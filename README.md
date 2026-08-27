@@ -106,12 +106,30 @@ pnpm supabase:test
 
 ## Deployment choices
 
-- **Vercel Hobby + Cloudflare Scheduler:** recommended free compute profile. Vercel hosts the web app and the included Cloudflare Worker securely invokes a small queue batch every minute.
-- **Vercel Pro + native cron:** remove the external scheduler and add the one-minute `/api/internal/consume` cron to `vercel.json` if you prefer a single provider.
-- **Google Cloud Run + Cloud Scheduler:** no Vercel account required. Both services have free allowances suitable for light personal usage, although Google requires a billing account.
-- **Vercel + worker container:** lower latency. Deploy the `worker` Docker target to Cloud Run, ECS/Fargate, or any container host.
-- **Docker Compose:** self-host both services using [`compose.yaml`](./compose.yaml).
-- **Cloudflare:** use it as an ingress/control-plane alternative only with an external Node worker and Postgres connection strategy; the shipped primary web artifact targets Next.js Node runtime.
+Costs below are rough monthly USD estimates for one lightly used personal deployment, checked August 2026. “Platform” covers the web app, scheduler/worker, and Supabase; “fixed total” also includes the current $39/month Blooio Starter plan. Model tokens, optional browser usage, domains, taxes, and usage overages are separate.
+
+| Path                                                    |                 Estimated platform |                     Estimated fixed total | Best for                                                                                                                               |
+| ------------------------------------------------------- | ---------------------------------: | ----------------------------------------: | -------------------------------------------------------------------------------------------------------------------------------------- |
+| **Vercel Hobby + Cloudflare Scheduler + Supabase Free** |                       **$0/month** |                       **about $39/month** | Trying the full product as a personal project. Supabase may pause after one inactive week and has no automatic backups.                |
+| **Vercel Hobby + Cloudflare Scheduler + Supabase Pro**  |                **about $25/month** |                       **about $64/month** | **Recommended for a reliable personal assistant.** The database does not pause and includes daily backups, while compute remains free. |
+| **Vercel Pro native cron + Supabase Pro**               |                **about $45/month** |                       **about $84/month** | A single web/scheduler provider and one-minute native cron without the Cloudflare Worker.                                              |
+| **Cloud Run + Cloud Scheduler + Supabase Pro**          |             **about $25–30/month** |                    **about $64–69/month** | Recommended no-Vercel path. Light scale-to-zero usage generally fits Google's free allowances, but a billing account is required.      |
+| **Docker Compose + hosted Supabase**                    | **$0 or $25/month, plus the host** | **about $39 or $64/month, plus the host** | Existing hardware, a home server, or a VPS. Use Supabase Pro when database pausing is unacceptable.                                    |
+
+The recommended progression is:
+
+1. Start with **Vercel Hobby + Cloudflare Scheduler + Supabase Free** to validate Blooio, OAuth, and the agent flow without paying for compute.
+2. Upgrade only Supabase to Pro when this becomes a real everyday assistant. This is the best reliability-to-cost tradeoff for most personal deployments.
+3. Use **Cloud Run + Cloud Scheduler** when you want no Vercel dependency, or **Vercel Pro native cron** when reducing the number of providers matters more than the extra $20/month.
+4. Add a continuously running worker only when one-minute polling latency is too slow. A small Cloud Run or ECS/Fargate worker commonly adds roughly $10–50+/month depending on whether it can scale down, its region, and allocated CPU/memory.
+
+[Vercel Hobby is limited to personal, non-commercial use](https://vercel.com/docs/plans/hobby). For commercial use, choose Vercel Pro or another host and use the applicable Blooio commercial plan; the table's fixed totals use the personal Starter price.
+
+Current price references: [Supabase](https://supabase.com/pricing), [Vercel](https://vercel.com/pricing), [Cloudflare Workers](https://developers.cloudflare.com/workers/platform/pricing/), [Cloud Run](https://cloud.google.com/run/pricing), [Cloud Scheduler](https://cloud.google.com/scheduler/pricing), and [Blooio](https://blooio.com/pricing).
+
+AI and browser use are variable rather than fixed hosting costs. Vercel AI Gateway currently includes $5/month on its free tier and otherwise passes through model prices without markup; a reasonable initial budget alert for light personal use is $5–30/month, then adjust from observed usage. Kernel currently has a free developer tier with $5 in usage credits; its Hobbyist tier is $30/month plus usage. See [AI Gateway pricing](https://vercel.com/docs/ai-gateway/pricing) and [Kernel pricing](https://www.kernel.sh/pricing).
+
+Cloudflare can also replace the web ingress, but it is a secondary architecture rather than a shipped deployment target: keep an external Node worker and a suitable Postgres connection strategy. The primary web artifact targets the Next.js Node runtime.
 
 See [deployment details](./docs/deployment/README.md) and [architecture](./docs/architecture.md).
 
