@@ -1,0 +1,14 @@
+node_modules/
+.next/
+dist/
+coverage/
+.turbo/
+.vercel/
+.wrangler/
+.openinstinct/
+.env
+.env.*
+!.env.example
+*.tsbuildinfo
+supabase/.branches/
+supabase/.temp/

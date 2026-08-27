@@ -1,0 +1,17 @@
+services:
+  web:
+    build:
+      context: .
+      target: web
+    env_file: .env.local
+    ports: ["3000:3000"]
+    restart: unless-stopped
+  worker:
+    build:
+      context: .
+      target: worker
+    env_file: .env.local
+    environment:
+      PORT: "3001"
+    ports: ["3001:3001"]
+    restart: unless-stopped

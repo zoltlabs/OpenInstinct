@@ -1,0 +1,19 @@
+{
+  "name": "@openinstinct/db",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@openinstinct/core": "workspace:*",
+    "@supabase/supabase-js": "2.112.4",
+    "postgres": "3.4.9",
+    "zod": "4.4.3"
+  }
+}

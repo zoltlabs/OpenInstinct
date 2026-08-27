@@ -1,0 +1,25 @@
+{
+  "name": "@openinstinct/worker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "start": "tsx src/server.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@openinstinct/connectors": "workspace:*",
+    "@openinstinct/core": "workspace:*",
+    "@openinstinct/db": "workspace:*",
+    "@openinstinct/messaging": "workspace:*",
+    "@openinstinct/runtime": "workspace:*",
+    "ai": "7.0.83",
+    "tsx": "4.23.12",
+    "zod": "4.4.3"
+  }
+}

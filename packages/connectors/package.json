@@ -1,0 +1,20 @@
+{
+  "name": "@openinstinct/connectors",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@ai-sdk/mcp": "2.0.39",
+    "ai": "7.0.83",
+    "ipaddr.js": "^2.5.0",
+    "undici": "^8.10.0",
+    "zod": "4.4.3"
+  }
+}

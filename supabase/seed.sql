@@ -1,0 +1,1 @@
+-- Intentionally empty. OpenInstinct onboarding creates the single owner workspace.

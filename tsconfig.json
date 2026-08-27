@@ -1,0 +1,14 @@
+{
+  "files": [],
+  "references": [
+    { "path": "./packages/core" },
+    { "path": "./packages/db" },
+    { "path": "./packages/messaging" },
+    { "path": "./packages/connectors" },
+    { "path": "./packages/browser" },
+    { "path": "./packages/runtime" },
+    { "path": "./apps/cli" },
+    { "path": "./apps/worker" },
+    { "path": "./apps/web" }
+  ]
+}
