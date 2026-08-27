@@ -2,9 +2,15 @@
 
 All profiles use hosted Supabase for Auth, Postgres, `pgmq`, and migrations. Run `supabase db push` before deploying application code. Set `OWNER_EMAIL` before exposing the deployment; only that normalized address can request the owner magic link or complete the server-side ownership transaction.
 
-## Vercel
+## Vercel Hobby + Cloudflare Scheduler (free default)
 
-Link the repository root with `vercel link`, add every production variable from `.env.example`, and deploy with `vercel deploy --prod`. [`vercel.json`](../../vercel.json) builds the web workspace and invokes `/api/internal/consume` every minute. Set `CRON_SECRET` in Vercel so cron requests are authenticated. Per-minute cron requires Vercel Pro or Enterprise; Hobby rejects this schedule at deployment, so use the external worker profile on Hobby.
+Link the repository root with `vercel link`, add every production variable from `.env.example`, and deploy with `vercel deploy --prod`. [`vercel.json`](../../vercel.json) intentionally contains no native cron, so it deploys on Hobby. The included [`cloudflare-scheduler`](../../infra/cloudflare-scheduler/wrangler.jsonc) calls the protected consumer once per minute. Store `CONSUMER_URL` and the same `INTERNAL_API_SECRET` using `wrangler secret put`, then run `pnpm --dir infra/cloudflare-scheduler deploy`.
+
+This scheduler performs one outbound fetch and no agent work itself. The Next.js function claims and processes the durable Supabase queue. It can therefore use Cloudflare's free Cron Trigger while the application remains on Vercel Hobby.
+
+## Vercel Pro native cron
+
+If you prefer a single provider, add `{ "path": "/api/internal/consume", "schedule": "* * * * *" }` to the `crons` array in `vercel.json` and set `CRON_SECRET`. Vercel Hobby rejects schedules more frequent than daily; native one-minute cron requires Pro or Enterprise.
 
 For faster replies, deploy the worker container as well and disable the Vercel cron after confirming the external worker is healthy. Multiple consumers are queue-safe, but one operating mode is easier to observe.
 
@@ -12,12 +18,14 @@ For faster replies, deploy the worker container as well and disable the Vercel c
 
 ```bash
 docker compose up --build -d
-pnpm smoke -- --url http://localhost:3000 --worker-url http://localhost:3001
+pnpm run smoke -- --url http://localhost:3000 --worker-url http://localhost:3001
 ```
 
 The image has `web` and `worker` targets. Keep `.env.local` mode `0600`; Compose injects it and the Docker build excludes it.
 
 ## Google Cloud Run
+
+Cloud Run can host both the Next.js `web` container and the continuously running `worker` container, so this profile does not require Vercel. For the lowest idle cost, run the web container with request-based billing and scale-to-zero, then use one Cloud Scheduler job to POST the protected consumer endpoint every minute. Google provides a Cloud Run free allowance and three free Cloud Scheduler jobs per billing account, but a billing account is still required.
 
 ```bash
 gcloud builds submit --tag REGION-docker.pkg.dev/PROJECT/REPOSITORY/openinstinct-worker

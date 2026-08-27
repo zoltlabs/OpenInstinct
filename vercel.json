@@ -2,6 +2,5 @@
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "framework": "nextjs",
   "buildCommand": "pnpm --filter @openinstinct/web build",
-  "outputDirectory": "apps/web/.next",
-  "crons": [{ "path": "/api/internal/consume", "schedule": "* * * * *" }]
+  "outputDirectory": "apps/web/.next"
 }

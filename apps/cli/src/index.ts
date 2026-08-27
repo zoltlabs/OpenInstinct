@@ -150,7 +150,7 @@ program
         "Fill missing values in .env.local",
         "Run: pnpm supabase:start && pnpm supabase:reset",
         "Run: pnpm dev",
-        "Run: pnpm openinstinct smoke",
+        "Run: pnpm run smoke -- --url http://localhost:3000",
       ],
     };
     emit(options.json ? result : result.next.join("\n"), options.json);
@@ -261,7 +261,13 @@ program
     },
   );
 
-program.parseAsync().catch((error: unknown) => {
+// pnpm 10 preserves the conventional `--` separator when forwarding script
+// arguments. Commander treats it as the end of options, so normalize it here.
+const cliArgv = process.argv.filter(
+  (value, index) => index < 2 || value !== "--",
+);
+
+program.parseAsync(cliArgv).catch((error: unknown) => {
   process.stderr.write(
     `${error instanceof Error ? error.message : String(error)}\n`,
   );

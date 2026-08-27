@@ -4,12 +4,12 @@ OpenInstinct is a one-owner-per-deployment personal assistant. Supabase owns dur
 
 ## Required workflow
 
-1. Run `pnpm doctor -- --json` before setup or infrastructure work.
+1. Run `pnpm run doctor -- --json` before setup or infrastructure work.
 2. Read the local package documentation before changing AI SDK, Next.js, or Supabase integrations.
 3. Never request or print secrets. Secret values enter through hidden prompts, OAuth, stdin, or provider secret stores.
 4. Webhook ingestion must be idempotent. Consequential actions must use provider idempotency when available; otherwise persist `unknown` outcomes and never retry automatically.
 5. All tables exposed through Supabase's Data API require explicit grants and tested RLS.
-6. Run `pnpm check`, `pnpm build`, and `pnpm smoke -- --json` before handoff.
+6. Run `pnpm check`, `pnpm build`, and `pnpm run smoke -- --json` before handoff.
 
 ## Ownership
 

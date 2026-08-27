@@ -1,0 +1,14 @@
+{
+  "name": "@openinstinct/cloudflare-scheduler",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "7.0.2",
+    "wrangler": "4.127.0"
+  }
+}

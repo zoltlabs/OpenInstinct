@@ -17,28 +17,38 @@ There is no new chat interface. The web app is a small owner-only control plane 
 
 ## Fastest setup
 
-Prerequisites: Node 22+, pnpm 10, a Supabase project, a Blooio account/number, and a Vercel account. Google OAuth and Kernel are optional until you connect those features.
+Prerequisites: Node 22+, pnpm 10, a Supabase project, a Blooio account/number, and a Vercel account. The default profile works on Vercel Hobby by using a free Cloudflare Cron Trigger for queue consumption. Google OAuth and Kernel are optional until you connect those features.
 
 ```bash
 git clone <your-fork-url> openinstinct
 cd openinstinct
 corepack enable
 pnpm install
-pnpm setup -- --target vercel
+pnpm run setup -- --target vercel
 ```
 
-`pnpm setup` creates `.env.local`, generates the two local cryptographic secrets, and prints every missing prerequisite. It never prints generated secrets. Fill the remaining values, then:
+`pnpm run setup` creates `.env.local`, generates the two local cryptographic secrets, and prints every missing prerequisite. It never prints generated secrets. Fill the remaining values, then:
 
 ```bash
 supabase login
 supabase link --project-ref <project-ref>
 supabase db push
 vercel link
-pnpm doctor -- --target vercel
+pnpm run doctor -- --target vercel
 vercel deploy --prod
-pnpm --filter @openinstinct/cli dev -- create-blooio-webhook \
+pnpm run openinstinct -- create-blooio-webhook \
   --url https://your-domain.example --env-file .env.local
-pnpm smoke -- --url https://your-domain.example
+pnpm run smoke -- --url https://your-domain.example
+```
+
+Deploy the free one-minute scheduler after `INTERNAL_API_SECRET` and `NEXT_PUBLIC_APP_URL` are set in `.env.local`:
+
+```bash
+sed -n 's/^NEXT_PUBLIC_APP_URL=//p' .env.local | \
+  pnpm --dir infra/cloudflare-scheduler exec wrangler secret put CONSUMER_URL
+sed -n 's/^INTERNAL_API_SECRET=//p' .env.local | \
+  pnpm --dir infra/cloudflare-scheduler exec wrangler secret put INTERNAL_API_SECRET
+pnpm --dir infra/cloudflare-scheduler deploy
 ```
 
 After creating the Blooio webhook, push the newly captured `BLOOIO_WEBHOOK_SECRET` to your deployment without displaying it:
@@ -96,7 +106,9 @@ pnpm supabase:test
 
 ## Deployment choices
 
-- **Vercel Pro + Supabase:** simplest. The web function consumes a small queue batch every minute through Vercel Cron. Vercel Hobby only permits daily cron jobs, so Hobby deployments need the worker container.
+- **Vercel Hobby + Cloudflare Scheduler:** recommended free compute profile. Vercel hosts the web app and the included Cloudflare Worker securely invokes a small queue batch every minute.
+- **Vercel Pro + native cron:** remove the external scheduler and add the one-minute `/api/internal/consume` cron to `vercel.json` if you prefer a single provider.
+- **Google Cloud Run + Cloud Scheduler:** no Vercel account required. Both services have free allowances suitable for light personal usage, although Google requires a billing account.
 - **Vercel + worker container:** lower latency. Deploy the `worker` Docker target to Cloud Run, ECS/Fargate, or any container host.
 - **Docker Compose:** self-host both services using [`compose.yaml`](./compose.yaml).
 - **Cloudflare:** use it as an ingress/control-plane alternative only with an external Node worker and Postgres connection strategy; the shipped primary web artifact targets Next.js Node runtime.
@@ -109,11 +121,13 @@ Point Codex or another coding agent at the repository root and tell it to read [
 
 ```bash
 pnpm install
-pnpm setup -- --target <vercel|aws|gcp|docker>
-pnpm doctor -- --target <target> --json
+pnpm run setup -- --target <vercel|aws|gcp|docker>
+pnpm run doctor -- --target <target> --json
 ```
 
 Commands use stable exit codes: `0` success, `2` missing setup, `3` failed smoke check. `--json` emits machine-readable results. Cloud provisioning remains explicit because it can create billable resources; all routine setup after authorization is CLI-controlled.
+
+Vercel Hobby is intended for personal, non-commercial deployments. For commercial deployments that must remain independent of Vercel, use the Cloud Run or self-hosted Docker profile.
 
 ## Trust model
 
