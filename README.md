@@ -117,7 +117,7 @@ See [deployment details](./docs/deployment/README.md) and [architecture](./docs/
 
 ## Agent-first repository contract
 
-Point Codex or another coding agent at the repository root and tell it to read [`AGENTS.md`](./AGENTS.md), then run:
+Point Codex or another coding agent at the repository root and tell it to read [`AGENTS.md`](./AGENTS.md). That file immediately routes it to the canonical [`agent overview`](./docs/agent-overview.md), which explains the runtime, safety invariants, state model, repository map, and recipes for adding connectors, actions, channels, browser tools, and database features. Then run:
 
 ```bash
 pnpm install

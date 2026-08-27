@@ -2,6 +2,8 @@
 
 OpenInstinct is a one-owner-per-deployment personal assistant. Supabase owns durable state; compute providers are replaceable. Never introduce a provider-specific dependency into `packages/core`, `packages/db`, `packages/messaging`, or `packages/connectors`.
 
+Before changing code, read [`docs/agent-overview.md`](docs/agent-overview.md). It is the canonical agent-facing map of the runtime, safety invariants, extension points, and verification workflow.
+
 ## Required workflow
 
 1. Run `pnpm run doctor -- --json` before setup or infrastructure work.
