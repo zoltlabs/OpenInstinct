@@ -17,7 +17,9 @@ const validValues = {
   BLOOIO_API_KEY: "blooio_example",
   BLOOIO_OWNER_PHONE: "+15555550123",
   OWNER_EMAIL: "owner@example.com",
-  AI_MODEL: "openai/gpt-5.6-sol",
+  AI_PROVIDER: "openai",
+  AI_MODEL: "gpt-5.6-sol",
+  OPENAI_API_KEY: "openai_example",
   INTERNAL_API_SECRET: "a".repeat(32),
 };
 
@@ -52,9 +54,13 @@ describe("agent-friendly setup checks", () => {
     });
   });
 
-  it("validates values and requires gateway credentials off Vercel", () => {
+  it("validates values and requires the selected direct provider key", () => {
     const checks = checkEnvironment({
-      values: { ...validValues, BLOOIO_OWNER_PHONE: "555" },
+      values: {
+        ...validValues,
+        BLOOIO_OWNER_PHONE: "555",
+        OPENAI_API_KEY: undefined,
+      },
       target: "docker",
       phase: "bootstrap",
     });
@@ -64,9 +70,54 @@ describe("agent-friendly setup checks", () => {
       detail: "invalid",
     });
     expect(checks).toContainEqual({
-      name: "env:AI_GATEWAY_API_KEY",
+      name: "env:OPENAI_API_KEY",
       ok: false,
       detail: "missing",
+    });
+  });
+
+  it("supports OpenRouter fallback without requiring AI Gateway", () => {
+    const checks = checkEnvironment({
+      values: {
+        ...validValues,
+        AI_FALLBACK_PROVIDER: "openrouter",
+        AI_FALLBACK_MODEL: "openai/gpt-5.6-luna",
+        OPENROUTER_API_KEY: "openrouter_example",
+      },
+      target: "docker",
+      phase: "bootstrap",
+    });
+    expect(checks.every((check) => check.ok)).toBe(true);
+    expect(
+      checks.some((check) => check.name === "env:AI_GATEWAY_API_KEY"),
+    ).toBe(false);
+  });
+
+  it("requires both fallback fields and rejects a duplicate fallback", () => {
+    const missingModel = checkEnvironment({
+      values: { ...validValues, AI_FALLBACK_PROVIDER: "openai" },
+      target: "docker",
+      phase: "bootstrap",
+    });
+    expect(missingModel).toContainEqual({
+      name: "env:AI_FALLBACK_MODEL",
+      ok: false,
+      detail: "missing",
+    });
+
+    const duplicate = checkEnvironment({
+      values: {
+        ...validValues,
+        AI_FALLBACK_PROVIDER: "openai",
+        AI_FALLBACK_MODEL: validValues.AI_MODEL,
+      },
+      target: "docker",
+      phase: "bootstrap",
+    });
+    expect(duplicate).toContainEqual({
+      name: "env:ai-fallback",
+      ok: false,
+      detail: "fallback must differ from the primary model",
     });
   });
 

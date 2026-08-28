@@ -165,6 +165,7 @@ const commonEnvironmentNames = [
   "BLOOIO_API_KEY",
   "BLOOIO_OWNER_PHONE",
   "OWNER_EMAIL",
+  "AI_PROVIDER",
   "AI_MODEL",
   "INTERNAL_API_SECRET",
 ] as const;
@@ -183,8 +184,17 @@ const deployableEnvironmentNames = [
   "BLOOIO_CHANNEL_ID",
   "BLOOIO_OWNER_PHONE",
   "OWNER_EMAIL",
+  "AI_PROVIDER",
   "AI_GATEWAY_API_KEY",
   "AI_MODEL",
+  "AI_FALLBACK_PROVIDER",
+  "AI_FALLBACK_MODEL",
+  "OPENAI_API_KEY",
+  "ANTHROPIC_API_KEY",
+  "GOOGLE_GENERATIVE_AI_API_KEY",
+  "OPENROUTER_API_KEY",
+  "AI_COMPATIBLE_BASE_URL",
+  "AI_COMPATIBLE_API_KEY",
   "GOOGLE_CLIENT_ID",
   "GOOGLE_CLIENT_SECRET",
   "GOOGLE_REDIRECT_URI",
@@ -193,6 +203,36 @@ const deployableEnvironmentNames = [
   "CRON_SECRET",
   "WORKER_URL",
 ] as const;
+
+function addProviderEnvironmentNames(
+  names: Array<keyof typeof environmentFieldSchemas>,
+  provider: string | undefined,
+  target: DeploymentTarget,
+): void {
+  const parsed = environmentFieldSchemas.AI_PROVIDER.safeParse(provider);
+  if (!parsed.success) return;
+  switch (parsed.data) {
+    case "openai":
+      names.push("OPENAI_API_KEY");
+      break;
+    case "anthropic":
+      names.push("ANTHROPIC_API_KEY");
+      break;
+    case "google":
+      names.push("GOOGLE_GENERATIVE_AI_API_KEY");
+      break;
+    case "openrouter":
+      names.push("OPENROUTER_API_KEY");
+      break;
+    case "vercel-gateway":
+      if (!["vercel", "vercel-pro"].includes(target))
+        names.push("AI_GATEWAY_API_KEY");
+      break;
+    case "openai-compatible":
+      names.push("AI_COMPATIBLE_BASE_URL");
+      break;
+  }
+}
 
 export function checkEnvironment(input: {
   values: Record<string, string | undefined>;
@@ -204,10 +244,17 @@ export function checkEnvironment(input: {
   ];
   if (input.phase === "ready") names.push("BLOOIO_WEBHOOK_SECRET");
   if (input.target === "vercel-pro") names.push("CRON_SECRET");
-  if (!["vercel", "vercel-pro"].includes(input.target))
-    names.push("AI_GATEWAY_API_KEY");
+  addProviderEnvironmentNames(names, input.values.AI_PROVIDER, input.target);
+  if (input.values.AI_FALLBACK_PROVIDER || input.values.AI_FALLBACK_MODEL) {
+    names.push("AI_FALLBACK_PROVIDER", "AI_FALLBACK_MODEL");
+    addProviderEnvironmentNames(
+      names,
+      input.values.AI_FALLBACK_PROVIDER,
+      input.target,
+    );
+  }
 
-  const checks = names.map((name) => {
+  const checks = [...new Set(names)].map((name) => {
     const value = input.values[name];
     if (!value) return { name: `env:${name}`, ok: false, detail: "missing" };
     const result = environmentFieldSchemas[name].safeParse(value);
@@ -217,6 +264,16 @@ export function checkEnvironment(input: {
       detail: result.success ? "valid" : "invalid",
     };
   });
+
+  if (
+    input.values.AI_FALLBACK_PROVIDER === input.values.AI_PROVIDER &&
+    input.values.AI_FALLBACK_MODEL === input.values.AI_MODEL
+  )
+    checks.push({
+      name: "env:ai-fallback",
+      ok: false,
+      detail: "fallback must differ from the primary model",
+    });
 
   if (input.target !== "docker") {
     for (const name of [

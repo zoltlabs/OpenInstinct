@@ -13,6 +13,16 @@ const secureUrl = z
   }, "URL must use HTTPS except on loopback development hosts.");
 const optionalUrl = secureUrl.optional();
 
+export const aiProviderSchema = z.enum([
+  "openai",
+  "anthropic",
+  "google",
+  "openrouter",
+  "vercel-gateway",
+  "openai-compatible",
+]);
+export type AiProvider = z.infer<typeof aiProviderSchema>;
+
 const base64Key = z.string().refine((value) => {
   try {
     return (
@@ -46,8 +56,18 @@ export const environmentFieldSchemas = {
   BLOOIO_CHANNEL_ID: z.string().min(1),
   BLOOIO_OWNER_PHONE: z.string().regex(/^\+[1-9][0-9]{7,14}$/),
   OWNER_EMAIL: z.string().email(),
+  AI_PROVIDER: aiProviderSchema,
   AI_GATEWAY_API_KEY: z.string().min(1),
   AI_MODEL: z.string().min(1),
+  AI_FALLBACK_PROVIDER: aiProviderSchema,
+  AI_FALLBACK_MODEL: z.string().min(1),
+  OPENAI_API_KEY: z.string().min(1),
+  ANTHROPIC_API_KEY: z.string().min(1),
+  GOOGLE_GENERATIVE_AI_API_KEY: z.string().min(1),
+  OPENROUTER_API_KEY: z.string().min(1),
+  AI_COMPATIBLE_BASE_URL: secureUrl,
+  AI_COMPATIBLE_API_KEY: z.string().min(1),
+  VERCEL_OIDC_TOKEN: z.string().min(1),
   GOOGLE_CLIENT_ID: z.string().min(1),
   GOOGLE_CLIENT_SECRET: z.string().min(1),
   GOOGLE_REDIRECT_URI: secureUrl,
@@ -57,7 +77,7 @@ export const environmentFieldSchemas = {
   WORKER_URL: secureUrl,
 } as const;
 
-export const serverEnvironmentSchema = z.object({
+const serverEnvironmentBaseSchema = z.object({
   NEXT_PUBLIC_APP_URL: environmentFieldSchemas.NEXT_PUBLIC_APP_URL,
   NEXT_PUBLIC_SUPABASE_URL: environmentFieldSchemas.NEXT_PUBLIC_SUPABASE_URL,
   NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY:
@@ -73,8 +93,21 @@ export const serverEnvironmentSchema = z.object({
   BLOOIO_CHANNEL_ID: environmentFieldSchemas.BLOOIO_CHANNEL_ID.optional(),
   BLOOIO_OWNER_PHONE: environmentFieldSchemas.BLOOIO_OWNER_PHONE,
   OWNER_EMAIL: environmentFieldSchemas.OWNER_EMAIL,
+  AI_PROVIDER: environmentFieldSchemas.AI_PROVIDER,
   AI_GATEWAY_API_KEY: environmentFieldSchemas.AI_GATEWAY_API_KEY.optional(),
   AI_MODEL: environmentFieldSchemas.AI_MODEL,
+  AI_FALLBACK_PROVIDER: environmentFieldSchemas.AI_FALLBACK_PROVIDER.optional(),
+  AI_FALLBACK_MODEL: environmentFieldSchemas.AI_FALLBACK_MODEL.optional(),
+  OPENAI_API_KEY: environmentFieldSchemas.OPENAI_API_KEY.optional(),
+  ANTHROPIC_API_KEY: environmentFieldSchemas.ANTHROPIC_API_KEY.optional(),
+  GOOGLE_GENERATIVE_AI_API_KEY:
+    environmentFieldSchemas.GOOGLE_GENERATIVE_AI_API_KEY.optional(),
+  OPENROUTER_API_KEY: environmentFieldSchemas.OPENROUTER_API_KEY.optional(),
+  AI_COMPATIBLE_BASE_URL:
+    environmentFieldSchemas.AI_COMPATIBLE_BASE_URL.optional(),
+  AI_COMPATIBLE_API_KEY:
+    environmentFieldSchemas.AI_COMPATIBLE_API_KEY.optional(),
+  VERCEL_OIDC_TOKEN: environmentFieldSchemas.VERCEL_OIDC_TOKEN.optional(),
   GOOGLE_CLIENT_ID: environmentFieldSchemas.GOOGLE_CLIENT_ID.optional(),
   GOOGLE_CLIENT_SECRET: environmentFieldSchemas.GOOGLE_CLIENT_SECRET.optional(),
   GOOGLE_REDIRECT_URI: optionalUrl,
@@ -84,21 +117,118 @@ export const serverEnvironmentSchema = z.object({
   WORKER_URL: optionalUrl,
 });
 
+function requireProviderConfiguration(
+  value: z.infer<typeof serverEnvironmentBaseSchema>,
+  provider: AiProvider,
+  path: "AI_PROVIDER" | "AI_FALLBACK_PROVIDER",
+  context: z.core.$RefinementCtx,
+): void {
+  const required = (
+    name:
+      | "OPENAI_API_KEY"
+      | "ANTHROPIC_API_KEY"
+      | "GOOGLE_GENERATIVE_AI_API_KEY"
+      | "OPENROUTER_API_KEY"
+      | "AI_COMPATIBLE_BASE_URL",
+  ) => {
+    if (!value[name])
+      context.addIssue({
+        code: "custom",
+        message: `${name} is required when ${path}=${provider}.`,
+        path: [name],
+      });
+  };
+
+  switch (provider) {
+    case "openai":
+      required("OPENAI_API_KEY");
+      break;
+    case "anthropic":
+      required("ANTHROPIC_API_KEY");
+      break;
+    case "google":
+      required("GOOGLE_GENERATIVE_AI_API_KEY");
+      break;
+    case "openrouter":
+      required("OPENROUTER_API_KEY");
+      break;
+    case "vercel-gateway":
+      if (!value.AI_GATEWAY_API_KEY && !value.VERCEL_OIDC_TOKEN)
+        context.addIssue({
+          code: "custom",
+          message:
+            "AI_GATEWAY_API_KEY or VERCEL_OIDC_TOKEN is required when using vercel-gateway.",
+          path: ["AI_GATEWAY_API_KEY"],
+        });
+      break;
+    case "openai-compatible":
+      required("AI_COMPATIBLE_BASE_URL");
+      break;
+  }
+}
+
+export const serverEnvironmentSchema = serverEnvironmentBaseSchema.superRefine(
+  (value, context) => {
+    requireProviderConfiguration(
+      value,
+      value.AI_PROVIDER,
+      "AI_PROVIDER",
+      context,
+    );
+    if (
+      Boolean(value.AI_FALLBACK_PROVIDER) !== Boolean(value.AI_FALLBACK_MODEL)
+    )
+      context.addIssue({
+        code: "custom",
+        message:
+          "AI_FALLBACK_PROVIDER and AI_FALLBACK_MODEL must be set together.",
+        path: [
+          value.AI_FALLBACK_PROVIDER
+            ? "AI_FALLBACK_MODEL"
+            : "AI_FALLBACK_PROVIDER",
+        ],
+      });
+    if (value.AI_FALLBACK_PROVIDER)
+      requireProviderConfiguration(
+        value,
+        value.AI_FALLBACK_PROVIDER,
+        "AI_FALLBACK_PROVIDER",
+        context,
+      );
+    if (
+      value.AI_FALLBACK_PROVIDER === value.AI_PROVIDER &&
+      value.AI_FALLBACK_MODEL === value.AI_MODEL
+    )
+      context.addIssue({
+        code: "custom",
+        message: "The fallback must differ from the primary model.",
+        path: ["AI_FALLBACK_MODEL"],
+      });
+  },
+);
+
 export type ServerEnvironment = z.infer<typeof serverEnvironmentSchema>;
 
 export function readServerEnvironment(
   source: NodeJS.ProcessEnv = process.env,
 ): ServerEnvironment {
+  const normalized = Object.fromEntries(
+    Object.entries(source).map(([name, value]) => [
+      name,
+      value === "" ? undefined : value,
+    ]),
+  );
   return serverEnvironmentSchema.parse({
-    ...source,
-    SUPABASE_URL: source.SUPABASE_URL ?? source.NEXT_PUBLIC_SUPABASE_URL,
+    ...normalized,
+    SUPABASE_URL:
+      normalized.SUPABASE_URL ?? normalized.NEXT_PUBLIC_SUPABASE_URL,
     SUPABASE_PUBLISHABLE_KEY:
-      source.SUPABASE_PUBLISHABLE_KEY ??
-      source.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY,
+      normalized.SUPABASE_PUBLISHABLE_KEY ??
+      normalized.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY,
   });
 }
 
-export const publicEnvironmentSchema = serverEnvironmentSchema.pick({
+export const publicEnvironmentSchema = serverEnvironmentBaseSchema.pick({
   NEXT_PUBLIC_APP_URL: true,
   NEXT_PUBLIC_SUPABASE_URL: true,
   NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY: true,

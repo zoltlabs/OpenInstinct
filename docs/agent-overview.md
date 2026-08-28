@@ -22,6 +22,7 @@ Current integrations are:
 - Google OAuth for Gmail and Calendar
 - Generic remote MCP over HTTPS for long-tail connectors
 - Kernel behind a provider-neutral cloud-browser interface
+- Direct OpenAI, Anthropic, and Google inference with optional OpenRouter, Vercel AI Gateway, or OpenAI-compatible endpoints
 - Vercel, containers, or other Node hosts for compute
 - Supabase Postgres, Auth, Row Level Security, and `pgmq`
 
@@ -68,13 +69,14 @@ Preserve these in every feature:
 10. **Remote MCP is hostile input.** Require HTTPS, block redirects and private/special IP ranges at the transport layer, bound responses, validate schemas, and require approval for every MCP invocation.
 11. **Database exposure is explicit.** Every Data API table needs intentional grants, RLS, and SQL tests. Workers use direct Postgres credentials; browsers receive only owner-safe views and server-mediated operations.
 12. **Provider code stays at the edge.** Core policy and state must not depend on Vercel, Blooio, Google, Kernel, or a specific model provider.
+13. **Model fallback is step-local and explicit.** A configured fallback may retry a failed generation before its tool call executes. Never restart an entire agent run for provider failover because earlier tool calls may already have completed.
 
 ## Repository map
 
 | Area                         | Owns                                                                                                          | Start here                                                                                                             |
 | ---------------------------- | ------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
 | `apps/web`                   | Owner control plane, auth, onboarding, public webhooks, connector callbacks, approvals, bounded queue trigger | `app/api/webhooks/blooio/route.ts`, `app/api/approvals/[id]/route.ts`, `app/api/internal/consume/route.ts`, `proxy.ts` |
-| `apps/worker`                | Agent tools, policy-to-proposal flow, job processing, side-effect execution, retries                          | `src/agent.ts`, `src/processor.ts`, `src/consumer.ts`                                                                  |
+| `apps/worker`                | Agent tools, direct model providers and fallback, job processing, side-effect execution, retries              | `src/models.ts`, `src/agent.ts`, `src/processor.ts`, `src/consumer.ts`                                                 |
 | `apps/cli`                   | Agent-friendly setup, diagnostics, webhook provisioning, smoke tests                                          | `src/index.ts`                                                                                                         |
 | `packages/core`              | Provider-independent schemas, canonical hashing, policy, run state machine, system prompt                     | `src/domain.ts`, `src/policy.ts`, `src/state-machine.ts`, `src/prompt.ts`                                              |
 | `packages/db`                | The only direct SQL access layer, repositories, encrypted credentials, queue job schemas                      | `src/store.ts`, `src/jobs.ts`, `src/crypto.ts`                                                                         |
@@ -184,6 +186,7 @@ Create a new timestamped migration; never edit an already-applied migration afte
 | New event or job type    | `packages/core/src/domain.ts`, `packages/db/src/jobs.ts`                                  | store transaction, consumer, state machine, migration constraints         |
 | New OAuth provider       | `packages/connectors`, `apps/web/app/api/connectors`                                      | encrypted connection storage, runtime env, CLI doctor, callback allowlist |
 | New hosting target       | `packages/runtime/src/deployment.ts`, `apps/cli/src/index.ts`                             | Dockerfiles, scheduler/worker mode, deployment docs                       |
+| New model provider       | `apps/worker/src/models.ts`, `packages/runtime/src/env.ts`                                | provider package, CLI doctor, `.env.example`, fallback tests, README      |
 | New owner-visible data   | migration, `packages/db/src/store.ts`, `apps/web`                                         | grants, RLS, safe views, SQL tests                                        |
 | New proactive behavior   | `scheduled_triggers`, queue producer, worker                                              | owner controls, rate bounds, quiet hours, deduplication                   |
 

@@ -12,18 +12,25 @@ import {
   refreshGoogleToken,
 } from "@openinstinct/connectors";
 import type { ServerEnvironment } from "@openinstinct/runtime";
+import type { LanguageModel } from "ai";
 import { executeApprovedGoogleAction, runAssistantAgent } from "./agent";
 import { PermanentJobError } from "./consumer";
+import { createAssistantModel } from "./models";
 
 export class JobProcessor {
   readonly #store: OpenInstinctStore;
   readonly #env: ServerEnvironment;
   readonly #blooio: BlooioClient;
+  readonly #model: LanguageModel;
+  readonly #modelId: string;
 
   constructor(input: { store: OpenInstinctStore; env: ServerEnvironment }) {
     this.#store = input.store;
     this.#env = input.env;
     this.#blooio = new BlooioClient({ apiKey: input.env.BLOOIO_API_KEY });
+    const assistantModel = createAssistantModel(input.env);
+    this.#model = assistantModel.model;
+    this.#modelId = assistantModel.configuredId;
   }
 
   async process(job: AgentJob): Promise<void> {
@@ -73,7 +80,7 @@ export class JobProcessor {
         });
         await this.#store.completeRun({
           runId: job.runId,
-          model: this.#env.AI_MODEL,
+          model: this.#modelId,
         });
         return;
       }
@@ -93,7 +100,7 @@ export class JobProcessor {
       });
       await this.#store.completeRun({
         runId: job.runId,
-        model: this.#env.AI_MODEL,
+        model: this.#modelId,
       });
       return;
     }
@@ -113,7 +120,7 @@ export class JobProcessor {
             configVersion: googleState.configVersion,
           }
         : undefined,
-      model: this.#env.AI_MODEL,
+      model: this.#model,
       appUrl: this.#env.NEXT_PUBLIC_APP_URL,
       mcpConnections: mcpConnections.map((connection) => ({
         id: connection.id,
@@ -147,7 +154,7 @@ export class JobProcessor {
         runId: job.runId,
         inputTokens: result.inputTokens,
         outputTokens: result.outputTokens,
-        model: this.#env.AI_MODEL,
+        model: this.#modelId,
       });
     }
   }

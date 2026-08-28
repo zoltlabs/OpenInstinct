@@ -1,4 +1,10 @@
-import { ToolLoopAgent, isStepCount, tool, type ModelMessage } from "ai";
+import {
+  ToolLoopAgent,
+  isStepCount,
+  tool,
+  type LanguageModel,
+  type ModelMessage,
+} from "ai";
 import { z } from "zod";
 import {
   assistantInstructions,
@@ -36,7 +42,7 @@ export async function runAssistantAgent(input: {
   store: OpenInstinctStore;
   google?: GoogleConnector;
   googleConnection?: { id: string; account: string; configVersion: string };
-  model: string;
+  model: LanguageModel;
   appUrl: string;
   mcpConnections?: readonly {
     id: string;

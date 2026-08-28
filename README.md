@@ -12,12 +12,13 @@ There is no new chat interface. The web app is a small owner-only control plane 
 - Generic HTTPS MCP registration and tool discovery; MCP calls require explicit approval
 - Hash-bound approval requests so approved inputs cannot be changed before execution
 - Kernel browser provider abstraction, with sessions and persistent profiles
+- Direct OpenAI, Anthropic, and Google model access, plus optional OpenRouter, Vercel AI Gateway, and OpenAI-compatible providers
 - Vercel deployment with a cron-driven consumer, or a continuously running Docker worker
 - CLI-friendly setup, diagnostics, webhook registration, and smoke checks
 
 ## Fastest setup
 
-Prerequisites: Node 22+, pnpm 10, a Blooio account/number, and accounts for Supabase and your chosen compute providers. You do not need local Supabase or Docker for the default path. The lowest-friction profile uses hosted Supabase, Vercel Hobby, and a free Cloudflare Cron Trigger. Google OAuth and Kernel remain optional.
+Prerequisites: Node 22+, pnpm 10, a Blooio account/number, and accounts for Supabase, your chosen model provider, and your chosen compute providers. You do not need local Supabase or Docker for the default path. The lowest-friction profile uses hosted Supabase, Vercel Hobby, and a free Cloudflare Cron Trigger. Google OAuth and Kernel remain optional.
 
 ```bash
 git clone <your-fork-url> openinstinct
@@ -92,11 +93,27 @@ Copy [`.env.example`](./.env.example). Required production variables are:
 | `BLOOIO_WEBHOOK_SECRET`                | One-time secret returned when the webhook is created  |
 | `BLOOIO_OWNER_PHONE`                   | The sole owner’s E.164 phone number                   |
 | `OWNER_EMAIL`                          | The only email allowed to sign in and claim ownership |
-| `AI_MODEL`                             | AI SDK model id; defaults to `openai/gpt-5.6-sol`     |
-| `AI_GATEWAY_API_KEY`                   | AI Gateway key outside Vercel's managed runtime       |
+| `AI_PROVIDER`                          | Direct or optional routing provider                   |
+| `AI_MODEL`                             | Provider-native model id                              |
+| Selected provider credential           | The matching server-only API key described below      |
 | `INTERNAL_API_SECRET`                  | Protects non-Vercel queue-consumer calls              |
 
-For Google, set all three of `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, and the exact `GOOGLE_REDIRECT_URI`, or leave all three unset. Add the redirect URI to the Google OAuth client. `KERNEL_API_KEY` enables the optional browser runtime. Vercel's managed runtime can authenticate to AI Gateway with its deployment identity; Docker, AWS, and GCP profiles require `AI_GATEWAY_API_KEY`. For the Vercel Pro cron profile, set `CRON_SECRET`; Vercel sends it to cron routes automatically.
+Model providers are selected explicitly:
+
+| `AI_PROVIDER`       | Required configuration                                                          | `AI_MODEL` form                         |
+| ------------------- | ------------------------------------------------------------------------------- | --------------------------------------- |
+| `openai`            | `OPENAI_API_KEY`                                                                | Native OpenAI id, such as `gpt-5.6-sol` |
+| `anthropic`         | `ANTHROPIC_API_KEY`                                                             | Native Anthropic id                     |
+| `google`            | `GOOGLE_GENERATIVE_AI_API_KEY`                                                  | Native Gemini id                        |
+| `openrouter`        | `OPENROUTER_API_KEY`                                                            | OpenRouter's namespaced model id        |
+| `vercel-gateway`    | `AI_GATEWAY_API_KEY`, or Vercel OIDC when deployed there                        | Gateway's namespaced model id           |
+| `openai-compatible` | `AI_COMPATIBLE_BASE_URL`; `AI_COMPATIBLE_API_KEY` when the endpoint requires it | The endpoint's model id                 |
+
+Direct OpenAI, Anthropic, or Google access is the normal path; no AI gateway is required. For optional failover, set both `AI_FALLBACK_PROVIDER` and `AI_FALLBACK_MODEL` plus that provider's credential. The fallback runs only when a model generation fails, before the resulting tool call can execute. OpenRouter is the recommended host-neutral fallback; Vercel AI Gateway is convenient when the deployment already runs on Vercel.
+
+Existing Gateway deployments can preserve their current behavior by setting `AI_PROVIDER=vercel-gateway` and keeping the existing namespaced `AI_MODEL`. To migrate to direct OpenAI, set `AI_PROVIDER=openai`, remove the `openai/` prefix from `AI_MODEL`, and provide `OPENAI_API_KEY`.
+
+For Google application access, separately set all three of `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, and the exact `GOOGLE_REDIRECT_URI`, or leave all three unset. Those OAuth credentials are unrelated to `GOOGLE_GENERATIVE_AI_API_KEY`. Add the redirect URI to the Google OAuth client. `KERNEL_API_KEY` enables the optional browser runtime. For the Vercel Pro cron profile, set `CRON_SECRET`; Vercel sends it to cron routes automatically.
 
 ## Optional local database development
 
@@ -123,18 +140,18 @@ pnpm supabase:test
 
 Costs below are rough monthly USD estimates for one lightly used personal deployment, checked August 2026. “Platform” covers the web app, scheduler/worker, and Supabase; “fixed total” also includes the current $39/month Blooio Starter plan. Model tokens, optional browser usage, domains, taxes, and usage overages are separate.
 
-| Path                                                    |                 Estimated platform |                     Estimated fixed total | Best for                                                                                                                               |
-| ------------------------------------------------------- | ---------------------------------: | ----------------------------------------: | -------------------------------------------------------------------------------------------------------------------------------------- |
-| **Vercel Hobby + Cloudflare Scheduler + Supabase Free** |                       **$0/month** |                       **about $39/month** | Trying the full product as a personal project. Supabase may pause after one inactive week and has no automatic backups.                |
-| **Vercel Hobby + Cloudflare Scheduler + Supabase Pro**  |                **about $25/month** |                       **about $64/month** | **Recommended for a reliable personal assistant.** The database does not pause and includes daily backups, while compute remains free. |
-| **Vercel Pro native cron + Supabase Pro**               |                **about $45/month** |                       **about $84/month** | A single web/scheduler provider and one-minute native cron without the Cloudflare Worker.                                              |
-| **Cloud Run + Cloud Scheduler + Supabase Pro**          |             **about $25–30/month** |                    **about $64–69/month** | Recommended no-Vercel path. Light scale-to-zero usage generally fits Google's free allowances, but a billing account is required.      |
-| **Docker Compose + hosted Supabase**                    | **$0 or $25/month, plus the host** | **about $39 or $64/month, plus the host** | Existing hardware, a home server, or a VPS. Use Supabase Pro when database pausing is unacceptable.                                    |
+| Path                                                    |                 Estimated platform |                     Estimated fixed total | Best for                                                                                                                          |
+| ------------------------------------------------------- | ---------------------------------: | ----------------------------------------: | --------------------------------------------------------------------------------------------------------------------------------- |
+| **Vercel Hobby + Cloudflare Scheduler + Supabase Free** |                       **$0/month** |                       **about $39/month** | **Recommended starting path for a personal assistant.** The included scheduler keeps the database active during normal operation. |
+| **Vercel Hobby + Cloudflare Scheduler + Supabase Pro**  |                **about $25/month** |                       **about $64/month** | Optional reliability upgrade for automatic database backups, more storage, and support.                                           |
+| **Vercel Pro native cron + Supabase Pro**               |                **about $45/month** |                       **about $84/month** | A single web/scheduler provider and one-minute native cron without the Cloudflare Worker.                                         |
+| **Cloud Run + Cloud Scheduler + Supabase Pro**          |             **about $25–30/month** |                    **about $64–69/month** | Recommended no-Vercel path. Light scale-to-zero usage generally fits Google's free allowances, but a billing account is required. |
+| **Docker Compose + hosted Supabase**                    | **$0 or $25/month, plus the host** | **about $39 or $64/month, plus the host** | Existing hardware, a home server, or a VPS. Use Supabase Pro when database pausing is unacceptable.                               |
 
 The recommended progression is:
 
-1. Start with **Vercel Hobby + Cloudflare Scheduler + Supabase Free** to validate Blooio, OAuth, and the agent flow without paying for compute.
-2. Upgrade only Supabase to Pro when this becomes a real everyday assistant. This is the best reliability-to-cost tradeoff for most personal deployments.
+1. Start with **Vercel Hobby + Cloudflare Scheduler + Supabase Free** and keep Blooio as the only fixed platform cost. This is appropriate for a normal personal deployment, not merely a trial.
+2. Upgrade only Supabase to Pro if you specifically need automatic backups, additional database capacity, or paid support.
 3. Use **Cloud Run + Cloud Scheduler** when you want no Vercel dependency, or **Vercel Pro native cron** when reducing the number of providers matters more than the extra $20/month.
 4. Add a continuously running worker only when one-minute polling latency is too slow. A small Cloud Run or ECS/Fargate worker commonly adds roughly $10–50+/month depending on whether it can scale down, its region, and allocated CPU/memory.
 
@@ -142,7 +159,7 @@ The recommended progression is:
 
 Current price references: [Supabase](https://supabase.com/pricing), [Vercel](https://vercel.com/pricing), [Cloudflare Workers](https://developers.cloudflare.com/workers/platform/pricing/), [Cloud Run](https://cloud.google.com/run/pricing), [Cloud Scheduler](https://cloud.google.com/scheduler/pricing), and [Blooio](https://blooio.com/pricing).
 
-AI and browser use are variable rather than fixed hosting costs. Vercel AI Gateway currently includes $5/month on its free tier and otherwise passes through model prices without markup; a reasonable initial budget alert for light personal use is $5–30/month, then adjust from observed usage. Kernel currently has a free developer tier with $5 in usage credits; its Hobbyist tier is $30/month plus usage. See [AI Gateway pricing](https://vercel.com/docs/ai-gateway/pricing) and [Kernel pricing](https://www.kernel.sh/pricing).
+AI and browser use are variable rather than fixed hosting costs. Direct model APIs charge their normal token rates. OpenRouter and Vercel AI Gateway are optional routing/fallback choices, not required subscriptions; a reasonable initial budget alert for light personal use is $5–30/month, then adjust from observed usage. Kernel currently has a free developer tier with $5 in usage credits; its Hobbyist tier is $30/month plus usage. See [OpenRouter pricing](https://openrouter.ai/pricing), [AI Gateway pricing](https://vercel.com/docs/ai-gateway/pricing), and [Kernel pricing](https://www.kernel.sh/pricing).
 
 Cloudflare can also replace the web ingress, but it is a secondary architecture rather than a shipped deployment target: keep an external Node worker and a suitable Postgres connection strategy. The primary web artifact targets the Next.js Node runtime.
 
