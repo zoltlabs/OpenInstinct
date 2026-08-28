@@ -7,7 +7,7 @@
     "openinstinct": "./dist/index.js"
   },
   "scripts": {
-    "build": "tsc",
+    "build": "esbuild src/index.ts --bundle --platform=node --format=esm --outfile=dist/index.js && chmod +x dist/index.js",
     "dev": "tsx src/index.ts",
     "typecheck": "tsc --noEmit",
     "test": "vitest run"
@@ -17,5 +17,8 @@
     "@openinstinct/runtime": "workspace:*",
     "commander": "15.0.0",
     "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.2"
   }
 }

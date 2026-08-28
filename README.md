@@ -17,29 +17,48 @@ There is no new chat interface. The web app is a small owner-only control plane 
 
 ## Fastest setup
 
-Prerequisites: Node 22+, pnpm 10, a Supabase project, a Blooio account/number, and a Vercel account. The default profile works on Vercel Hobby by using a free Cloudflare Cron Trigger for queue consumption. Google OAuth and Kernel are optional until you connect those features.
+Prerequisites: Node 22+, pnpm 10, a Blooio account/number, and accounts for Supabase and your chosen compute providers. You do not need local Supabase or Docker for the default path. The lowest-friction profile uses hosted Supabase, Vercel Hobby, and a free Cloudflare Cron Trigger. Google OAuth and Kernel remain optional.
 
 ```bash
 git clone <your-fork-url> openinstinct
 cd openinstinct
 corepack enable
 pnpm install
-pnpm run setup -- --target vercel
+pnpm run setup -- --target vercel --database hosted --json
 ```
 
-`pnpm run setup` creates `.env.local`, generates the two local cryptographic secrets, and prints every missing prerequisite. It never prints generated secrets. Fill the remaining values, then:
+`setup` creates `.env.local`, generates the two local cryptographic secrets, and returns a machine-readable action plan. It never prints generated or provider secrets.
+
+Create or select the hosted Supabase project with an authorized Supabase MCP/API integration. If that is unavailable, an agent may use browser control to create the project, pausing for confirmation before project creation or credential generation. Do not use `supabase projects create --db-password ...`: it places the password in the process arguments.
+
+After the project exists, copy its pooler or direct Postgres connection URL into the CLI's hidden prompt. The command links the project, retrieves its API keys without printing them, and writes all Supabase connection values to `.env.local` with mode `0600`:
 
 ```bash
-supabase login
-supabase link --project-ref <project-ref>
-supabase db push
+pnpm exec supabase login
+pnpm run openinstinct -- configure-supabase --project-ref <project-ref>
+pnpm exec supabase db push --linked
+```
+
+Configure hosted Supabase Auth with:
+
+- Site URL: the exact `NEXT_PUBLIC_APP_URL`
+- Redirect URL: `NEXT_PUBLIC_APP_URL/api/auth/callback`
+
+An authorized Supabase MCP/API integration is preferred for those settings; browser control is the fallback. Then authenticate the compute CLIs and continue:
+
+```bash
 vercel link
-pnpm run doctor -- --target vercel
+pnpm --dir infra/cloudflare-scheduler exec wrangler login
+pnpm run doctor -- --target vercel --phase bootstrap --json
+pnpm run openinstinct -- push-vercel-env --environment production
 vercel deploy --prod
 pnpm run openinstinct -- create-blooio-webhook \
   --url https://your-domain.example --env-file .env.local
-pnpm run smoke -- --url https://your-domain.example
+pnpm run openinstinct -- push-vercel-env --environment production
+vercel deploy --prod
 ```
+
+`bootstrap` deliberately does not require `BLOOIO_WEBHOOK_SECRET`; `ready` does. The webhook command reads `BLOOIO_API_KEY` from `.env.local` and stores the one-time signing secret there without displaying either value.
 
 Deploy the free one-minute scheduler after `INTERNAL_API_SECRET` and `NEXT_PUBLIC_APP_URL` are set in `.env.local`:
 
@@ -49,16 +68,11 @@ sed -n 's/^NEXT_PUBLIC_APP_URL=//p' .env.local | \
 sed -n 's/^INTERNAL_API_SECRET=//p' .env.local | \
   pnpm --dir infra/cloudflare-scheduler exec wrangler secret put INTERNAL_API_SECRET
 pnpm --dir infra/cloudflare-scheduler deploy
+pnpm run doctor -- --target vercel --phase ready --json
+pnpm run smoke -- --url https://your-domain.example --json
 ```
 
-After creating the Blooio webhook, push the newly captured `BLOOIO_WEBHOOK_SECRET` to your deployment without displaying it:
-
-```bash
-sed -n 's/^BLOOIO_WEBHOOK_SECRET=//p' .env.local | \
-  vercel env add BLOOIO_WEBHOOK_SECRET production --force
-```
-
-The secret flows over stdin and is not printed or placed in shell history. Use the equivalent secret-manager CLI for other hosts. Redeploy after changing production environment variables.
+Every allowlisted value flows over stdin and is not printed or placed in shell history. Use the equivalent secret-manager CLI for other hosts. Redeploy after changing production environment variables.
 
 Open the deployed URL, request the owner magic link using `OWNER_EMAIL`, and onboard with the exact E.164 phone number in `BLOOIO_OWNER_PHONE`. The database enforces one owner workspace per deployment.
 
@@ -79,22 +93,23 @@ Copy [`.env.example`](./.env.example). Required production variables are:
 | `BLOOIO_OWNER_PHONE`                   | The sole owner’s E.164 phone number                   |
 | `OWNER_EMAIL`                          | The only email allowed to sign in and claim ownership |
 | `AI_MODEL`                             | AI SDK model id; defaults to `openai/gpt-5.6-sol`     |
-| `AI_GATEWAY_API_KEY`                   | Vercel AI Gateway key                                 |
+| `AI_GATEWAY_API_KEY`                   | AI Gateway key outside Vercel's managed runtime       |
 | `INTERNAL_API_SECRET`                  | Protects non-Vercel queue-consumer calls              |
 
-For Google, set `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, and the exact `GOOGLE_REDIRECT_URI`. Add that URI to the Google OAuth client. `KERNEL_API_KEY` enables the optional browser runtime. On Vercel, set `CRON_SECRET`; Vercel sends it to cron routes automatically.
+For Google, set all three of `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, and the exact `GOOGLE_REDIRECT_URI`, or leave all three unset. Add the redirect URI to the Google OAuth client. `KERNEL_API_KEY` enables the optional browser runtime. Vercel's managed runtime can authenticate to AI Gateway with its deployment identity; Docker, AWS, and GCP profiles require `AI_GATEWAY_API_KEY`. For the Vercel Pro cron profile, set `CRON_SECRET`; Vercel sends it to cron routes automatically.
 
-## Local development
+## Optional local database development
 
-Docker is required for the local Supabase stack.
+The normal setup path uses hosted Supabase. Run a local Supabase stack only when developing migrations, RLS, or database behavior; Docker is required for this optional profile.
 
 ```bash
+pnpm run setup -- --target docker --database local
 pnpm supabase:start
 pnpm supabase:reset
 pnpm dev
 ```
 
-Use the local Supabase output to fill the URL, publishable key, secret key, and database URL in `.env.local`. Local auth email appears in Supabase Inbucket at `http://127.0.0.1:54324`.
+Use the local Supabase output to fill the URL, publishable key, secret key, and database URL in the root `.env.local`. `pnpm dev` explicitly loads that file for both the web app and worker. Local auth email appears in Supabase Inbucket at `http://127.0.0.1:54324`; both `localhost` and `127.0.0.1` callback URLs are allowlisted.
 
 Run all checks:
 
@@ -133,17 +148,19 @@ Cloudflare can also replace the web ingress, but it is a secondary architecture 
 
 See [deployment details](./docs/deployment/README.md) and [architecture](./docs/architecture.md).
 
+For a Codex-driven installation, use the [agent-operated setup runbook](./docs/agent-setup.md).
+
 ## Agent-first repository contract
 
 Point Codex or another coding agent at the repository root and tell it to read [`AGENTS.md`](./AGENTS.md). That file immediately routes it to the canonical [`agent overview`](./docs/agent-overview.md), which explains the runtime, safety invariants, state model, repository map, and recipes for adding connectors, actions, channels, browser tools, and database features. Then run:
 
 ```bash
 pnpm install
-pnpm run setup -- --target <vercel|aws|gcp|docker>
-pnpm run doctor -- --target <target> --json
+pnpm run setup -- --target <vercel|vercel-pro|aws|gcp|docker> --database hosted --json
+pnpm run doctor -- --target <target> --phase bootstrap --json
 ```
 
-Commands use stable exit codes: `0` success, `2` missing setup, `3` failed smoke check. `--json` emits machine-readable results. Cloud provisioning remains explicit because it can create billable resources; all routine setup after authorization is CLI-controlled.
+Commands use stable exit codes: `0` success, `2` missing setup, `3` failed smoke check. `--json` emits machine-readable checks and external-action metadata. Agents should prefer purpose-built MCP/API integrations, then CLIs, then browser control. They must pause at project creation, credential generation, paid-plan selection, and other consequential provider actions. Secrets enter through hidden prompts, stdin, OAuth, or provider secret stores and are never included in an agent prompt or command arguments.
 
 Vercel Hobby is intended for personal, non-commercial deployments. For commercial deployments that must remain independent of Vercel, use the Cloud Run or self-hosted Docker profile.
 

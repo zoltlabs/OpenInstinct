@@ -11,7 +11,7 @@
   "scripts": {
     "build": "pnpm --filter @openinstinct/web build && pnpm --filter @openinstinct/cli build",
     "check": "pnpm format:check && pnpm typecheck && pnpm test",
-    "dev": "pnpm --parallel --filter @openinstinct/web --filter @openinstinct/worker dev",
+    "dev": "node --env-file=.env.local scripts/dev.mjs",
     "doctor": "tsx apps/cli/src/index.ts doctor",
     "format": "prettier --write .",
     "format:check": "prettier --check .",

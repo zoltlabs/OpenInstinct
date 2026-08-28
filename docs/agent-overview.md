@@ -194,13 +194,13 @@ Use Node 22 and pnpm 10.
 ```bash
 corepack enable
 pnpm install
-pnpm run doctor -- --target docker --json
-pnpm supabase:start
-pnpm supabase:reset
-pnpm dev
+pnpm run setup -- --target vercel --database hosted --json
+pnpm run openinstinct -- configure-supabase --project-ref <project-ref>
+pnpm exec supabase db push --linked
+pnpm run doctor -- --target vercel --phase bootstrap --json
 ```
 
-For setup or infrastructure work, run `doctor` before making changes. It emits machine-readable output and stable exit codes. Never print `.env.local` or pass secret values as CLI arguments.
+Hosted Supabase is the normal setup path. Use the local stack only for database development with `pnpm supabase:start` and `pnpm supabase:reset`. For setup or infrastructure work, run `doctor` before making changes. It emits machine-readable output and stable exit codes. `bootstrap` omits the not-yet-created webhook secret; `ready` requires it. Never print `.env.local` or pass secret values as CLI arguments. See `docs/agent-setup.md` for MCP, CLI, browser-fallback, and confirmation boundaries.
 
 Before handoff:
 

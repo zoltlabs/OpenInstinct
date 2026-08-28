@@ -3,7 +3,7 @@ import { z } from "zod";
 
 export const deploymentTargetSchema = z.enum([
   "vercel",
-  "cloudflare",
+  "vercel-pro",
   "aws",
   "gcp",
   "docker",
@@ -20,12 +20,12 @@ export interface CommandResult {
 export function runCommand(
   command: string,
   args: readonly string[],
-  options: { cwd?: string; input?: string } = {},
+  options: { cwd?: string; input?: string; env?: NodeJS.ProcessEnv } = {},
 ): Promise<CommandResult> {
   return new Promise((resolve, reject) => {
     const child = spawn(command, [...args], {
       cwd: options.cwd,
-      env: process.env,
+      env: options.env ?? process.env,
       shell: false,
       stdio: "pipe",
     });
@@ -54,13 +54,13 @@ export function runCommand(
 export function requiredCli(target: DeploymentTarget): readonly string[] {
   switch (target) {
     case "vercel":
+      return ["supabase", "vercel", "wrangler"];
+    case "vercel-pro":
       return ["supabase", "vercel"];
-    case "cloudflare":
-      return ["supabase", "wrangler"];
     case "aws":
-      return ["supabase", "aws", "tofu"];
+      return ["supabase", "aws"];
     case "gcp":
-      return ["supabase", "gcloud", "tofu"];
+      return ["supabase", "gcloud"];
     case "docker":
       return ["supabase", "docker"];
   }

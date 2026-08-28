@@ -1,10 +1,12 @@
 # Deployment profiles
 
-All profiles use hosted Supabase for Auth, Postgres, `pgmq`, and migrations. Run `supabase db push` before deploying application code. Set `OWNER_EMAIL` before exposing the deployment; only that normalized address can request the owner magic link or complete the server-side ownership transaction.
+All profiles use hosted Supabase for Auth, Postgres, `pgmq`, and migrations. Local Supabase is an optional database-development tool, not a production setup prerequisite. Run `pnpm exec supabase db push --linked` before deploying application code. Configure the hosted Auth Site URL and exact `/api/auth/callback` redirect for the application URL. Set `OWNER_EMAIL` before exposing the deployment; only that normalized address can request the owner magic link or complete the server-side ownership transaction.
+
+For agent-operated provisioning, prefer an authorized Supabase MCP/API integration. Use browser control only as fallback, and pause before project creation or credential generation. After creation, `openinstinct configure-supabase` captures the database URL through hidden input and writes project keys without printing them.
 
 ## Vercel Hobby + Cloudflare Scheduler (free default)
 
-Link the repository root with `vercel link`, add every production variable from `.env.example`, and deploy with `vercel deploy --prod`. [`vercel.json`](../../vercel.json) intentionally contains no native cron, so it deploys on Hobby. The included [`cloudflare-scheduler`](../../infra/cloudflare-scheduler/wrangler.jsonc) calls the protected consumer once per minute. Store `CONSUMER_URL` and the same `INTERNAL_API_SECRET` using `wrangler secret put`, then run `pnpm --dir infra/cloudflare-scheduler deploy`.
+Link the repository root with `vercel link`, run `pnpm run openinstinct -- push-vercel-env --environment production`, and deploy with `vercel deploy --prod`. The sync command sends allowlisted `.env.local` values over stdin and suppresses provider output. [`vercel.json`](../../vercel.json) intentionally contains no native cron, so it deploys on Hobby. The included [`cloudflare-scheduler`](../../infra/cloudflare-scheduler/wrangler.jsonc) calls the protected consumer once per minute. Store `CONSUMER_URL` and the same `INTERNAL_API_SECRET` using `wrangler secret put`, then run `pnpm --dir infra/cloudflare-scheduler deploy`.
 
 This scheduler performs one outbound fetch and no agent work itself. The Next.js function claims and processes the durable Supabase queue. It can therefore use Cloudflare's free Cron Trigger while the application remains on Vercel Hobby.
 
@@ -21,7 +23,7 @@ docker compose up --build -d
 pnpm run smoke -- --url http://localhost:3000 --worker-url http://localhost:3001
 ```
 
-The image has `web` and `worker` targets. Keep `.env.local` mode `0600`; Compose injects it and the Docker build excludes it.
+The image has `web` and `worker` targets. By default they connect to hosted Supabase. Keep `.env.local` mode `0600`; Compose injects it and the Docker build excludes it. Use `pnpm supabase:start` only when intentionally testing against a local database.
 
 ## Google Cloud Run
 
