@@ -25,7 +25,7 @@ describe("core policy", () => {
       "deny",
     );
     expect(decideAction({ risk: "destructive", toolName: "delete" }).type).toBe(
-      "deny",
+      "approval",
     );
   });
 

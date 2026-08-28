@@ -16,6 +16,7 @@ export async function consumeJobs(input: {
     error?: string;
   }[]
 > {
+  await input.store.dispatchDueSchedules();
   const jobs = await input.store.claimJobs(input.limit ?? 5);
   const results: {
     messageId: number;

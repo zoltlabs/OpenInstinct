@@ -40,6 +40,17 @@ export default async function ApprovalPage({
             <form action={`/api/approvals/${action.id}`} method="post">
               <input type="hidden" name="decision" value="approve" />
               <input type="hidden" name="inputHash" value={action.input_hash} />
+              {action.risk === "destructive" ? (
+                <label>
+                  Type <code>CONFIRM DESTRUCTIVE ACTION</code> to continue.
+                  <input
+                    name="destructiveConfirmation"
+                    required
+                    pattern="CONFIRM DESTRUCTIVE ACTION"
+                    autoComplete="off"
+                  />
+                </label>
+              ) : null}
               <button type="submit">Approve exactly this</button>
             </form>
             <form action={`/api/approvals/${action.id}`} method="post">

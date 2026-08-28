@@ -45,4 +45,4 @@ Implement typed direct connectors for high-value services where OAuth scopes and
 
 ## Browser automation
 
-Kernel implements the provider-neutral `BrowserProvider` interface. Browser programs have a 50 KB input limit and a 30-second execution limit. Browser actions are not yet exposed as autonomous model tools; add them through the same proposal/approval boundary used by MCP.
+Kernel implements the provider-neutral `BrowserProvider` interface. Browser programs have a 50 KB input limit and a 30-second execution limit. Public page reads may execute inline. Interactions are exposed only through a bounded step schema and the same proposal/approval boundary used by MCP; the model cannot submit arbitrary browser JavaScript.

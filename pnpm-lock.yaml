@@ -112,6 +112,9 @@ importers:
       "@ai-sdk/openai-compatible":
         specifier: 3.0.39
         version: 3.0.39(zod@4.4.3)
+      "@openinstinct/browser":
+        specifier: workspace:*
+        version: link:../../packages/browser
       "@openinstinct/connectors":
         specifier: workspace:*
         version: link:../../packages/connectors

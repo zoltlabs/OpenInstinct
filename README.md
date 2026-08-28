@@ -10,8 +10,12 @@ There is no new chat interface. The web app is a small owner-only control plane 
 - Durable agent runs and retries with Supabase Postgres and `pgmq`
 - Direct Google OAuth with PKCE, encrypted refresh tokens, Gmail reads/drafts, and Calendar reads/writes
 - Generic HTTPS MCP registration and tool discovery; MCP calls require explicit approval
+- Public HTTPS web fetches with redirect, response-size, and private-network protections
+- Owner-approved durable memory with explicit destructive forgetting
+- One-time and recurring reminders plus scheduled agent routines on the durable queue
 - Hash-bound approval requests so approved inputs cannot be changed before execution
-- Kernel browser provider abstraction, with sessions and persistent profiles
+- Kernel browser reads and bounded, approval-gated interaction steps with persistent profiles
+- Destructive actions with an additional typed owner-confirmation phrase
 - Direct OpenAI, Anthropic, and Google model access, plus optional OpenRouter, Vercel AI Gateway, and OpenAI-compatible providers
 - Vercel deployment with a cron-driven consumer, or a continuously running Docker worker
 - CLI-friendly setup, diagnostics, webhook registration, and smoke checks

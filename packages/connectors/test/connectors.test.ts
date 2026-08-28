@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   assertSafeMcpUrl,
+  assertSafeWebUrl,
   createGoogleAuthorization,
   isPrivateNetworkAddress,
 } from "../src/index";
@@ -16,6 +17,17 @@ describe("Google OAuth", () => {
     expect(url.searchParams.get("code_challenge_method")).toBe("S256");
     expect(url.searchParams.get("access_type")).toBe("offline");
     expect(result.codeVerifier.length).toBeGreaterThan(32);
+  });
+});
+
+describe("web fetch URL policy", () => {
+  it("allows only public credential-free HTTPS URLs", () => {
+    expect(assertSafeWebUrl("https://example.com/news").hostname).toBe(
+      "example.com",
+    );
+    expect(() => assertSafeWebUrl("http://example.com")).toThrow();
+    expect(() => assertSafeWebUrl("https://127.0.0.1/private")).toThrow();
+    expect(() => assertSafeWebUrl("https://token@example.com")).toThrow();
   });
 });
 

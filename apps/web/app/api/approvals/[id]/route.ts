@@ -29,6 +29,22 @@ export async function POST(
   const form = await request.formData();
   const approved = form.get("decision") === "approve";
   const inputHash = String(form.get("inputHash") ?? "");
+  if (approved) {
+    const { data: action } = await supabase
+      .from("action_requests")
+      .select("risk")
+      .eq("id", id)
+      .eq("workspace_id", workspace.id)
+      .maybeSingle();
+    if (
+      action?.risk === "destructive" &&
+      form.get("destructiveConfirmation") !== "CONFIRM DESTRUCTIVE ACTION"
+    )
+      return NextResponse.json(
+        { error: "Destructive confirmation phrase did not match." },
+        { status: 400 },
+      );
+  }
   const databaseUrl = process.env.DATABASE_URL;
   if (!databaseUrl) throw new Error("DATABASE_URL is not configured.");
   const store = new OpenInstinctStore(databaseUrl);

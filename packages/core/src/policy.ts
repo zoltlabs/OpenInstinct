@@ -36,10 +36,17 @@ export function decideAction(input: {
       reason: "The owner explicitly enabled automatic calendar writes.",
     };
   }
-  if (["security", "financial", "destructive"].includes(input.risk)) {
+  if (["security", "financial"].includes(input.risk)) {
     return {
       type: "deny",
       reason: `${input.risk} actions are disabled in the initial release.`,
+    };
+  }
+  if (input.risk === "destructive") {
+    return {
+      type: "approval",
+      reason:
+        "Destructive actions require explicit owner confirmation of the exact payload.",
     };
   }
   return {

@@ -1,5 +1,5 @@
 begin;
-select plan(14);
+select plan(18);
 
 select has_table('public', 'workspaces', 'workspaces table exists');
 select has_table('public', 'action_requests', 'action requests table exists');
@@ -15,6 +15,10 @@ select has_extension('pg_net', 'async HTTP is enabled');
 select has_function('app_private', 'invoke_consumer', array[]::text[], 'protected consumer invoker exists');
 select has_function('app_private', 'configure_consumer_scheduler', array['text', 'text'], 'scheduler configuration function exists');
 select ok(not has_function_privilege('authenticated', 'app_private.invoke_consumer()', 'EXECUTE'), 'clients cannot invoke the scheduler function');
+select has_column('public', 'scheduled_triggers', 'recurrence_seconds', 'schedules support recurrence');
+select has_column('public', 'scheduled_triggers', 'completed_at', 'schedules record completion');
+select ok((select relrowsecurity from pg_class where oid = 'public.scheduled_triggers'::regclass), 'schedules use RLS');
+select ok((select relrowsecurity from pg_class where oid = 'public.memories'::regclass), 'memories use RLS');
 
 select * from finish();
 rollback;

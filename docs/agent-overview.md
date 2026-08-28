@@ -46,7 +46,7 @@ flowchart LR
 1. `apps/web` verifies the Blooio signature against the exact, size-bounded raw request body before parsing it.
 2. `packages/db` deduplicates the provider event and atomically creates the message, agent run, and `process_event` queue job.
 3. `apps/worker` claims the durable job, loads bounded context, and runs the agent for a bounded number of steps.
-4. Safe reads may execute inline. A write or communication becomes an immutable `action_request`; the run moves to `waiting_approval`.
+4. Safe reads may execute inline. A write, communication, browser interaction, or destructive operation becomes an immutable `action_request`; the run moves to `waiting_approval`.
 5. The authenticated owner approves or denies the exact canonical input hash.
 6. Approval queues `resume_run`. The worker revalidates the connector identity, configuration version, and tool allowlist before executing the stored input.
 7. The outcome and audit trail are persisted, and a deterministic outbound message is sent through Blooio.
@@ -99,8 +99,8 @@ The important durable records are:
 - `agent_runs`: durable orchestration state
 - `action_requests` and `approvals`: immutable proposed intent and owner decision
 - `connections`: encrypted provider configuration and credentials
-- `scheduled_triggers`: future proactive work
-- `memories`: owner context with vector support
+- `scheduled_triggers`: one-time reminders and fixed-interval recurring agent routines
+- `memories`: owner-approved long-term context with explicit save/forget operations and vector-ready storage
 - `audit_events`: security-relevant history
 - `browser_profiles`: references to provider-side browser state, not raw secrets
 
@@ -243,13 +243,23 @@ Before considering a feature complete, verify:
 - `pnpm check`, `pnpm build`, relevant database tests, and the applicable smoke test pass.
 - README, this overview, deployment docs, `.env.example`, and CLI help are updated when the operator experience changes.
 
+## Current proactive, web, memory, and browser behavior
+
+- Reminders deliver an idempotent iMessage at an exact timestamp. They may repeat at a bounded fixed interval.
+- Scheduled routines inject their approved prompt as a durable scheduled event and run through the same agent queue, tool limits, policy, and approval boundary as owner messages.
+- The worker includes a bounded set of recent owner-approved memories in each model run. It can search all active memories, propose new memories, and propose destructive forgetting.
+- Public web fetch is read-only, HTTPS-only, response-bounded, redirect-free, and protected against private/special network destinations.
+- Kernel may read a page inline or execute an approved sequence of `goto`, `click`, `fill`, `select`, and bounded `wait` steps. Arbitrary JavaScript is not accepted from the model.
+- Any HTTPS MCP server can contribute discovered tools. The assistant invokes them through one generic, allowlist-checked action boundary; every invocation still requires approval, including tools described as read-only.
+- Destructive operations are no longer categorically disabled. They require a hash-bound approval plus the control plane's exact destructive confirmation phrase. Financial and security-sensitive operations remain denied.
+
 ## Intentional limitations
 
 - It is single-owner, not multi-tenant SaaS.
 - The web app is a control plane, not a primary conversation surface.
 - Generic MCP calls always require approval.
-- Browser automation is provider-abstracted but not an unrestricted agent tool.
+- Browser automation uses a bounded step language, not unrestricted model-generated code.
 - Some APIs cannot prove whether a timed-out write completed. Those actions become `unknown` and require owner reconciliation.
-- Proactive schedules and memory tables exist as foundations; broad autonomous behavior should be added incrementally with explicit owner controls and auditability.
+- Recurrence is a fixed elapsed-time interval rather than a cron or calendar recurrence rule; local-time/DST-aware schedules need a future schema extension.
 
 For architectural rationale, read [`architecture.md`](architecture.md). For operator steps, read [`deployment/README.md`](deployment/README.md). For disclosure and security expectations, read [`../SECURITY.md`](../SECURITY.md).

@@ -68,23 +68,39 @@ export default async function Home() {
     );
   }
 
-  const [{ data: connections }, { data: actions }, { data: runs }] =
-    await Promise.all([
-      supabase
-        .from("connection_summaries")
-        .select("id,provider,display_name,status,updated_at")
-        .order("updated_at", { ascending: false }),
-      supabase
-        .from("action_requests")
-        .select("id,summary,risk,status,input_hash,created_at")
-        .eq("status", "pending")
-        .order("created_at", { ascending: false }),
-      supabase
-        .from("agent_runs")
-        .select("id,status,created_at,last_error")
-        .order("created_at", { ascending: false })
-        .limit(8),
-    ]);
+  const [
+    { data: connections },
+    { data: actions },
+    { data: runs },
+    { data: schedules },
+    { data: memories },
+  ] = await Promise.all([
+    supabase
+      .from("connection_summaries")
+      .select("id,provider,display_name,status,scopes,updated_at")
+      .order("updated_at", { ascending: false }),
+    supabase
+      .from("action_requests")
+      .select("id,summary,risk,status,input_hash,created_at")
+      .eq("status", "pending")
+      .order("created_at", { ascending: false }),
+    supabase
+      .from("agent_runs")
+      .select("id,status,created_at,last_error")
+      .order("created_at", { ascending: false })
+      .limit(8),
+    supabase
+      .from("scheduled_triggers")
+      .select("id,kind,run_at,recurrence_seconds,status")
+      .in("status", ["scheduled", "queued"])
+      .order("run_at", { ascending: true })
+      .limit(12),
+    supabase
+      .from("memories")
+      .select("id,kind,content,sensitivity,updated_at")
+      .order("updated_at", { ascending: false })
+      .limit(12),
+  ]);
 
   return (
     <main>
@@ -131,6 +147,14 @@ export default async function Home() {
             />
             <button type="submit">Connect MCP</button>
           </form>
+          {connections
+            ?.filter((connection) => connection.provider === "mcp")
+            .map((connection) => (
+              <p className="status" key={connection.id}>
+                {connection.display_name ?? "MCP"}:{" "}
+                {connection.scopes.join(", ")}
+              </p>
+            ))}
         </section>
         <section className="card wide">
           <h2>Pending approvals</h2>
@@ -143,6 +167,35 @@ export default async function Home() {
             ))
           ) : (
             <p className="muted">Nothing waiting.</p>
+          )}
+        </section>
+        <section className="card wide">
+          <h2>Reminders and routines</h2>
+          {schedules?.length ? (
+            schedules.map((schedule) => (
+              <p key={schedule.id}>
+                <code>{schedule.kind}</code> ·{" "}
+                {new Date(schedule.run_at).toLocaleString()}
+                {schedule.recurrence_seconds
+                  ? ` · every ${schedule.recurrence_seconds} seconds`
+                  : ""}
+              </p>
+            ))
+          ) : (
+            <p className="muted">No active schedules.</p>
+          )}
+        </section>
+        <section className="card wide">
+          <h2>Memory</h2>
+          {memories?.length ? (
+            memories.map((memory) => (
+              <p key={memory.id}>
+                <code>{memory.kind}</code> · {memory.content} ·{" "}
+                <span className="muted">{memory.sensitivity}</span>
+              </p>
+            ))
+          ) : (
+            <p className="muted">No owner-approved durable memories.</p>
           )}
         </section>
         <section className="card wide">

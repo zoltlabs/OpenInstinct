@@ -194,9 +194,11 @@ export class OpenInstinctStore {
     const messages = await this.#sql<
       { role: "user" | "assistant"; content: string }[]
     >`
-      select role, content from public.messages
-      where conversation_id = ${run.conversation_id} and role in ('user', 'assistant')
-      order by created_at asc limit 50
+      select role, content from (
+        select role, content, created_at from public.messages
+        where conversation_id = ${run.conversation_id} and role in ('user', 'assistant')
+        order by created_at desc limit 50
+      ) recent order by created_at asc
     `;
     return {
       runId,
@@ -499,5 +501,284 @@ export class OpenInstinctStore {
       update public.action_requests set status = 'unknown'
       where id = ${actionId} and status = 'executing'
     `;
+  }
+
+  async searchMemories(input: {
+    workspaceId: string;
+    query?: string;
+    limit?: number;
+  }): Promise<
+    readonly {
+      id: string;
+      kind: string;
+      content: string;
+      confidence: number;
+      sensitivity: string;
+      updatedAt: string;
+    }[]
+  > {
+    const limit = Math.min(input.limit ?? 20, 50);
+    const pattern = `%${input.query?.trim() ?? ""}%`;
+    const rows = await this.#sql<
+      {
+        id: string;
+        kind: string;
+        content: string;
+        confidence: number;
+        sensitivity: string;
+        updated_at: Date;
+      }[]
+    >`
+      select id, kind, content, confidence, sensitivity, updated_at
+      from public.memories
+      where workspace_id = ${input.workspaceId}
+        and (expires_at is null or expires_at > now())
+        and content ilike ${pattern}
+      order by confirmed_at desc nulls last, updated_at desc
+      limit ${limit}
+    `;
+    return rows.map((row) => ({
+      id: row.id,
+      kind: row.kind,
+      content: row.content,
+      confidence: row.confidence,
+      sensitivity: row.sensitivity,
+      updatedAt: row.updated_at.toISOString(),
+    }));
+  }
+
+  async saveMemory(input: {
+    id: string;
+    workspaceId: string;
+    kind: "profile" | "episodic" | "commitment" | "open_loop" | "preference";
+    content: string;
+    sensitivity: "public" | "personal" | "sensitive";
+    sourceId: string;
+  }): Promise<void> {
+    await this.#sql`
+      insert into public.memories (
+        id, workspace_id, kind, content, source_type, source_id,
+        confidence, sensitivity, confirmed_at
+      ) values (
+        ${input.id}, ${input.workspaceId}, ${input.kind}, ${input.content},
+        'owner_approved', ${input.sourceId}, 1, ${input.sensitivity}, now()
+      ) on conflict (id) do nothing
+    `;
+  }
+
+  async deleteMemory(input: {
+    workspaceId: string;
+    memoryId: string;
+  }): Promise<void> {
+    const deleted = await this.#sql`
+      delete from public.memories
+      where id = ${input.memoryId} and workspace_id = ${input.workspaceId}
+      returning id
+    `;
+    if (deleted.length !== 1) throw new Error("Memory was not found.");
+  }
+
+  async listScheduledTriggers(input: {
+    workspaceId: string;
+    limit?: number;
+  }): Promise<
+    readonly {
+      id: string;
+      kind: string;
+      payload: Record<string, unknown>;
+      runAt: string;
+      recurrenceSeconds?: number;
+      status: string;
+    }[]
+  > {
+    const rows = await this.#sql<
+      {
+        id: string;
+        kind: string;
+        payload: Record<string, unknown>;
+        run_at: Date;
+        recurrence_seconds: string | number | null;
+        status: string;
+      }[]
+    >`
+      select id, kind, payload, run_at, recurrence_seconds, status
+      from public.scheduled_triggers
+      where workspace_id = ${input.workspaceId} and status in ('scheduled', 'queued')
+      order by run_at asc limit ${Math.min(input.limit ?? 20, 50)}
+    `;
+    return rows.map((row) => ({
+      id: row.id,
+      kind: row.kind,
+      payload: row.payload,
+      runAt: row.run_at.toISOString(),
+      recurrenceSeconds:
+        row.recurrence_seconds === null
+          ? undefined
+          : Number(row.recurrence_seconds),
+      status: row.status,
+    }));
+  }
+
+  async listBrowserProfiles(workspaceId: string): Promise<
+    readonly {
+      id: string;
+      provider: string;
+      providerProfileId: string;
+      label: string;
+    }[]
+  > {
+    const rows = await this.#sql<
+      {
+        id: string;
+        provider: string;
+        provider_profile_id: string;
+        label: string;
+      }[]
+    >`
+      select id, provider, provider_profile_id, label
+      from public.browser_profiles
+      where workspace_id = ${workspaceId}
+      order by label asc limit 50
+    `;
+    return rows.map((row) => ({
+      id: row.id,
+      provider: row.provider,
+      providerProfileId: row.provider_profile_id,
+      label: row.label,
+    }));
+  }
+
+  async createScheduledTrigger(input: {
+    id: string;
+    workspaceId: string;
+    kind: "reminder" | "routine";
+    payload: Record<string, unknown>;
+    runAt: string;
+    recurrenceSeconds?: number;
+  }): Promise<void> {
+    await this.#sql`
+      insert into public.scheduled_triggers (
+        id, workspace_id, kind, payload, run_at, recurrence_seconds
+      ) values (
+        ${input.id}, ${input.workspaceId}, ${input.kind},
+        ${this.#sql.json(toJson(input.payload))}, ${new Date(input.runAt)},
+        ${input.recurrenceSeconds ?? null}
+      ) on conflict (id) do nothing
+    `;
+  }
+
+  async cancelScheduledTrigger(input: {
+    workspaceId: string;
+    triggerId: string;
+  }): Promise<void> {
+    const updated = await this.#sql`
+      update public.scheduled_triggers
+      set status = 'cancelled', completed_at = now()
+      where id = ${input.triggerId} and workspace_id = ${input.workspaceId}
+        and status in ('scheduled', 'queued')
+      returning id
+    `;
+    if (updated.length !== 1) throw new Error("Active schedule was not found.");
+  }
+
+  async isScheduledTriggerCancelled(input: {
+    workspaceId: string;
+    triggerId: string;
+  }): Promise<boolean> {
+    const [row] = await this.#sql<{ status: string }[]>`
+      select status from public.scheduled_triggers
+      where id = ${input.triggerId} and workspace_id = ${input.workspaceId}
+    `;
+    return !row || row.status === "cancelled";
+  }
+
+  async dispatchDueSchedules(limit = 20): Promise<number> {
+    return this.#sql.begin(async (tx) => {
+      const rows = await tx<
+        {
+          id: string;
+          workspace_id: string;
+          kind: string;
+          payload: Record<string, unknown>;
+          run_at: Date;
+          recurrence_seconds: string | number | null;
+        }[]
+      >`
+        select id, workspace_id, kind, payload, run_at, recurrence_seconds
+        from public.scheduled_triggers
+        where status = 'scheduled' and run_at <= now()
+        order by run_at asc limit ${Math.min(limit, 100)}
+        for update skip locked
+      `;
+      for (const row of rows) {
+        const conversationId = row.payload.conversationId;
+        if (typeof conversationId !== "string") {
+          await tx`update public.scheduled_triggers set status = 'cancelled', completed_at = now() where id = ${row.id}`;
+          continue;
+        }
+        const occurrenceAt = row.run_at.toISOString();
+        if (row.kind === "reminder") {
+          const message = row.payload.message;
+          if (typeof message !== "string" || !message.trim()) {
+            await tx`update public.scheduled_triggers set status = 'cancelled', completed_at = now() where id = ${row.id}`;
+            continue;
+          }
+          await tx`select pgmq.send('agent_jobs', ${tx.json(
+            toJson({
+              type: "deliver_reminder",
+              triggerId: row.id,
+              occurrenceAt,
+              workspaceId: row.workspace_id,
+              conversationId,
+              message,
+            }),
+          )}::jsonb)`;
+        } else if (row.kind === "routine") {
+          const prompt = row.payload.prompt;
+          if (typeof prompt !== "string" || !prompt.trim()) {
+            await tx`update public.scheduled_triggers set status = 'cancelled', completed_at = now() where id = ${row.id}`;
+            continue;
+          }
+          const eventId = `schedule:${row.id}:${occurrenceAt}`;
+          await tx`
+            insert into public.inbound_events (id, workspace_id, source, type, occurred_at, payload)
+            values (${eventId}, ${row.workspace_id}, 'schedule', 'routine.due', ${row.run_at}, ${tx.json(toJson({ triggerId: row.id, prompt }))})
+          `;
+          await tx`
+            insert into public.messages (
+              workspace_id, conversation_id, provider_message_id, role, direction, content, status
+            ) values (
+              ${row.workspace_id}, ${conversationId}, ${eventId}, 'user', 'inbound', ${prompt}, 'scheduled'
+            )
+          `;
+          const runId = randomUUID();
+          await tx`
+            insert into public.agent_runs (id, workspace_id, conversation_id, trigger_event_id, status)
+            values (${runId}, ${row.workspace_id}, ${conversationId}, ${eventId}, 'queued')
+          `;
+          await tx`select pgmq.send('agent_jobs', ${tx.json(
+            toJson({
+              type: "process_event",
+              eventId,
+              runId,
+              workspaceId: row.workspace_id,
+            }),
+          )}::jsonb)`;
+        }
+        const recurrence =
+          row.recurrence_seconds === null
+            ? undefined
+            : Number(row.recurrence_seconds);
+        if (recurrence) {
+          let next = new Date(row.run_at.getTime() + recurrence * 1000);
+          while (next.getTime() <= Date.now())
+            next = new Date(next.getTime() + recurrence * 1000);
+          await tx`update public.scheduled_triggers set run_at = ${next}, status = 'scheduled' where id = ${row.id}`;
+        } else {
+          await tx`update public.scheduled_triggers set status = 'completed', completed_at = now() where id = ${row.id}`;
+        }
+      }
+      return rows.length;
+    });
   }
 }
