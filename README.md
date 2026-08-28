@@ -18,7 +18,7 @@ There is no new chat interface. The web app is a small owner-only control plane 
 
 ## Fastest setup
 
-Prerequisites: Node 22+, pnpm 10, a Blooio account/number, and accounts for Supabase, your chosen model provider, and your chosen compute providers. You do not need local Supabase or Docker for the default path. The lowest-friction profile uses hosted Supabase, Vercel Hobby, and a free Cloudflare Cron Trigger. Google OAuth and Kernel remain optional.
+Prerequisites: Node 22+, pnpm 10, and accounts for Supabase and Vercel. You do not need local Supabase, Docker, Cloudflare, a separate model-provider key, or a Blooio account to deploy the default path. Blooio, Google OAuth, and Kernel are connected after deployment.
 
 ```bash
 git clone <your-fork-url> openinstinct
@@ -26,17 +26,20 @@ cd openinstinct
 corepack enable
 pnpm install
 pnpm run setup -- --target vercel --database hosted --json
+pnpm run openinstinct -- setup-ui
 ```
 
 `setup` creates `.env.local`, generates the two local cryptographic secrets, and returns a machine-readable action plan. It never prints generated or provider secrets.
 
+`setup-ui` opens a loopback-only progress wizard. It asks only for the owner email first, keeps provider credentials collapsed until needed, and moves Gmail, Calendar, and iMessage to post-deploy onboarding. It never renders an existing secret, preserves blank fields, rejects cross-origin submissions, and writes `.env.local` with mode `0600`. For Vercel targets, a new setup defaults to Vercel AI Gateway so no separate model-provider key is needed.
+
 Create or select the hosted Supabase project with an authorized Supabase MCP/API integration. If that is unavailable, an agent may use browser control to create the project, pausing for confirmation before project creation or credential generation. Do not use `supabase projects create --db-password ...`: it places the password in the process arguments.
 
-After the project exists, copy its pooler or direct Postgres connection URL into the CLI's hidden prompt. The command links the project, retrieves its API keys without printing them, and writes all Supabase connection values to `.env.local` with mode `0600`:
+After the project exists, enter its pooler or direct Postgres connection URL in the loopback setup page. The command below reads it from `.env.local`, links the project, retrieves its API keys without printing them, and writes all Supabase connection values with mode `0600`:
 
 ```bash
 pnpm exec supabase login
-pnpm run openinstinct -- configure-supabase --project-ref <project-ref>
+pnpm run openinstinct -- configure-supabase --project-ref <project-ref> --use-env-database-url
 pnpm exec supabase db push --linked
 ```
 
@@ -49,10 +52,10 @@ An authorized Supabase MCP/API integration is preferred for those settings; brow
 
 ```bash
 vercel link
-pnpm --dir infra/cloudflare-scheduler exec wrangler login
 pnpm run doctor -- --target vercel --phase bootstrap --json
 pnpm run openinstinct -- push-vercel-env --environment production
 vercel deploy --prod
+pnpm run openinstinct -- configure-supabase-scheduler --json
 pnpm run openinstinct -- create-blooio-webhook \
   --url https://your-domain.example --env-file .env.local
 pnpm run openinstinct -- push-vercel-env --environment production
@@ -61,14 +64,9 @@ vercel deploy --prod
 
 `bootstrap` deliberately does not require `BLOOIO_WEBHOOK_SECRET`; `ready` does. The webhook command reads `BLOOIO_API_KEY` from `.env.local` and stores the one-time signing secret there without displaying either value.
 
-Deploy the free one-minute scheduler after `INTERNAL_API_SECRET` and `NEXT_PUBLIC_APP_URL` are set in `.env.local`:
+The scheduler command stores the protected consumer URL and `INTERNAL_API_SECRET` in Supabase Vault, then creates an idempotent one-minute Supabase Cron job. No secret is printed or embedded in the cron command. After post-deploy integrations are ready, verify the deployment:
 
 ```bash
-sed -n 's/^NEXT_PUBLIC_APP_URL=//p' .env.local | \
-  pnpm --dir infra/cloudflare-scheduler exec wrangler secret put CONSUMER_URL
-sed -n 's/^INTERNAL_API_SECRET=//p' .env.local | \
-  pnpm --dir infra/cloudflare-scheduler exec wrangler secret put INTERNAL_API_SECRET
-pnpm --dir infra/cloudflare-scheduler deploy
 pnpm run doctor -- --target vercel --phase ready --json
 pnpm run smoke -- --url https://your-domain.example --json
 ```
@@ -140,19 +138,19 @@ pnpm supabase:test
 
 Costs below are rough monthly USD estimates for one lightly used personal deployment, checked August 2026. “Platform” covers the web app, scheduler/worker, and Supabase; “fixed total” also includes the current $39/month Blooio Starter plan. Model tokens, optional browser usage, domains, taxes, and usage overages are separate.
 
-| Path                                                    |                 Estimated platform |                     Estimated fixed total | Best for                                                                                                                          |
-| ------------------------------------------------------- | ---------------------------------: | ----------------------------------------: | --------------------------------------------------------------------------------------------------------------------------------- |
-| **Vercel Hobby + Cloudflare Scheduler + Supabase Free** |                       **$0/month** |                       **about $39/month** | **Recommended starting path for a personal assistant.** The included scheduler keeps the database active during normal operation. |
-| **Vercel Hobby + Cloudflare Scheduler + Supabase Pro**  |                **about $25/month** |                       **about $64/month** | Optional reliability upgrade for automatic database backups, more storage, and support.                                           |
-| **Vercel Pro native cron + Supabase Pro**               |                **about $45/month** |                       **about $84/month** | A single web/scheduler provider and one-minute native cron without the Cloudflare Worker.                                         |
-| **Cloud Run + Cloud Scheduler + Supabase Pro**          |             **about $25–30/month** |                    **about $64–69/month** | Recommended no-Vercel path. Light scale-to-zero usage generally fits Google's free allowances, but a billing account is required. |
-| **Docker Compose + hosted Supabase**                    | **$0 or $25/month, plus the host** | **about $39 or $64/month, plus the host** | Existing hardware, a home server, or a VPS. Use Supabase Pro when database pausing is unacceptable.                               |
+| Path                                             |                 Estimated platform |                     Estimated fixed total | Best for                                                                                                                          |
+| ------------------------------------------------ | ---------------------------------: | ----------------------------------------: | --------------------------------------------------------------------------------------------------------------------------------- |
+| **Vercel Hobby + Supabase Cron + Supabase Free** |                       **$0/month** |                       **about $39/month** | **Recommended starting path.** Two infrastructure accounts, with scheduling kept inside the existing database.                    |
+| **Vercel Hobby + Supabase Cron + Supabase Pro**  |                **about $25/month** |                       **about $64/month** | Optional reliability upgrade for automatic database backups, more storage, and support.                                           |
+| **Vercel Pro native cron + Supabase Pro**        |                **about $45/month** |                       **about $84/month** | A single web/scheduler provider and one-minute native cron without the Cloudflare Worker.                                         |
+| **Cloud Run + Cloud Scheduler + Supabase Pro**   |             **about $25–30/month** |                    **about $64–69/month** | Recommended no-Vercel path. Light scale-to-zero usage generally fits Google's free allowances, but a billing account is required. |
+| **Docker Compose + hosted Supabase**             | **$0 or $25/month, plus the host** | **about $39 or $64/month, plus the host** | Existing hardware, a home server, or a VPS. Use Supabase Pro when database pausing is unacceptable.                               |
 
 The recommended progression is:
 
-1. Start with **Vercel Hobby + Cloudflare Scheduler + Supabase Free** and keep Blooio as the only fixed platform cost. This is appropriate for a normal personal deployment, not merely a trial.
+1. Start with **Vercel Hobby + Supabase Cron + Supabase Free**. Add Blooio only when the deployed control plane is ready for iMessage onboarding.
 2. Upgrade only Supabase to Pro if you specifically need automatic backups, additional database capacity, or paid support.
-3. Use **Cloud Run + Cloud Scheduler** when you want no Vercel dependency, or **Vercel Pro native cron** when reducing the number of providers matters more than the extra $20/month.
+3. Use **Cloud Run + Cloud Scheduler** when you want no Vercel dependency, or **Vercel Pro native cron** when you want scheduling on Vercel. The legacy Cloudflare scheduler remains available as the `vercel-cloudflare` advanced profile.
 4. Add a continuously running worker only when one-minute polling latency is too slow. A small Cloud Run or ECS/Fargate worker commonly adds roughly $10–50+/month depending on whether it can scale down, its region, and allocated CPU/memory.
 
 [Vercel Hobby is limited to personal, non-commercial use](https://vercel.com/docs/plans/hobby). For commercial use, choose Vercel Pro or another host and use the applicable Blooio commercial plan; the table's fixed totals use the personal Starter price.
@@ -173,7 +171,7 @@ Point Codex or another coding agent at the repository root and tell it to read [
 
 ```bash
 pnpm install
-pnpm run setup -- --target <vercel|vercel-pro|aws|gcp|docker> --database hosted --json
+pnpm run setup -- --target <vercel|vercel-pro|vercel-cloudflare|aws|gcp|docker> --database hosted --json
 pnpm run doctor -- --target <target> --phase bootstrap --json
 ```
 

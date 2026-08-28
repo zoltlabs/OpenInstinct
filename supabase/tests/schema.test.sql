@@ -1,5 +1,5 @@
 begin;
-select plan(9);
+select plan(14);
 
 select has_table('public', 'workspaces', 'workspaces table exists');
 select has_table('public', 'action_requests', 'action requests table exists');
@@ -10,6 +10,11 @@ select ok((select count(*) = 1 from pg_indexes where schemaname = 'public' and i
 select ok(not has_table_privilege('authenticated', 'public.workspaces', 'INSERT'), 'clients cannot claim workspaces directly');
 select ok(not has_table_privilege('authenticated', 'public.connections', 'UPDATE'), 'clients cannot mutate connector security state');
 select has_view('public', 'connection_summaries', 'safe connector summaries view exists');
+select has_extension('pg_cron', 'Supabase Cron is enabled');
+select has_extension('pg_net', 'async HTTP is enabled');
+select has_function('app_private', 'invoke_consumer', array[]::text[], 'protected consumer invoker exists');
+select has_function('app_private', 'configure_consumer_scheduler', array['text', 'text'], 'scheduler configuration function exists');
+select ok(not has_function_privilege('authenticated', 'app_private.invoke_consumer()', 'EXECUTE'), 'clients cannot invoke the scheduler function');
 
 select * from finish();
 rollback;

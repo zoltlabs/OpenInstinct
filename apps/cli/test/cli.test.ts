@@ -1,10 +1,15 @@
 import { describe, expect, it } from "vitest";
+import { mkdtemp, readFile, stat } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   checkEnvironment,
   envFileValues,
   parseSupabaseApiKeys,
   setupActions,
 } from "../src/index";
+import { setEnvValues } from "../src/env-file";
+import { startSetupUi, validateSetupWizardValues } from "../src/setup-ui";
 
 const validValues = {
   NEXT_PUBLIC_APP_URL: "https://openinstinct.example",
@@ -41,6 +46,20 @@ describe("agent-friendly setup checks", () => {
     expect(checks.some((check) => check.name.includes("WEBHOOK"))).toBe(false);
   });
 
+  it("does not block deployment on post-deploy iMessage setup", () => {
+    const checks = checkEnvironment({
+      values: {
+        ...validValues,
+        BLOOIO_API_KEY: undefined,
+        BLOOIO_OWNER_PHONE: undefined,
+      },
+      target: "vercel",
+      phase: "bootstrap",
+    });
+    expect(checks.every((check) => check.ok)).toBe(true);
+    expect(checks.some((check) => check.name.includes("BLOOIO"))).toBe(false);
+  });
+
   it("requires the webhook secret when checking readiness", () => {
     const checks = checkEnvironment({
       values: validValues,
@@ -62,7 +81,7 @@ describe("agent-friendly setup checks", () => {
         OPENAI_API_KEY: undefined,
       },
       target: "docker",
-      phase: "bootstrap",
+      phase: "ready",
     });
     expect(checks).toContainEqual({
       name: "env:BLOOIO_OWNER_PHONE",
@@ -129,12 +148,25 @@ describe("agent-friendly setup checks", () => {
       fallbackTool: "computer-use",
       mutatesExternalState: true,
     });
-    expect(actions.some((action) => action.id === "deploy-scheduler")).toBe(
+    expect(actions.some((action) => action.id === "configure-scheduler")).toBe(
       true,
+    );
+    expect(actions.some((action) => action.id === "deploy-scheduler")).toBe(
+      false,
     );
     expect(
       actions.some((action) => action.id === "sync-vercel-environment"),
     ).toBe(true);
+    expect(
+      setupActions("vercel-cloudflare").some(
+        (action) => action.id === "deploy-scheduler",
+      ),
+    ).toBe(true);
+    expect(
+      setupActions("vercel-pro").find((action) => action.id === "deploy-web"),
+    ).toMatchObject({
+      command: "vercel deploy --prod --local-config vercel.pro.json",
+    });
   });
 
   it("extracts current or legacy Supabase API key shapes", () => {
@@ -158,5 +190,93 @@ describe("agent-friendly setup checks", () => {
       publishableKey: "legacy_anon",
       secretKey: "legacy_service",
     });
+  });
+
+  it("quotes env values safely and keeps the file owner-only", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "openinstinct-cli-"));
+    const envPath = join(directory, ".env.local");
+    await setEnvValues(envPath, {
+      OWNER_EMAIL: "owner+setup@example.com",
+      BLOOIO_API_KEY: "key#with spaces",
+    });
+    expect(envFileValues(await readFile(envPath, "utf8"))).toMatchObject({
+      OWNER_EMAIL: "owner+setup@example.com",
+      BLOOIO_API_KEY: "key#with spaces",
+    });
+    expect((await stat(envPath)).mode & 0o777).toBe(0o600);
+    await expect(
+      setEnvValues(envPath, { BLOOIO_API_KEY: "unsafe\nINJECTED=true" }),
+    ).rejects.toThrow("line breaks");
+  });
+
+  it("validates Google OAuth as a complete group", async () => {
+    const incomplete = await validateSetupWizardValues(
+      new URLSearchParams({ GOOGLE_CLIENT_ID: "client-id" }),
+      {},
+    );
+    expect(incomplete.errors).toContain(
+      "Google OAuth requires the client ID, client secret, and redirect URL together.",
+    );
+    const complete = await validateSetupWizardValues(
+      new URLSearchParams({
+        GOOGLE_CLIENT_ID: "client-id",
+        GOOGLE_CLIENT_SECRET: "client-secret",
+        GOOGLE_REDIRECT_URI:
+          "https://openinstinct.example/api/connectors/google/callback",
+      }),
+      {},
+    );
+    expect(complete.errors).toEqual([]);
+  });
+
+  it("never renders stored secrets and rejects cross-origin form posts", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "openinstinct-ui-"));
+    const envPath = join(directory, ".env.local");
+    await setEnvValues(envPath, { BLOOIO_API_KEY: "never-render-this" });
+    const ui = await startSetupUi({ envPath, port: 0 });
+    try {
+      const page = await (await fetch(ui.url)).text();
+      expect(page).not.toContain("never-render-this");
+      expect(page).toContain("Configured — leave blank to keep it");
+      expect(page).toContain("Scheduling is handled inside Supabase");
+      expect(page).toContain("Advanced deployment options");
+      const csrf = page.match(/name="csrf" value="([^"]+)"/u)?.[1];
+      expect(csrf).toBeTruthy();
+      const response = await fetch(`${ui.url}/save`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+          Origin: "https://attacker.example",
+        },
+        body: new URLSearchParams({
+          csrf: csrf ?? "",
+          OWNER_EMAIL: "owner@example.com",
+        }),
+      });
+      expect(response.status).toBe(403);
+      expect(
+        envFileValues(await readFile(envPath, "utf8")).OWNER_EMAIL,
+      ).toBeUndefined();
+      const saved = await fetch(`${ui.url}/save`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+          Origin: ui.url,
+        },
+        body: new URLSearchParams({
+          csrf: csrf ?? "",
+          OWNER_EMAIL: "owner@example.com",
+          BLOOIO_API_KEY: "",
+        }),
+      });
+      expect(saved.status).toBe(200);
+      expect(envFileValues(await readFile(envPath, "utf8"))).toMatchObject({
+        OWNER_EMAIL: "owner@example.com",
+        BLOOIO_API_KEY: "never-render-this",
+      });
+      expect(await saved.text()).not.toContain("never-render-this");
+    } finally {
+      await ui.close();
+    }
   });
 });

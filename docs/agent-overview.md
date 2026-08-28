@@ -79,13 +79,13 @@ Preserve these in every feature:
 | `apps/worker`                | Agent tools, direct model providers and fallback, job processing, side-effect execution, retries              | `src/models.ts`, `src/agent.ts`, `src/processor.ts`, `src/consumer.ts`                                                 |
 | `apps/cli`                   | Agent-friendly setup, diagnostics, webhook provisioning, smoke tests                                          | `src/index.ts`                                                                                                         |
 | `packages/core`              | Provider-independent schemas, canonical hashing, policy, run state machine, system prompt                     | `src/domain.ts`, `src/policy.ts`, `src/state-machine.ts`, `src/prompt.ts`                                              |
-| `packages/db`                | The only direct SQL access layer, repositories, encrypted credentials, queue job schemas                      | `src/store.ts`, `src/jobs.ts`, `src/crypto.ts`                                                                         |
+| `packages/db`                | The only direct SQL access layer, repositories, encrypted credentials, queue and scheduler configuration      | `src/store.ts`, `src/jobs.ts`, `src/scheduler.ts`, `src/crypto.ts`                                                     |
 | `packages/messaging`         | Blooio v4 protocol, signature verification, message normalization and sending                                 | `src/client.ts`, `src/signature.ts`, `src/types.ts`                                                                    |
 | `packages/connectors`        | Direct Google OAuth/API and generic remote MCP transports                                                     | `src/google.ts`, `src/mcp.ts`, `src/types.ts`                                                                          |
 | `packages/browser`           | Provider-neutral browser contract and Kernel adapter                                                          | `src/provider.ts`, `src/kernel.ts`                                                                                     |
 | `packages/runtime`           | Environment validation and portable deployment contracts                                                      | `src/env.ts`, `src/deployment.ts`                                                                                      |
 | `supabase`                   | Schema, constraints, RLS, grants, functions, `pgmq`, database tests                                           | `migrations/20260827185247_initial_schema.sql`, `tests/schema.test.sql`                                                |
-| `infra/cloudflare-scheduler` | Free one-minute trigger for the bounded consumer endpoint                                                     | `src/index.ts`, `wrangler.jsonc`                                                                                       |
+| `infra/cloudflare-scheduler` | Optional advanced one-minute trigger for the bounded consumer endpoint                                        | `src/index.ts`, `wrangler.jsonc`                                                                                       |
 | `docs/deployment`            | Supported hosting profiles and secret wiring                                                                  | `README.md`                                                                                                            |
 
 Do not duplicate domain types. Put a Zod schema at the package boundary that owns the data and infer its TypeScript type.
@@ -218,7 +218,7 @@ Run the checks that require live services when those services are available. If 
 
 ## Deployment profiles
 
-- **Lowest-friction hobby setup:** Vercel Hobby for `apps/web`, Supabase, and the included Cloudflare Worker Cron Trigger for one-minute queue consumption.
+- **Lowest-friction hobby setup:** Vercel Hobby for `apps/web`, with Supabase Cron invoking the protected consumer once per minute and secrets held in Supabase Vault.
 - **No Vercel:** deploy the web and worker container targets to Cloud Run or another Node/container host, with a scheduler invoking the bounded consumer if no continuous worker is running.
 - **Self-hosted:** Docker Compose runs web and worker against the configured Supabase/Postgres project.
 - **Lower latency:** run `apps/worker` continuously instead of waiting for a one-minute scheduler tick.

@@ -1,13 +1,12 @@
 #!/usr/bin/env node
-import { access, chmod, copyFile, readFile, writeFile } from "node:fs/promises";
-import { constants } from "node:fs";
+import { copyFile, readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { randomBytes } from "node:crypto";
-import { parseEnv } from "node:util";
 import { Command } from "commander";
 import { z } from "zod";
 import { BlooioClient } from "@openinstinct/messaging";
+import { configureSupabaseScheduler } from "@openinstinct/db";
 import {
   deploymentTargetSchema,
   environmentFieldSchemas,
@@ -15,6 +14,15 @@ import {
   runCommand,
   type DeploymentTarget,
 } from "@openinstinct/runtime";
+import {
+  envFileValues,
+  pathExists as exists,
+  setEnvValue,
+  setEnvValues,
+} from "./env-file";
+import { startSetupUi } from "./setup-ui";
+
+export { envFileValues } from "./env-file";
 
 export type Check = { name: string; ok: boolean; detail: string };
 const setupPhaseSchema = z.enum(["bootstrap", "ready"]);
@@ -24,15 +32,6 @@ function emit(value: unknown, json: boolean): void {
   process.stdout.write(
     `${json ? JSON.stringify(value, null, 2) : String(value)}\n`,
   );
-}
-
-async function exists(path: string): Promise<boolean> {
-  try {
-    await access(path, constants.F_OK);
-    return true;
-  } catch {
-    return false;
-  }
 }
 
 async function commandAvailable(
@@ -54,12 +53,6 @@ async function commandAvailable(
         )
       : await runCommand(command, ["--version"], { cwd: root });
   return result.code === 0;
-}
-
-export function envFileValues(
-  source: string,
-): Record<string, string | undefined> {
-  return parseEnv(source);
 }
 
 async function readSecretInput(prompt: string): Promise<string> {
@@ -134,27 +127,6 @@ export function parseSupabaseApiKeys(value: unknown): {
   return { publishableKey, secretKey };
 }
 
-async function setEnvValue(
-  path: string,
-  name: string,
-  value: string,
-): Promise<void> {
-  const source = (await exists(path)) ? await readFile(path, "utf8") : "";
-  const lines = source.split(/\r?\n/u);
-  const index = lines.findIndex((line) => line.startsWith(`${name}=`));
-  const assignment = `${name}=${value}`;
-  if (index >= 0) lines[index] = assignment;
-  else lines.push(assignment);
-  await writeFile(
-    path,
-    `${lines.filter((line, i) => line || i < lines.length - 1).join("\n")}\n`,
-    {
-      mode: 0o600,
-    },
-  );
-  await chmod(path, 0o600);
-}
-
 const commonEnvironmentNames = [
   "NEXT_PUBLIC_APP_URL",
   "NEXT_PUBLIC_SUPABASE_URL",
@@ -162,8 +134,6 @@ const commonEnvironmentNames = [
   "SUPABASE_SECRET_KEY",
   "DATABASE_URL",
   "SECRET_ENCRYPTION_KEY",
-  "BLOOIO_API_KEY",
-  "BLOOIO_OWNER_PHONE",
   "OWNER_EMAIL",
   "AI_PROVIDER",
   "AI_MODEL",
@@ -225,7 +195,7 @@ function addProviderEnvironmentNames(
       names.push("OPENROUTER_API_KEY");
       break;
     case "vercel-gateway":
-      if (!["vercel", "vercel-pro"].includes(target))
+      if (!["vercel", "vercel-pro", "vercel-cloudflare"].includes(target))
         names.push("AI_GATEWAY_API_KEY");
       break;
     case "openai-compatible":
@@ -242,7 +212,8 @@ export function checkEnvironment(input: {
   const names: Array<keyof typeof environmentFieldSchemas> = [
     ...commonEnvironmentNames,
   ];
-  if (input.phase === "ready") names.push("BLOOIO_WEBHOOK_SECRET");
+  if (input.phase === "ready")
+    names.push("BLOOIO_API_KEY", "BLOOIO_OWNER_PHONE", "BLOOIO_WEBHOOK_SECRET");
   if (input.target === "vercel-pro") names.push("CRON_SECRET");
   addProviderEnvironmentNames(names, input.values.AI_PROVIDER, input.target);
   if (input.values.AI_FALLBACK_PROVIDER || input.values.AI_FALLBACK_MODEL) {
@@ -361,29 +332,31 @@ const program = new Command()
   .option("--root <path>", "repository root", process.cwd());
 
 export function setupActions(target: DeploymentTarget) {
-  const deploy =
-    target === "vercel" || target === "vercel-pro"
-      ? [
-          {
-            id: "link-vercel",
-            command: "vercel link",
-            mutatesExternalState: true,
-          },
-          {
-            id: "sync-vercel-environment",
-            command:
-              "pnpm run openinstinct -- push-vercel-env --environment production",
-            mutatesExternalState: true,
-            secretInput: "read from .env.local and sent over stdin",
-            confirmation: "required-before-credential-storage",
-          },
-          {
-            id: "deploy-web",
-            command: "vercel deploy --prod",
-            mutatesExternalState: true,
-          },
-        ]
-      : [];
+  const deploy = ["vercel", "vercel-pro", "vercel-cloudflare"].includes(target)
+    ? [
+        {
+          id: "link-vercel",
+          command: "vercel link",
+          mutatesExternalState: true,
+        },
+        {
+          id: "sync-vercel-environment",
+          command:
+            "pnpm run openinstinct -- push-vercel-env --environment production",
+          mutatesExternalState: true,
+          secretInput: "read from .env.local and sent over stdin",
+          confirmation: "required-before-credential-storage",
+        },
+        {
+          id: "deploy-web",
+          command:
+            target === "vercel-pro"
+              ? "vercel deploy --prod --local-config vercel.pro.json"
+              : "vercel deploy --prod",
+          mutatesExternalState: true,
+        },
+      ]
+    : [];
   return [
     {
       id: "provision-supabase",
@@ -397,7 +370,7 @@ export function setupActions(target: DeploymentTarget) {
     {
       id: "capture-supabase",
       command:
-        "pnpm run openinstinct -- configure-supabase --project-ref <project-ref>",
+        "pnpm run openinstinct -- configure-supabase --project-ref <project-ref> --use-env-database-url",
       mutatesExternalState: false,
       secretInput: "hidden prompt or stdin",
     },
@@ -418,6 +391,17 @@ export function setupActions(target: DeploymentTarget) {
     ...(target === "vercel"
       ? [
           {
+            id: "configure-scheduler",
+            command:
+              "pnpm run openinstinct -- configure-supabase-scheduler --json",
+            mutatesExternalState: true,
+            secretInput: "read from .env.local and stored in Supabase Vault",
+          },
+        ]
+      : []),
+    ...(target === "vercel-cloudflare"
+      ? [
+          {
             id: "deploy-scheduler",
             command: "pnpm --dir infra/cloudflare-scheduler deploy",
             mutatesExternalState: true,
@@ -430,7 +414,11 @@ export function setupActions(target: DeploymentTarget) {
 program
   .command("setup")
   .description("prepare local configuration and report remaining actions")
-  .option("--target <target>", "vercel|vercel-pro|aws|gcp|docker", "vercel")
+  .option(
+    "--target <target>",
+    "vercel|vercel-pro|vercel-cloudflare|aws|gcp|docker",
+    "vercel",
+  )
   .option("--database <database>", "hosted|local", "hosted")
   .option("--env-file <path>", "environment file", ".env.local")
   .action(
@@ -446,8 +434,9 @@ program
       const options = program.opts<{ json: boolean; root: string }>();
       const root = resolve(options.root);
       const envPath = resolve(root, envFile);
-      if (!(await exists(envPath)))
-        await copyFile(resolve(root, ".env.example"), envPath);
+      const parsedTarget = deploymentTargetSchema.parse(target);
+      const createdEnv = !(await exists(envPath));
+      if (createdEnv) await copyFile(resolve(root, ".env.example"), envPath);
       const generatedValues = envFileValues(await readFile(envPath, "utf8"));
       if (!generatedValues.SECRET_ENCRYPTION_KEY) {
         await setEnvValue(
@@ -463,7 +452,32 @@ program
           randomBytes(32).toString("base64url"),
         );
       }
-      const parsedTarget = deploymentTargetSchema.parse(target);
+      if (parsedTarget === "vercel-pro" && !generatedValues.CRON_SECRET) {
+        await setEnvValue(
+          envPath,
+          "CRON_SECRET",
+          randomBytes(32).toString("base64url"),
+        );
+      }
+      if (
+        ["vercel", "vercel-pro", "vercel-cloudflare"].includes(parsedTarget) &&
+        (!generatedValues.AI_PROVIDER ||
+          generatedValues.AI_PROVIDER === "openai") &&
+        !generatedValues.OPENAI_API_KEY
+      ) {
+        await setEnvValues(envPath, {
+          AI_PROVIDER: "vercel-gateway",
+          AI_MODEL: "openai/gpt-5.6-sol",
+        });
+      }
+      if (
+        !generatedValues.GOOGLE_CLIENT_ID &&
+        !generatedValues.GOOGLE_CLIENT_SECRET &&
+        generatedValues.GOOGLE_REDIRECT_URI ===
+          "http://localhost:3000/api/connectors/google/callback"
+      ) {
+        await setEnvValue(envPath, "GOOGLE_REDIRECT_URI", "");
+      }
       const parsedDatabase = z.enum(["hosted", "local"]).parse(database);
       const checks = await doctor(root, parsedTarget, "bootstrap", envFile);
       const next =
@@ -476,15 +490,24 @@ program
             ]
           : [
               "Create or select a hosted Supabase project with an authorized MCP/API integration; use browser control only as fallback.",
-              "Capture its connection securely with: pnpm run openinstinct -- configure-supabase --project-ref <project-ref> (paste DATABASE_URL only into the hidden prompt).",
+              "Enter DATABASE_URL in the loopback setup UI, then capture the connection with: pnpm run openinstinct -- configure-supabase --project-ref <project-ref> --use-env-database-url.",
               "Configure hosted Supabase Auth URLs for the final application URL.",
               "Run: pnpm exec supabase db push --linked",
               `Run: pnpm run doctor -- --target ${parsedTarget} --phase bootstrap --json`,
-              ...(["vercel", "vercel-pro"].includes(parsedTarget)
+              ...(["vercel", "vercel-pro", "vercel-cloudflare"].includes(
+                parsedTarget,
+              )
                 ? [
                     "Run: vercel link",
                     "Run: pnpm run openinstinct -- push-vercel-env --environment production",
-                    "Run: vercel deploy --prod",
+                    parsedTarget === "vercel-pro"
+                      ? "Run: vercel deploy --prod --local-config vercel.pro.json"
+                      : "Run: vercel deploy --prod",
+                    ...(parsedTarget === "vercel"
+                      ? [
+                          "Run: pnpm run openinstinct -- configure-supabase-scheduler --json",
+                        ]
+                      : []),
                   ]
                 : []),
             ];
@@ -503,9 +526,31 @@ program
   );
 
 program
+  .command("setup-ui")
+  .description("open a loopback-only browser form for private setup values")
+  .option("--env-file <path>", "secure env file to update", ".env.local")
+  .option("--port <port>", "loopback port", "4173")
+  .action(async ({ envFile, port }: { envFile: string; port: string }) => {
+    const options = program.opts<{ json: boolean; root: string }>();
+    const parsedPort = z.coerce.number().int().min(1024).max(65535).parse(port);
+    const envPath = resolve(options.root, envFile);
+    const setupUi = await startSetupUi({ envPath, port: parsedPort });
+    emit(
+      options.json
+        ? { ok: true, url: setupUi.url, envFile: envPath }
+        : `Open ${setupUi.url} to enter setup values locally. Press Ctrl-C when finished.`,
+      options.json,
+    );
+  });
+
+program
   .command("doctor")
   .description("check prerequisites without changing external services")
-  .option("--target <target>", "vercel|vercel-pro|aws|gcp|docker", "vercel")
+  .option(
+    "--target <target>",
+    "vercel|vercel-pro|vercel-cloudflare|aws|gcp|docker",
+    "vercel",
+  )
   .option("--phase <phase>", "bootstrap|ready", "bootstrap")
   .option("--env-file <path>", "environment file", ".env.local")
   .action(
@@ -655,13 +700,20 @@ program
   )
   .requiredOption("--project-ref <ref>", "20-character Supabase project ref")
   .option("--env-file <path>", "secure env file to update", ".env.local")
+  .option(
+    "--use-env-database-url",
+    "read DATABASE_URL from the secure env file instead of prompting",
+    false,
+  )
   .action(
     async ({
       projectRef,
       envFile,
+      useEnvDatabaseUrl,
     }: {
       projectRef: string;
       envFile: string;
+      useEnvDatabaseUrl: boolean;
     }) => {
       if (!/^[a-z]{20}$/u.test(projectRef))
         throw new Error("Supabase project ref must be 20 lowercase letters.");
@@ -669,9 +721,15 @@ program
         json: boolean;
         root: string;
       }>();
-      const databaseUrl = await readSecretInput(
-        "Paste the hosted Supabase DATABASE_URL (input is hidden): ",
-      );
+      const envPath = resolve(options.root, envFile);
+      const currentValues = (await exists(envPath))
+        ? envFileValues(await readFile(envPath, "utf8"))
+        : {};
+      const databaseUrl = useEnvDatabaseUrl
+        ? (currentValues.DATABASE_URL ?? "")
+        : await readSecretInput(
+            "Paste the hosted Supabase DATABASE_URL (input is hidden): ",
+          );
       const parsedDatabaseUrl =
         environmentFieldSchemas.DATABASE_URL.safeParse(databaseUrl);
       if (!parsedDatabaseUrl.success || !new URL(databaseUrl).password)
@@ -717,18 +775,15 @@ program
       const { publishableKey, secretKey } = parseSupabaseApiKeys(
         JSON.parse(apiKeys.stdout),
       );
-      const envPath = resolve(options.root, envFile);
       const projectUrl = `https://${projectRef}.supabase.co`;
-      for (const [name, value] of Object.entries({
+      await setEnvValues(envPath, {
         NEXT_PUBLIC_SUPABASE_URL: projectUrl,
         NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY: publishableKey,
         SUPABASE_URL: projectUrl,
         SUPABASE_PUBLISHABLE_KEY: publishableKey,
         SUPABASE_SECRET_KEY: secretKey,
         DATABASE_URL: databaseUrl,
-      })) {
-        await setEnvValue(envPath, name, value);
-      }
+      });
       emit(
         options.json
           ? {
@@ -749,6 +804,52 @@ program
       );
     },
   );
+
+program
+  .command("configure-supabase-scheduler")
+  .description(
+    "schedule the protected queue consumer with Supabase Cron and Vault",
+  )
+  .option("--env-file <path>", "secure env file to read", ".env.local")
+  .action(async ({ envFile }: { envFile: string }) => {
+    const options = program.opts<{ json: boolean; root: string }>();
+    const envPath = resolve(options.root, envFile);
+    if (!(await exists(envPath)))
+      throw new Error(`Environment file not found: ${envPath}`);
+    const values = envFileValues(await readFile(envPath, "utf8"));
+    const databaseUrl = environmentFieldSchemas.DATABASE_URL.parse(
+      values.DATABASE_URL,
+    );
+    const appUrl = environmentFieldSchemas.NEXT_PUBLIC_APP_URL.parse(
+      values.NEXT_PUBLIC_APP_URL,
+    );
+    const internalApiSecret = environmentFieldSchemas.INTERNAL_API_SECRET.parse(
+      values.INTERNAL_API_SECRET,
+    );
+    const parsedAppUrl = new URL(appUrl);
+    if (
+      parsedAppUrl.protocol !== "https:" ||
+      ["localhost", "127.0.0.1", "::1"].includes(parsedAppUrl.hostname)
+    )
+      throw new Error(
+        "NEXT_PUBLIC_APP_URL must be the final public HTTPS deployment URL.",
+      );
+    const consumerUrl = new URL(
+      "/api/internal/consume",
+      parsedAppUrl,
+    ).toString();
+    const result = await configureSupabaseScheduler({
+      databaseUrl,
+      consumerUrl,
+      internalApiSecret,
+    });
+    emit(
+      options.json
+        ? { ok: true, provider: "supabase-cron", consumerUrl, ...result }
+        : `Scheduled ${consumerUrl} once per minute with Supabase Cron (job ${result.jobId}).`,
+      options.json,
+    );
+  });
 
 program
   .command("create-blooio-webhook")

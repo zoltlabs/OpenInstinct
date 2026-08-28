@@ -4,15 +4,19 @@ All profiles use hosted Supabase for Auth, Postgres, `pgmq`, and migrations. Loc
 
 For agent-operated provisioning, prefer an authorized Supabase MCP/API integration. Use browser control only as fallback, and pause before project creation or credential generation. After creation, `openinstinct configure-supabase` captures the database URL through hidden input and writes project keys without printing them.
 
-## Vercel Hobby + Cloudflare Scheduler (free default)
+## Vercel Hobby + Supabase Cron (free default)
 
-Link the repository root with `vercel link`, run `pnpm run openinstinct -- push-vercel-env --environment production`, and deploy with `vercel deploy --prod`. The sync command sends allowlisted `.env.local` values over stdin and suppresses provider output. [`vercel.json`](../../vercel.json) intentionally contains no native cron, so it deploys on Hobby. The included [`cloudflare-scheduler`](../../infra/cloudflare-scheduler/wrangler.jsonc) calls the protected consumer once per minute. Store `CONSUMER_URL` and the same `INTERNAL_API_SECRET` using `wrangler secret put`, then run `pnpm --dir infra/cloudflare-scheduler deploy`.
+Link the repository root with `vercel link`, run `pnpm run openinstinct -- push-vercel-env --environment production`, and deploy with `vercel deploy --prod`. The sync command sends allowlisted `.env.local` values over stdin and suppresses provider output. [`vercel.json`](../../vercel.json) intentionally contains no native cron, so it deploys on Hobby. After setting the final `NEXT_PUBLIC_APP_URL`, run `pnpm run openinstinct -- configure-supabase-scheduler --json`.
 
-This scheduler performs one outbound fetch and no agent work itself. The Next.js function claims and processes the durable Supabase queue. It can therefore use Cloudflare's free Cron Trigger while the application remains on Vercel Hobby.
+The command stores the endpoint and bearer secret in Supabase Vault and schedules a static database function with Supabase Cron. The function performs one outbound fetch; the Next.js function claims and processes the durable queue. This keeps the default at two infrastructure accounts.
 
 ## Vercel Pro native cron
 
-If you prefer a single provider, add `{ "path": "/api/internal/consume", "schedule": "* * * * *" }` to the `crons` array in `vercel.json` and set `CRON_SECRET`. Vercel Hobby rejects schedules more frequent than daily; native one-minute cron requires Pro or Enterprise.
+Set `CRON_SECRET` and deploy with `vercel deploy --prod --local-config vercel.pro.json`. Vercel Hobby rejects schedules more frequent than daily; the included one-minute profile requires Pro or Enterprise.
+
+## Vercel Hobby + Cloudflare Scheduler (advanced)
+
+Choose the `vercel-cloudflare` target to retain the original free Cloudflare Cron Trigger. Store `CONSUMER_URL` and the same `INTERNAL_API_SECRET` with `wrangler secret put`, then run `pnpm --dir infra/cloudflare-scheduler deploy`. This path remains supported but is no longer the default because it requires a third infrastructure account.
 
 For faster replies, deploy the worker container as well and disable the Vercel cron after confirming the external worker is healthy. Multiple consumers are queue-safe, but one operating mode is easier to observe.
 

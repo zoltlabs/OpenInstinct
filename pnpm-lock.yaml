@@ -32,6 +32,9 @@ importers:
 
   apps/cli:
     dependencies:
+      "@openinstinct/db":
+        specifier: workspace:*
+        version: link:../../packages/db
       "@openinstinct/messaging":
         specifier: workspace:*
         version: link:../../packages/messaging

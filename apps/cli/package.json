@@ -13,6 +13,7 @@
     "test": "vitest run"
   },
   "dependencies": {
+    "@openinstinct/db": "workspace:*",
     "@openinstinct/messaging": "workspace:*",
     "@openinstinct/runtime": "workspace:*",
     "commander": "15.0.0",

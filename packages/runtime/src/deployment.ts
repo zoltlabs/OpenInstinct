@@ -4,6 +4,7 @@ import { z } from "zod";
 export const deploymentTargetSchema = z.enum([
   "vercel",
   "vercel-pro",
+  "vercel-cloudflare",
   "aws",
   "gcp",
   "docker",
@@ -54,9 +55,10 @@ export function runCommand(
 export function requiredCli(target: DeploymentTarget): readonly string[] {
   switch (target) {
     case "vercel":
-      return ["supabase", "vercel", "wrangler"];
     case "vercel-pro":
       return ["supabase", "vercel"];
+    case "vercel-cloudflare":
+      return ["supabase", "vercel", "wrangler"];
     case "aws":
       return ["supabase", "aws"];
     case "gcp":
