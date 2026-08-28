@@ -28,6 +28,17 @@ export type Check = { name: string; ok: boolean; detail: string };
 const setupPhaseSchema = z.enum(["bootstrap", "ready"]);
 type SetupPhase = z.infer<typeof setupPhaseSchema>;
 
+export function normalizePublicAppUrl(input: string): string {
+  const parsedUrl = environmentFieldSchemas.NEXT_PUBLIC_APP_URL.parse(input);
+  const value = new URL(parsedUrl);
+  if (
+    value.protocol !== "https:" ||
+    ["localhost", "127.0.0.1", "::1"].includes(value.hostname)
+  )
+    throw new Error("The final application URL must be public HTTPS.");
+  return value.origin;
+}
+
 function emit(value: unknown, json: boolean): void {
   process.stdout.write(
     `${json ? JSON.stringify(value, null, 2) : String(value)}\n`,
@@ -247,10 +258,11 @@ export function checkEnvironment(input: {
     });
 
   if (input.target !== "docker") {
-    for (const name of [
-      "NEXT_PUBLIC_APP_URL",
+    const deploymentUrlNames = [
       "NEXT_PUBLIC_SUPABASE_URL",
-    ] as const) {
+      ...(input.phase === "ready" ? (["NEXT_PUBLIC_APP_URL"] as const) : []),
+    ] as const;
+    for (const name of deploymentUrlNames) {
       const value = input.values[name];
       if (!value) continue;
       let isPublicHttps = false;
@@ -332,28 +344,15 @@ const program = new Command()
   .option("--root <path>", "repository root", process.cwd());
 
 export function setupActions(target: DeploymentTarget) {
-  const deploy = ["vercel", "vercel-pro", "vercel-cloudflare"].includes(target)
+  const link = ["vercel", "vercel-pro", "vercel-cloudflare"].includes(target)
     ? [
         {
           id: "link-vercel",
           command: "vercel link",
+          preferredTool: "vercel-mcp",
+          fallbackTool: "vercel-cli",
           mutatesExternalState: true,
-        },
-        {
-          id: "sync-vercel-environment",
-          command:
-            "pnpm run openinstinct -- push-vercel-env --environment production",
-          mutatesExternalState: true,
-          secretInput: "read from .env.local and sent over stdin",
-          confirmation: "required-before-credential-storage",
-        },
-        {
-          id: "deploy-web",
-          command:
-            target === "vercel-pro"
-              ? "vercel deploy --prod --local-config vercel.pro.json"
-              : "vercel deploy --prod",
-          mutatesExternalState: true,
+          confirmation: "required-before-project-creation-if-missing",
         },
       ]
     : [];
@@ -375,19 +374,58 @@ export function setupActions(target: DeploymentTarget) {
       secretInput: "hidden prompt or stdin",
     },
     {
-      id: "configure-supabase-auth",
-      description:
-        "Set the hosted Supabase Site URL and allowed redirect URL to NEXT_PUBLIC_APP_URL and NEXT_PUBLIC_APP_URL/api/auth/callback.",
-      preferredTool: "supabase-mcp",
-      fallbackTool: "computer-use",
-      mutatesExternalState: true,
-    },
-    {
       id: "push-schema",
       command: "pnpm exec supabase db push --linked",
       mutatesExternalState: true,
     },
-    ...deploy,
+    ...link,
+    ...(["vercel", "vercel-pro", "vercel-cloudflare"].includes(target)
+      ? [
+          {
+            id: "capture-app-url",
+            description:
+              "Read the default production domain assigned to the Vercel project, then store it locally with the command below.",
+            command:
+              "pnpm run openinstinct -- set-app-url --url <production-url>",
+            preferredTool: "vercel-mcp",
+            fallbackTool: "vercel-cli",
+            mutatesExternalState: false,
+          },
+          {
+            id: "configure-supabase-auth",
+            description:
+              "Set the Supabase Auth Site URL to NEXT_PUBLIC_APP_URL and allow NEXT_PUBLIC_APP_URL/api/auth/callback.",
+            preferredTool: "supabase-mcp",
+            fallbackTool: "computer-use",
+            mutatesExternalState: true,
+            confirmation: "required-before-production-auth-change",
+          },
+          {
+            id: "verify-bootstrap",
+            command: `pnpm run doctor -- --target ${target} --phase bootstrap --json`,
+            mutatesExternalState: false,
+          },
+          {
+            id: "sync-final-environment",
+            command:
+              "pnpm run openinstinct -- push-vercel-env --environment production",
+            mutatesExternalState: true,
+            secretInput: "read from .env.local and sent over stdin",
+            confirmation: "required-before-credential-storage",
+          },
+          {
+            id: "deploy-final",
+            command:
+              target === "vercel-pro"
+                ? "vercel deploy --prod --local-config vercel.pro.json"
+                : "vercel deploy --prod",
+            preferredTool: "vercel-mcp",
+            fallbackTool: "vercel-cli",
+            mutatesExternalState: true,
+            confirmation: "required-before-public-deployment",
+          },
+        ]
+      : []),
     ...(target === "vercel"
       ? [
           {
@@ -489,16 +527,17 @@ program
               "Run: pnpm run smoke -- --url http://localhost:3000",
             ]
           : [
-              "Create or select a hosted Supabase project with an authorized MCP/API integration; use browser control only as fallback.",
+              "Use the connected Supabase integration to create or select a project.",
               "Enter DATABASE_URL in the loopback setup UI, then capture the connection with: pnpm run openinstinct -- configure-supabase --project-ref <project-ref> --use-env-database-url.",
-              "Configure hosted Supabase Auth URLs for the final application URL.",
               "Run: pnpm exec supabase db push --linked",
-              `Run: pnpm run doctor -- --target ${parsedTarget} --phase bootstrap --json`,
               ...(["vercel", "vercel-pro", "vercel-cloudflare"].includes(
                 parsedTarget,
               )
                 ? [
                     "Run: vercel link",
+                    "Read the Vercel project's assigned production domain and store it with: pnpm run openinstinct -- set-app-url --url <production-url>",
+                    "Use the Supabase integration to set Auth Site URL to NEXT_PUBLIC_APP_URL and allow NEXT_PUBLIC_APP_URL/api/auth/callback.",
+                    `Run: pnpm run doctor -- --target ${parsedTarget} --phase bootstrap --json`,
                     "Run: pnpm run openinstinct -- push-vercel-env --environment production",
                     parsedTarget === "vercel-pro"
                       ? "Run: vercel deploy --prod --local-config vercel.pro.json"
@@ -509,10 +548,13 @@ program
                         ]
                       : []),
                   ]
-                : []),
+                : [
+                    `Run: pnpm run doctor -- --target ${parsedTarget} --phase bootstrap --json`,
+                  ]),
             ];
       const result = {
-        ok: checks.every((check) => check.ok),
+        ok: true,
+        ready: checks.every((check) => check.ok),
         target: parsedTarget,
         database: parsedDatabase,
         envFile: envPath,
@@ -521,9 +563,26 @@ program
         actions: parsedDatabase === "hosted" ? setupActions(parsedTarget) : [],
       };
       emit(options.json ? result : result.next.join("\n"), options.json);
-      if (!result.ok) process.exitCode = 2;
     },
   );
+
+program
+  .command("set-app-url")
+  .description("store the final public application URL before deployment")
+  .requiredOption("--url <url>", "final public HTTPS application URL")
+  .option("--env-file <path>", "secure env file to update", ".env.local")
+  .action(async ({ url, envFile }: { url: string; envFile: string }) => {
+    const options = program.opts<{ json: boolean; root: string }>();
+    const appUrl = normalizePublicAppUrl(url);
+    const envPath = resolve(options.root, envFile);
+    await setEnvValue(envPath, "NEXT_PUBLIC_APP_URL", appUrl);
+    emit(
+      options.json
+        ? { ok: true, appUrl, envFile: envPath }
+        : `Stored ${appUrl} as the final application URL.`,
+      options.json,
+    );
+  });
 
 program
   .command("setup-ui")

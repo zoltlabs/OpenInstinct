@@ -84,9 +84,23 @@ function escapeHtml(value: string): string {
     .replaceAll("'", "&#39;");
 }
 
+function hasPublicAppUrl(configured: Set<string>, value: string | undefined) {
+  if (!configured.has("NEXT_PUBLIC_APP_URL") || !value) return false;
+  try {
+    const url = new URL(value);
+    return (
+      url.protocol === "https:" &&
+      !["localhost", "127.0.0.1", "::1"].includes(url.hostname)
+    );
+  } catch {
+    return false;
+  }
+}
+
 function page(input: {
   csrfToken: string;
   configured: Set<string>;
+  appUrl?: string;
   message?: string;
   errors?: string[];
 }): string {
@@ -154,7 +168,11 @@ function page(input: {
       ].every((name) => input.configured.has(name)),
       "Supabase",
     ],
-    ["Deployment", input.configured.has("NEXT_PUBLIC_APP_URL"), "Vercel Hobby"],
+    [
+      "Deployment",
+      hasPublicAppUrl(input.configured, input.appUrl),
+      "Create the Vercel project, then capture its assigned URL",
+    ],
     [
       "iMessage",
       ["BLOOIO_OWNER_PHONE", "BLOOIO_API_KEY"].every((name) =>
@@ -266,7 +284,11 @@ export async function startSetupUi(input: {
         sendHtml(
           response,
           200,
-          page({ csrfToken, configured: await configured() }),
+          page({
+            csrfToken,
+            configured: await configured(),
+            appUrl: (await readCurrent()).NEXT_PUBLIC_APP_URL,
+          }),
         );
         return;
       }
@@ -278,6 +300,7 @@ export async function startSetupUi(input: {
             page({
               csrfToken,
               configured: await configured(),
+              appUrl: (await readCurrent()).NEXT_PUBLIC_APP_URL,
               errors: ["Invalid request origin."],
             }),
           );
@@ -294,6 +317,7 @@ export async function startSetupUi(input: {
             page({
               csrfToken,
               configured: await configured(),
+              appUrl: (await readCurrent()).NEXT_PUBLIC_APP_URL,
               errors: ["Unsupported form encoding."],
             }),
           );
@@ -307,6 +331,7 @@ export async function startSetupUi(input: {
             page({
               csrfToken,
               configured: await configured(),
+              appUrl: (await readCurrent()).NEXT_PUBLIC_APP_URL,
               errors: ["The setup session expired. Refresh and try again."],
             }),
           );
@@ -321,6 +346,7 @@ export async function startSetupUi(input: {
             page({
               csrfToken,
               configured: await configured(),
+              appUrl: current.NEXT_PUBLIC_APP_URL,
               errors: result.errors,
             }),
           );
@@ -334,6 +360,7 @@ export async function startSetupUi(input: {
           page({
             csrfToken,
             configured: await configured(),
+            appUrl: (await readCurrent()).NEXT_PUBLIC_APP_URL,
             message: `Saved ${Object.keys(result.values).length} value${Object.keys(result.values).length === 1 ? "" : "s"}.`,
           }),
         );
@@ -348,6 +375,7 @@ export async function startSetupUi(input: {
         page({
           csrfToken,
           configured: await configured(),
+          appUrl: (await readCurrent()).NEXT_PUBLIC_APP_URL,
           errors: ["Could not save configuration."],
         }),
       );

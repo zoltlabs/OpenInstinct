@@ -5,6 +5,7 @@ import { join } from "node:path";
 import {
   checkEnvironment,
   envFileValues,
+  normalizePublicAppUrl,
   parseSupabaseApiKeys,
   setupActions,
 } from "../src/index";
@@ -29,6 +30,15 @@ const validValues = {
 };
 
 describe("agent-friendly setup checks", () => {
+  it("normalizes only public HTTPS application URLs", () => {
+    expect(normalizePublicAppUrl("https://assistant.example/path")).toBe(
+      "https://assistant.example",
+    );
+    expect(() => normalizePublicAppUrl("http://localhost:3000")).toThrow(
+      "public HTTPS",
+    );
+  });
+
   it("parses quoted env-file values without exposing them", () => {
     expect(envFileValues('OWNER_EMAIL="owner@example.com"\nEMPTY=\n')).toEqual({
       OWNER_EMAIL: "owner@example.com",
@@ -58,6 +68,35 @@ describe("agent-friendly setup checks", () => {
     });
     expect(checks.every((check) => check.ok)).toBe(true);
     expect(checks.some((check) => check.name.includes("BLOOIO"))).toBe(false);
+  });
+
+  it("accepts a temporary local app URL for bootstrap but not readiness", () => {
+    const values = {
+      ...validValues,
+      NEXT_PUBLIC_APP_URL: "http://localhost:3000",
+    };
+    const bootstrap = checkEnvironment({
+      values,
+      target: "vercel",
+      phase: "bootstrap",
+    });
+    expect(bootstrap.every((check) => check.ok)).toBe(true);
+    expect(
+      bootstrap.some(
+        (check) => check.name === "env:NEXT_PUBLIC_APP_URL:deployment",
+      ),
+    ).toBe(false);
+
+    const ready = checkEnvironment({
+      values: { ...values, BLOOIO_WEBHOOK_SECRET: "webhook-secret" },
+      target: "vercel",
+      phase: "ready",
+    });
+    expect(ready).toContainEqual({
+      name: "env:NEXT_PUBLIC_APP_URL:deployment",
+      ok: false,
+      detail: "must be a public HTTPS URL for this target",
+    });
   });
 
   it("requires the webhook secret when checking readiness", () => {
@@ -154,16 +193,27 @@ describe("agent-friendly setup checks", () => {
     expect(actions.some((action) => action.id === "deploy-scheduler")).toBe(
       false,
     );
+    expect(actions.some((action) => action.id === "capture-app-url")).toBe(
+      true,
+    );
     expect(
-      actions.some((action) => action.id === "sync-vercel-environment"),
+      actions.some((action) => action.id === "sync-final-environment"),
     ).toBe(true);
+    expect(
+      actions.findIndex((action) => action.id === "capture-app-url"),
+    ).toBeLessThan(
+      actions.findIndex((action) => action.id === "configure-supabase-auth"),
+    );
+    expect(
+      actions.findIndex((action) => action.id === "configure-supabase-auth"),
+    ).toBeLessThan(actions.findIndex((action) => action.id === "deploy-final"));
     expect(
       setupActions("vercel-cloudflare").some(
         (action) => action.id === "deploy-scheduler",
       ),
     ).toBe(true);
     expect(
-      setupActions("vercel-pro").find((action) => action.id === "deploy-web"),
+      setupActions("vercel-pro").find((action) => action.id === "deploy-final"),
     ).toMatchObject({
       command: "vercel deploy --prod --local-config vercel.pro.json",
     });

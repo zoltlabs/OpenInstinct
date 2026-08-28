@@ -18,7 +18,15 @@ There is no new chat interface. The web app is a small owner-only control plane 
 
 ## Fastest setup
 
-Prerequisites: Node 22+, pnpm 10, and accounts for Supabase and Vercel. You do not need local Supabase, Docker, Cloudflare, a separate model-provider key, or a Blooio account to deploy the default path. Blooio, Google OAuth, and Kernel are connected after deployment.
+The easiest path is agent-operated. Connect authorized Supabase and Vercel integrations to Codex or another capable coding agent, open this repository, and ask:
+
+> Set up OpenInstinct using my connected Supabase and Vercel accounts. Follow AGENTS.md and docs/agent-setup.md, and pause before creating projects, storing credentials, or deploying publicly.
+
+The owner needs Node 22+, pnpm 10, and Supabase and Vercel accounts. The agent handles local preparation, database linking and migrations, deployment, final URL wiring, Supabase Auth, environment synchronization, the scheduler, and verification. It asks only at the explicit confirmation or private credential boundaries.
+
+Google Cloud and `gcloud` are optional and only needed for Gmail and Calendar. Blooio and Kernel are also post-deploy integrations. None of them blocks the core deployment.
+
+Start with:
 
 ```bash
 git clone <your-fork-url> openinstinct
@@ -26,14 +34,13 @@ cd openinstinct
 corepack enable
 pnpm install
 pnpm run setup -- --target vercel --database hosted --json
-pnpm run openinstinct -- setup-ui
 ```
 
-`setup` creates `.env.local`, generates the two local cryptographic secrets, and returns a machine-readable action plan. It never prints generated or provider secrets.
+`setup` creates `.env.local`, generates local cryptographic secrets, and returns the ordered action plan. Expected missing provider configuration is reported as `ready: false`; it does not make the setup command fail. The agent should parse `checks` and `actions` and continue from there.
 
-`setup-ui` opens a loopback-only progress wizard. It asks only for the owner email first, keeps provider credentials collapsed until needed, and moves Gmail, Calendar, and iMessage to post-deploy onboarding. It never renders an existing secret, preserves blank fields, rejects cross-origin submissions, and writes `.env.local` with mode `0600`. For Vercel targets, a new setup defaults to Vercel AI Gateway so no separate model-provider key is needed.
+When private input is needed, run `pnpm run openinstinct -- setup-ui`. The loopback-only wizard never renders an existing secret, preserves blank fields, rejects cross-origin submissions, and writes `.env.local` with mode `0600`. New Vercel setups default to Vercel AI Gateway, so no separate model-provider key is required.
 
-Create or select the hosted Supabase project with an authorized Supabase MCP/API integration. If that is unavailable, an agent may use browser control to create the project, pausing for confirmation before project creation or credential generation. Do not use `supabase projects create --db-password ...`: it places the password in the process arguments.
+The agent uses the connected Supabase integration to create or select the database project, then privately captures its Postgres connection URL and applies the migrations. If no provider integration is available, the Supabase CLI or browser is the fallback. Never pass a database password in command arguments.
 
 After the project exists, enter its pooler or direct Postgres connection URL in the loopback setup page. The command below reads it from `.env.local`, links the project, retrieves its API keys without printing them, and writes all Supabase connection values with mode `0600`:
 
@@ -43,26 +50,30 @@ pnpm run openinstinct -- configure-supabase --project-ref <project-ref> --use-en
 pnpm exec supabase db push --linked
 ```
 
-Configure hosted Supabase Auth with:
-
-- Site URL: the exact `NEXT_PUBLIC_APP_URL`
-- Redirect URL: `NEXT_PUBLIC_APP_URL/api/auth/callback`
-
-An authorized Supabase MCP/API integration is preferred for those settings; browser control is the fallback. Then authenticate the compute CLIs and continue:
+Creating the Vercel project assigns its default production domain. The agent reads that domain before deployment, stores it locally, configures Supabase Auth, synchronizes the environment, and deploys once:
 
 ```bash
 vercel link
+pnpm run openinstinct -- set-app-url --url https://your-production-url.example
+# Through the Supabase integration:
+#   Site URL = NEXT_PUBLIC_APP_URL
+#   Allowed redirect = NEXT_PUBLIC_APP_URL/api/auth/callback
 pnpm run doctor -- --target vercel --phase bootstrap --json
 pnpm run openinstinct -- push-vercel-env --environment production
 vercel deploy --prod
 pnpm run openinstinct -- configure-supabase-scheduler --json
+```
+
+That is the complete core deployment. Optional iMessage onboarding happens afterward:
+
+```bash
 pnpm run openinstinct -- create-blooio-webhook \
   --url https://your-domain.example --env-file .env.local
 pnpm run openinstinct -- push-vercel-env --environment production
 vercel deploy --prod
 ```
 
-`bootstrap` deliberately does not require `BLOOIO_WEBHOOK_SECRET`; `ready` does. The webhook command reads `BLOOIO_API_KEY` from `.env.local` and stores the one-time signing secret there without displaying either value.
+`bootstrap` can tolerate a temporary localhost URL during recovery, but the normal MCP-first path knows the Vercel production domain before deployment. It does not require Blooio. `ready` requires a final public HTTPS URL and the complete iMessage configuration. The webhook command stores its one-time signing secret without displaying it.
 
 The scheduler command stores the protected consumer URL and `INTERNAL_API_SECRET` in Supabase Vault, then creates an idempotent one-minute Supabase Cron job. No secret is printed or embedded in the cron command. After post-deploy integrations are ready, verify the deployment:
 

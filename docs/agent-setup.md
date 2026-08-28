@@ -1,12 +1,14 @@
 # Agent-operated setup
 
-This runbook is for Codex or another local coding agent with shell access, provider integrations, and optional computer control. Hosted Supabase is the default. Local Supabase is only for database development and SQL tests.
+This runbook is for Codex or another local coding agent. The normal path assumes authorized Supabase and Vercel integrations. With those connected, the agent should complete every non-secret step and pause only at the confirmation boundaries below. Hosted Supabase is the default; local Supabase is only for database development and SQL tests.
+
+`gcloud` is optional. Use it only when the owner enables Gmail and Calendar after deployment. Blooio and Kernel are also post-deploy integrations and must not block the base Supabase/Vercel deployment.
 
 ## Tool order
 
 Use the narrowest available tool in this order:
 
-1. Authorized provider MCP or API integration
+1. Authorized Supabase or Vercel MCP/API integration
 2. Provider CLI
 3. Browser/computer control
 
@@ -26,18 +28,17 @@ The user should type existing credentials into provider UI or a hidden terminal 
 ## Hosted-first sequence
 
 1. Read `AGENTS.md` and `docs/agent-overview.md`.
-2. Run `pnpm install` and `pnpm run setup -- --target vercel --database hosted --json`.
-3. Start `pnpm run openinstinct -- setup-ui` when the owner prefers a browser form. It binds only to `127.0.0.1`, never redisplays existing secrets, and safely preserves blank fields across staged setup.
-4. Parse `checks` and `actions`; do not scrape the human-readable output.
-5. Authenticate provider CLIs through their normal OAuth/login flows.
-6. Discover an existing Supabase project. If none is suitable, request confirmation, then create one with Supabase MCP/API; use computer control as fallback. Do not pass a database password to `supabase projects create` because that CLI exposes it in argv.
-7. Have the owner enter the Postgres connection URL in `setup-ui`, then run `pnpm run openinstinct -- configure-supabase --project-ref <ref> --use-env-database-url`. The command links the project, captures API keys without printing them, and updates `.env.local` with mode `0600`. The original hidden terminal prompt remains available when the browser form is not used.
-8. Set the hosted Supabase Auth Site URL to `NEXT_PUBLIC_APP_URL` and add `NEXT_PUBLIC_APP_URL/api/auth/callback` as an exact redirect URL.
-9. Run `pnpm exec supabase db push --linked`.
-10. Configure the remaining provider values through the loopback form, hidden prompts, or provider secret stores, then run `doctor --phase bootstrap`.
-11. Link the compute target. For Vercel, run `push-vercel-env`; it sends allowlisted values over stdin and suppresses provider output, then deploy. For the default Hobby target, run `configure-supabase-scheduler`; it stores the URL and bearer secret in Supabase Vault without displaying either.
-12. Complete Google and Blooio onboarding against the final public URL. Register the Blooio webhook only after an account exists, then run `push-vercel-env` again and redeploy.
-13. Run `doctor --phase ready` and `smoke --json`, then complete owner magic-link onboarding.
+2. Run `pnpm install` and `pnpm run setup -- --target vercel --database hosted --json`. A successful preparation returns `ok: true`; `ready: false` is expected until provider setup is complete.
+3. Parse the ordered `actions`. Use the connected integrations for provider work and the listed commands for local work.
+4. Discover a suitable Supabase project. If none exists, request confirmation and create one through the Supabase integration.
+5. Start `pnpm run openinstinct -- setup-ui` for the owner to enter `OWNER_EMAIL` and the Postgres connection URL privately. Then run `configure-supabase` as listed in the action plan and apply the migrations.
+6. Link or create the Vercel project. Read its assigned default production domain through the Vercel integration and run `pnpm run openinstinct -- set-app-url --url <production-url>`.
+7. Through the Supabase integration, set the Auth Site URL to the final app URL and allow the exact `<app-url>/api/auth/callback` redirect.
+8. Run `doctor --phase bootstrap`, synchronize the production environment to Vercel, request deployment confirmation, and deploy once.
+9. Run `configure-supabase-scheduler`; it stores the protected URL and bearer secret in Supabase Vault without displaying either value.
+10. Run the deployed smoke check. The base control plane is now deployed.
+11. Optionally configure Google with `gcloud` or the Google Cloud console, Kernel, and Blooio. Blooio is required for iMessage operation but not for deploying the control plane. After creating its webhook, synchronize the environment and redeploy once.
+12. Run `doctor --phase ready`, the smoke check, and owner magic-link onboarding.
 
 ## Expected pauses
 
