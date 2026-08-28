@@ -203,7 +203,7 @@ pnpm exec supabase db push --linked
 pnpm run doctor -- --target vercel --phase bootstrap --json
 ```
 
-Hosted Supabase is the normal setup path. Use the local stack only for database development with `pnpm supabase:start` and `pnpm supabase:reset`. For setup or infrastructure work, run `doctor` before making changes. It emits machine-readable output and stable exit codes. `bootstrap` omits the not-yet-created webhook secret; `ready` requires it. Never print `.env.local` or pass secret values as CLI arguments. See `docs/agent-setup.md` for MCP, CLI, browser-fallback, and confirmation boundaries.
+Hosted Supabase is the normal setup path. Use the local stack only for database development with `pnpm supabase:start` and `pnpm supabase:reset`. For setup or infrastructure work, run `doctor` before making changes. It emits machine-readable output and stable exit codes. `bootstrap` omits the not-yet-created webhook secret; `ready` requires it. Never print `.env.local` or pass secret values as CLI arguments. See `docs/agent-setup.md` for MCP, CLI, browser-fallback, and confirmation boundaries, and `docs/google-setup.md` for the Gmail and Calendar OAuth runbook.
 
 Before handoff:
 

@@ -113,7 +113,7 @@ Direct OpenAI, Anthropic, or Google access is the normal path; no AI gateway is 
 
 Existing Gateway deployments can preserve their current behavior by setting `AI_PROVIDER=vercel-gateway` and keeping the existing namespaced `AI_MODEL`. To migrate to direct OpenAI, set `AI_PROVIDER=openai`, remove the `openai/` prefix from `AI_MODEL`, and provide `OPENAI_API_KEY`.
 
-For Google application access, separately set all three of `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, and the exact `GOOGLE_REDIRECT_URI`, or leave all three unset. Those OAuth credentials are unrelated to `GOOGLE_GENERATIVE_AI_API_KEY`. Add the redirect URI to the Google OAuth client. `KERNEL_API_KEY` enables the optional browser runtime. For the Vercel Pro cron profile, set `CRON_SECRET`; Vercel sends it to cron routes automatically.
+For Google application access, separately set all three of `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, and the exact `GOOGLE_REDIRECT_URI`, or leave all three unset. Those OAuth credentials are unrelated to `GOOGLE_GENERATIVE_AI_API_KEY`. Add the redirect URI to the Google OAuth client; the [Google setup runbook](./docs/google-setup.md) covers the agent-operated `gcloud` and browser flow. `KERNEL_API_KEY` enables the optional browser runtime. For the Vercel Pro cron profile, set `CRON_SECRET`; Vercel sends it to cron routes automatically.
 
 ## Optional local database development
 
