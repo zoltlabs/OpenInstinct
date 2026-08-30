@@ -1,6 +1,11 @@
+import { z } from "zod";
 import {
+  blooioChannelSchema,
+  blooioWebhookSchema,
   sendMessageInputSchema,
   sendMessageResultSchema,
+  type BlooioChannel,
+  type BlooioWebhook,
   type SendMessageInput,
   type SendMessageResult,
 } from "./types";
@@ -69,6 +74,32 @@ export class BlooioClient {
     return sendMessageResultSchema.parse(envelope.data ?? body);
   }
 
+  async listActiveChannels(): Promise<BlooioChannel[]> {
+    const query = new URLSearchParams({
+      type: "blooio",
+      status: "active",
+      limit: "200",
+    });
+    const response = await this.#fetch(
+      `${this.#baseUrl}/channels?${query.toString()}`,
+      { headers: { Authorization: `Bearer ${this.#apiKey}` } },
+    );
+    const body: unknown = await response.json().catch(() => ({}));
+    if (!response.ok) throw blooioApiError(response.status, body);
+    const envelope = body as { data?: unknown };
+    return blooioChannelSchema.array().parse(envelope.data);
+  }
+
+  async listWebhooks(): Promise<BlooioWebhook[]> {
+    const response = await this.#fetch(`${this.#baseUrl}/webhooks`, {
+      headers: { Authorization: `Bearer ${this.#apiKey}` },
+    });
+    const body: unknown = await response.json().catch(() => ({}));
+    if (!response.ok) throw blooioApiError(response.status, body);
+    const envelope = body as { data?: unknown };
+    return blooioWebhookSchema.array().parse(envelope.data);
+  }
+
   async createWebhook(url: string): Promise<{
     id: string;
     signingSecret: string;
@@ -108,6 +139,45 @@ export class BlooioClient {
     }
     return { id, signingSecret: secret };
   }
+
+  async rotateWebhookSecret(id: string): Promise<{ signingSecret: string }> {
+    const webhookId = z.string().min(1).parse(id);
+    const response = await this.#fetch(
+      `${this.#baseUrl}/webhooks/${encodeURIComponent(webhookId)}/secret/rotate`,
+      {
+        method: "POST",
+        headers: { Authorization: `Bearer ${this.#apiKey}` },
+      },
+    );
+    const body: unknown = await response.json().catch(() => ({}));
+    if (!response.ok) throw blooioApiError(response.status, body);
+    const envelope = body as { data?: unknown };
+    const data =
+      envelope.data && typeof envelope.data === "object"
+        ? (envelope.data as Record<string, unknown>)
+        : (body as Record<string, unknown>);
+    const secret = data.signing_secret;
+    if (typeof secret !== "string" || !secret)
+      throw new Error(
+        "Blooio did not return the rotated webhook signing secret.",
+      );
+    return { signingSecret: secret };
+  }
+}
+
+function blooioApiError(status: number, body: unknown): BlooioApiError {
+  const value =
+    body && typeof body === "object" ? (body as Record<string, unknown>) : {};
+  return new BlooioApiError({
+    status,
+    code: typeof value.code === "string" ? value.code : undefined,
+    message:
+      typeof value.message === "string"
+        ? value.message
+        : typeof value.error === "string"
+          ? value.error
+          : `Blooio request failed with HTTP ${status}.`,
+  });
 }
 
 const waitForRecipientCodes = new Set([

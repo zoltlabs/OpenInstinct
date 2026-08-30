@@ -22,77 +22,126 @@ There is no new chat interface. The web app is a small owner-only control plane 
 
 ## Fastest setup
 
-The easiest path is agent-operated. Connect authorized Supabase and Vercel integrations to Codex or another capable coding agent, open this repository, and ask:
+The recommended path uses Vercel Hobby, hosted Supabase, and an agent with authorized Supabase and Vercel integrations. The agent handles non-secret work and pauses before creating projects, storing credentials, changing production auth, or deploying publicly.
 
-> Set up OpenInstinct using my connected Supabase and Vercel accounts. Follow AGENTS.md and docs/agent-setup.md, and pause before creating projects, storing credentials, or deploying publicly.
+Open this repository in Codex or another capable coding agent and ask:
 
-The owner needs Node 22+, pnpm 10, and Supabase and Vercel accounts. The agent handles local preparation, database linking and migrations, deployment, final URL wiring, Supabase Auth, environment synchronization, the scheduler, and verification. It asks only at the explicit confirmation or private credential boundaries.
+> Set up OpenInstinct using my connected Supabase and Vercel accounts. Follow AGENTS.md and docs/agent-setup.md, and pause before creating projects, storing credentials, changing production auth, or deploying publicly.
 
-Google Cloud and `gcloud` are optional and only needed for Gmail and Calendar. Blooio and Kernel are also post-deploy integrations. None of them blocks the core deployment.
+There are two setup milestones:
 
-Start with:
+- **Bootstrap:** the owner-only web control plane, database, model, and scheduler are deployed. Blooio is not required.
+- **Ready:** the public URL and Blooio iMessage integration are configured and verified.
+
+Google Gmail and Calendar and the Kernel browser are optional post-deploy integrations.
+
+### Before you start
+
+You need:
+
+- Git, Node 22+, and pnpm 10;
+- Supabase and Vercel accounts;
+- authorized Supabase and Vercel integrations for your agent, when available;
+- the Vercel CLI installed and authenticated for the documented environment-sync and deployment commands (`pnpm add --global vercel`).
+
+The Supabase CLI is already a repository development dependency. Project creation, paid-plan choices, credential storage, production auth changes, public deployment, and webhook registration always require owner confirmation.
+
+### Phase 1: Prepare the repository
 
 ```bash
 git clone <your-fork-url> openinstinct
 cd openinstinct
 corepack enable
 pnpm install
+pnpm run doctor -- --target vercel --phase bootstrap --json
 pnpm run setup -- --target vercel --database hosted --json
 ```
 
-`setup` creates `.env.local`, generates local cryptographic secrets, and returns the ordered action plan. Expected missing provider configuration is reported as `ready: false`; it does not make the setup command fail. The agent should parse `checks` and `actions` and continue from there.
+The first `doctor` usually exits with code `2` and reports missing configuration; that is expected. `setup` then creates `.env.local`, generates local cryptographic secrets, selects Vercel AI Gateway by default, and returns ordered `checks` and `actions`. It should return `ok: true`; `ready: false` is expected at this stage.
 
-When private input is needed, run `pnpm run openinstinct -- setup-ui`. The loopback-only wizard never renders an existing secret, preserves blank fields, rejects cross-origin submissions, and writes `.env.local` with mode `0600`. New Vercel setups default to Vercel AI Gateway, so no separate model-provider key is required.
+### Phase 2: Configure the owner and Supabase
 
-The agent uses the connected Supabase integration to create or select the database project, then privately captures its Postgres connection URL and applies the migrations. If no provider integration is available, the Supabase CLI or browser is the fallback. Never pass a database password in command arguments.
+1. Use the authorized Supabase integration to select a project. Ask before creating one.
+2. Start the private setup form, which opens automatically in the default browser:
 
-After the project exists, enter its pooler or direct Postgres connection URL in the loopback setup page. The command below reads it from `.env.local`, links the project, retrieves its API keys without printing them, and writes all Supabase connection values with mode `0600`:
+   ```bash
+   pnpm run openinstinct -- setup-ui
+   ```
 
-```bash
-pnpm exec supabase login
-pnpm run openinstinct -- configure-supabase --project-ref <project-ref> --use-env-database-url
-pnpm exec supabase db push --linked
-```
+   Use `--no-open` to print the loopback URL without launching a browser.
 
-Creating the Vercel project assigns its default production domain. The agent reads that domain before deployment, stores it locally, configures Supabase Auth, synchronizes the environment, and deploys once:
+3. The owner enters `OWNER_EMAIL` and the Supabase pooler or direct Postgres `DATABASE_URL`, saves, and then stops the local form with Ctrl-C. Other integration fields can remain blank.
+4. Link Supabase and apply the schema:
+
+   ```bash
+   pnpm exec supabase login
+   pnpm run openinstinct -- configure-supabase --project-ref <project-ref> --use-env-database-url
+   pnpm exec supabase db push --linked
+   ```
+
+`configure-supabase` reads the database URL from `.env.local`, retrieves the project API keys without printing them, and keeps the file owner-readable only. Never pass a database password in command arguments.
+
+### Phase 3: Link Vercel and configure the final URL
+
+1. Run `vercel link`. If no project is linked, ask before creating one.
+2. Read the assigned production domain and store it locally.
+3. Configure Supabase Auth for that exact URL.
 
 ```bash
 vercel link
 pnpm run openinstinct -- set-app-url --url https://your-production-url.example
-# Through the Supabase integration:
-#   Site URL = NEXT_PUBLIC_APP_URL
-#   Allowed redirect = NEXT_PUBLIC_APP_URL/api/auth/callback
+```
+
+In Supabase Auth, set:
+
+- Site URL: the exact `NEXT_PUBLIC_APP_URL`
+- Allowed redirect: `<NEXT_PUBLIC_APP_URL>/api/auth/callback`
+
+Changing production Auth settings requires owner confirmation.
+
+### Phase 4: Validate and deploy the core
+
+```bash
 pnpm run doctor -- --target vercel --phase bootstrap --json
 pnpm run openinstinct -- push-vercel-env --environment production
 vercel deploy --prod
 pnpm run openinstinct -- configure-supabase-scheduler --json
+pnpm run smoke -- --url https://your-production-url.example --json
 ```
 
-That is the complete core deployment. Optional iMessage onboarding happens afterward:
+Ask before storing the production environment or deploying. The scheduler command stores the protected consumer URL and `INTERNAL_API_SECRET` in Supabase Vault, then creates an idempotent one-minute Supabase Cron job. At the end of this phase, the core control plane is deployed.
+
+### Phase 5: Enable iMessage and reach ready
+
+1. Open Blooio from `setup-ui`. The owner completes Blooio account verification and billing, provisions the assistant number, and creates an API key assigned to it. OpenInstinct never purchases or cancels a Blooio line.
+2. Save the owner phone and API key privately, then click **Verify Blooio**. If the API key has exactly one active number, the wizard captures its channel automatically. The equivalent agent-safe command is `pnpm run openinstinct -- configure-blooio --use-env-api-key --json`.
+3. Ask before registering the production webhook. Click **Register webhook** in the wizard or use the CLI command below.
+4. Synchronize the new environment and redeploy.
 
 ```bash
 pnpm run openinstinct -- create-blooio-webhook \
-  --url https://your-domain.example --env-file .env.local
+  --url https://your-production-url.example --env-file .env.local
 pnpm run openinstinct -- push-vercel-env --environment production
 vercel deploy --prod
-```
-
-`bootstrap` can tolerate a temporary localhost URL during recovery, but the normal MCP-first path knows the Vercel production domain before deployment. It does not require Blooio. `ready` requires a final public HTTPS URL and the complete iMessage configuration. The webhook command stores its one-time signing secret without displaying it.
-
-The scheduler command stores the protected consumer URL and `INTERNAL_API_SECRET` in Supabase Vault, then creates an idempotent one-minute Supabase Cron job. No secret is printed or embedded in the cron command. After post-deploy integrations are ready, verify the deployment:
-
-```bash
 pnpm run doctor -- --target vercel --phase ready --json
-pnpm run smoke -- --url https://your-domain.example --json
+pnpm run smoke -- --url https://your-production-url.example --json
 ```
 
-Every allowlisted value flows over stdin and is not printed or placed in shell history. Use the equivalent secret-manager CLI for other hosts. Redeploy after changing production environment variables.
+Webhook registration is recoverable: the command lists existing subscriptions, reuses an exact match when its secret is already stored, and rotates the matching webhook secret when local recovery is needed. It never blindly creates a second matching webhook, and it never displays the secret. Open the deployed URL, request the owner magic link using `OWNER_EMAIL`, and onboard with the exact E.164 value in `BLOOIO_OWNER_PHONE`. The database enforces one owner workspace per deployment.
 
-Open the deployed URL, request the owner magic link using `OWNER_EMAIL`, and onboard with the exact E.164 phone number in `BLOOIO_OWNER_PHONE`. The database enforces one owner workspace per deployment.
+### Phase 6: Add optional integrations
+
+- Gmail and Calendar: follow the [Google setup runbook](./docs/google-setup.md).
+- Kernel cloud browser: add `KERNEL_API_KEY` through `setup-ui`.
+- Other hosts and schedulers: see [deployment details](./docs/deployment/README.md).
+
+After changing production environment variables, synchronize them and redeploy. Allowlisted values flow over stdin and are not printed or placed in shell history. Use the equivalent secret manager for non-Vercel hosts.
 
 ## Environment
 
-Copy [`.env.example`](./.env.example). Required production variables are:
+Copy [`.env.example`](./.env.example). The setup command generates the cryptographic values and the setup tools populate provider values without displaying secrets.
+
+Required for the core deployment:
 
 | Variable                               | Purpose                                               |
 | -------------------------------------- | ----------------------------------------------------- |
@@ -102,14 +151,21 @@ Copy [`.env.example`](./.env.example). Required production variables are:
 | `SUPABASE_SECRET_KEY`                  | Server-only Supabase secret key                       |
 | `DATABASE_URL`                         | Direct or pooler Postgres URL; use SSL remotely       |
 | `SECRET_ENCRYPTION_KEY`                | Base64 32-byte AES key for connector credentials      |
-| `BLOOIO_API_KEY`                       | Blooio v4 API key                                     |
-| `BLOOIO_WEBHOOK_SECRET`                | One-time secret returned when the webhook is created  |
-| `BLOOIO_OWNER_PHONE`                   | The sole owner’s E.164 phone number                   |
 | `OWNER_EMAIL`                          | The only email allowed to sign in and claim ownership |
 | `AI_PROVIDER`                          | Direct or optional routing provider                   |
 | `AI_MODEL`                             | Provider-native model id                              |
 | Selected provider credential           | The matching server-only API key described below      |
 | `INTERNAL_API_SECRET`                  | Protects non-Vercel queue-consumer calls              |
+
+Additionally required for iMessage-ready status:
+
+| Variable                | Purpose                                              |
+| ----------------------- | ---------------------------------------------------- |
+| `BLOOIO_API_KEY`        | Blooio v4 API key                                    |
+| `BLOOIO_WEBHOOK_SECRET` | One-time secret returned when the webhook is created |
+| `BLOOIO_OWNER_PHONE`    | The sole owner’s E.164 phone number                  |
+
+`BLOOIO_CHANNEL_ID` is optional unless the provisioned Blooio configuration requires an explicit sending channel.
 
 Model providers are selected explicitly:
 

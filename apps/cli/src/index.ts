@@ -5,7 +5,6 @@ import { pathToFileURL } from "node:url";
 import { randomBytes } from "node:crypto";
 import { Command } from "commander";
 import { z } from "zod";
-import { BlooioClient } from "@openinstinct/messaging";
 import { configureSupabaseScheduler } from "@openinstinct/db";
 import {
   deploymentTargetSchema,
@@ -21,8 +20,11 @@ import {
   setEnvValues,
 } from "./env-file";
 import { startSetupUi } from "./setup-ui";
+import { setupActions } from "./setup-plan";
+import { configureBlooio, ensureBlooioWebhook } from "./blooio-setup";
 
 export { envFileValues } from "./env-file";
+export { setupActions } from "./setup-plan";
 
 export type Check = { name: string; ok: boolean; detail: string };
 const setupPhaseSchema = z.enum(["bootstrap", "ready"]);
@@ -95,6 +97,17 @@ async function readSecretInput(prompt: string): Promise<string> {
     process.stdin.resume();
     process.stdin.on("data", onData);
   });
+}
+
+async function openBrowser(url: string, root: string): Promise<boolean> {
+  const command =
+    process.platform === "darwin"
+      ? { name: "open", args: [url] }
+      : process.platform === "win32"
+        ? { name: "cmd", args: ["/c", "start", "", url] }
+        : { name: "xdg-open", args: [url] };
+  const result = await runCommand(command.name, command.args, { cwd: root });
+  return result.code === 0;
 }
 
 export function parseSupabaseApiKeys(value: unknown): {
@@ -343,112 +356,6 @@ const program = new Command()
   .option("--json", "emit machine-readable JSON", false)
   .option("--root <path>", "repository root", process.cwd());
 
-export function setupActions(target: DeploymentTarget) {
-  const link = ["vercel", "vercel-pro", "vercel-cloudflare"].includes(target)
-    ? [
-        {
-          id: "link-vercel",
-          command: "vercel link",
-          preferredTool: "vercel-mcp",
-          fallbackTool: "vercel-cli",
-          mutatesExternalState: true,
-          confirmation: "required-before-project-creation-if-missing",
-        },
-      ]
-    : [];
-  return [
-    {
-      id: "provision-supabase",
-      description:
-        "Create or select a hosted Supabase project. Prefer an authorized Supabase MCP/API integration; use browser control as the fallback.",
-      preferredTool: "supabase-mcp",
-      fallbackTool: "computer-use",
-      mutatesExternalState: true,
-      confirmation: "required-before-project-or-credential-creation",
-    },
-    {
-      id: "capture-supabase",
-      command:
-        "pnpm run openinstinct -- configure-supabase --project-ref <project-ref> --use-env-database-url",
-      mutatesExternalState: false,
-      secretInput: "hidden prompt or stdin",
-    },
-    {
-      id: "push-schema",
-      command: "pnpm exec supabase db push --linked",
-      mutatesExternalState: true,
-    },
-    ...link,
-    ...(["vercel", "vercel-pro", "vercel-cloudflare"].includes(target)
-      ? [
-          {
-            id: "capture-app-url",
-            description:
-              "Read the default production domain assigned to the Vercel project, then store it locally with the command below.",
-            command:
-              "pnpm run openinstinct -- set-app-url --url <production-url>",
-            preferredTool: "vercel-mcp",
-            fallbackTool: "vercel-cli",
-            mutatesExternalState: false,
-          },
-          {
-            id: "configure-supabase-auth",
-            description:
-              "Set the Supabase Auth Site URL to NEXT_PUBLIC_APP_URL and allow NEXT_PUBLIC_APP_URL/api/auth/callback.",
-            preferredTool: "supabase-mcp",
-            fallbackTool: "computer-use",
-            mutatesExternalState: true,
-            confirmation: "required-before-production-auth-change",
-          },
-          {
-            id: "verify-bootstrap",
-            command: `pnpm run doctor -- --target ${target} --phase bootstrap --json`,
-            mutatesExternalState: false,
-          },
-          {
-            id: "sync-final-environment",
-            command:
-              "pnpm run openinstinct -- push-vercel-env --environment production",
-            mutatesExternalState: true,
-            secretInput: "read from .env.local and sent over stdin",
-            confirmation: "required-before-credential-storage",
-          },
-          {
-            id: "deploy-final",
-            command:
-              target === "vercel-pro"
-                ? "vercel deploy --prod --local-config vercel.pro.json"
-                : "vercel deploy --prod",
-            preferredTool: "vercel-mcp",
-            fallbackTool: "vercel-cli",
-            mutatesExternalState: true,
-            confirmation: "required-before-public-deployment",
-          },
-        ]
-      : []),
-    ...(target === "vercel"
-      ? [
-          {
-            id: "configure-scheduler",
-            command:
-              "pnpm run openinstinct -- configure-supabase-scheduler --json",
-            mutatesExternalState: true,
-            secretInput: "read from .env.local and stored in Supabase Vault",
-          },
-        ]
-      : []),
-    ...(target === "vercel-cloudflare"
-      ? [
-          {
-            id: "deploy-scheduler",
-            command: "pnpm --dir infra/cloudflare-scheduler deploy",
-            mutatesExternalState: true,
-          },
-        ]
-      : []),
-  ];
-}
-
 program
   .command("setup")
   .description("prepare local configuration and report remaining actions")
@@ -552,6 +459,7 @@ program
                     `Run: pnpm run doctor -- --target ${parsedTarget} --phase bootstrap --json`,
                   ]),
             ];
+      const resolvedValues = envFileValues(await readFile(envPath, "utf8"));
       const result = {
         ok: true,
         ready: checks.every((check) => check.ok),
@@ -560,7 +468,10 @@ program
         envFile: envPath,
         checks,
         next,
-        actions: parsedDatabase === "hosted" ? setupActions(parsedTarget) : [],
+        actions:
+          parsedDatabase === "hosted"
+            ? setupActions(parsedTarget, resolvedValues)
+            : [],
       };
       emit(options.json ? result : result.next.join("\n"), options.json);
     },
@@ -589,18 +500,38 @@ program
   .description("open a loopback-only browser form for private setup values")
   .option("--env-file <path>", "secure env file to update", ".env.local")
   .option("--port <port>", "loopback port", "4173")
-  .action(async ({ envFile, port }: { envFile: string; port: string }) => {
-    const options = program.opts<{ json: boolean; root: string }>();
-    const parsedPort = z.coerce.number().int().min(1024).max(65535).parse(port);
-    const envPath = resolve(options.root, envFile);
-    const setupUi = await startSetupUi({ envPath, port: parsedPort });
-    emit(
-      options.json
-        ? { ok: true, url: setupUi.url, envFile: envPath }
-        : `Open ${setupUi.url} to enter setup values locally. Press Ctrl-C when finished.`,
-      options.json,
-    );
-  });
+  .option("--no-open", "print the local URL without opening a browser")
+  .action(
+    async ({
+      envFile,
+      port,
+      open,
+    }: {
+      envFile: string;
+      port: string;
+      open: boolean;
+    }) => {
+      const options = program.opts<{ json: boolean; root: string }>();
+      const parsedPort = z.coerce
+        .number()
+        .int()
+        .min(1024)
+        .max(65535)
+        .parse(port);
+      const envPath = resolve(options.root, envFile);
+      const setupUi = await startSetupUi({ envPath, port: parsedPort });
+      const opened =
+        open && !options.json
+          ? await openBrowser(setupUi.url, options.root).catch(() => false)
+          : false;
+      emit(
+        options.json
+          ? { ok: true, url: setupUi.url, envFile: envPath }
+          : `${opened ? "Opened" : "Open"} ${setupUi.url} to continue setup locally. Press Ctrl-C when finished.`,
+        options.json,
+      );
+    },
+  );
 
 program
   .command("doctor")
@@ -911,43 +842,89 @@ program
   });
 
 program
+  .command("configure-blooio")
+  .description(
+    "verify a user-managed Blooio account and discover its active channels",
+  )
+  .option("--channel-id <id>", "explicit active Blooio channel to use")
+  .option("--env-file <path>", "secure env file to update", ".env.local")
+  .option(
+    "--use-env-api-key",
+    "read BLOOIO_API_KEY from the secure env file instead of prompting",
+    false,
+  )
+  .action(
+    async ({
+      channelId,
+      envFile,
+      useEnvApiKey,
+    }: {
+      channelId?: string;
+      envFile: string;
+      useEnvApiKey: boolean;
+    }) => {
+      const options = program.opts<{ json: boolean; root: string }>();
+      const envPath = resolve(options.root, envFile);
+      const values = (await exists(envPath))
+        ? envFileValues(await readFile(envPath, "utf8"))
+        : {};
+      const apiKey = useEnvApiKey
+        ? (process.env.BLOOIO_API_KEY ?? values.BLOOIO_API_KEY ?? "")
+        : await readSecretInput("Paste the Blooio API key (input is hidden): ");
+      if (!apiKey)
+        throw new Error(
+          "BLOOIO_API_KEY is missing. Add it through setup-ui or enter it at the hidden prompt.",
+        );
+      const result = await configureBlooio({
+        envPath,
+        apiKey,
+        ...(channelId ? { channelId } : {}),
+      });
+      const safeChannels = result.channels.map((channel) => ({
+        id: channel.id,
+        address: channel.address,
+        status: channel.status,
+      }));
+      emit(
+        options.json
+          ? {
+              ok: true,
+              channels: safeChannels,
+              selectedChannelId: result.selectedChannelId ?? null,
+              envFile: envPath,
+            }
+          : result.selectedChannelId
+            ? `Verified Blooio and selected ${result.selectedChannelId}.`
+            : `Verified Blooio with ${result.channels.length} active channels. Add --channel-id to pin one, or leave routing to Blooio.`,
+        options.json,
+      );
+    },
+  );
+
+program
   .command("create-blooio-webhook")
   .description(
-    "register the deployed webhook; the signing secret is never printed",
+    "idempotently register the deployed webhook; the signing secret is never printed",
   )
   .requiredOption("--url <url>", "public application URL")
   .option("--env-file <path>", "secure env file to update", ".env.local")
   .action(async ({ url, envFile }: { url: string; envFile: string }) => {
     const options = program.opts<{ json: boolean; root: string }>();
     const secretPath = resolve(options.root, envFile);
-    const values = (await exists(secretPath))
-      ? envFileValues(await readFile(secretPath, "utf8"))
-      : {};
-    const apiKey = process.env.BLOOIO_API_KEY ?? values.BLOOIO_API_KEY;
-    if (!apiKey)
-      throw new Error(
-        "Set BLOOIO_API_KEY in the environment or add it to --env-file.",
-      );
-    const publicUrl = new URL(url);
-    if (publicUrl.protocol !== "https:")
-      throw new Error("Blooio webhooks require a public HTTPS URL.");
-    const webhook = await new BlooioClient({ apiKey }).createWebhook(
-      new URL("/api/webhooks/blooio", publicUrl).toString(),
-    );
-    await setEnvValue(
-      secretPath,
-      "BLOOIO_WEBHOOK_SECRET",
-      webhook.signingSecret,
-    );
+    const webhook = await ensureBlooioWebhook({
+      envPath: secretPath,
+      appUrl: url,
+    });
     emit(
       options.json
         ? {
             ok: true,
-            webhookId: webhook.id,
-            secretCaptured: true,
+            ...webhook,
             envFile: secretPath,
           }
-        : `Created webhook ${webhook.id}; stored the one-time signing secret in ${secretPath} with mode 0600.`,
+        : webhook.operation === "reused"
+          ? `Verified existing webhook ${webhook.webhookId}; the stored signing secret was preserved.`
+          : `${webhook.operation === "created" ? "Created" : "Recovered"} webhook ${webhook.webhookId}; stored its one-time signing secret in ${secretPath} with mode 0600.`,
       options.json,
     );
   });

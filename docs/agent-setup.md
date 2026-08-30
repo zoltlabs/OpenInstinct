@@ -25,24 +25,57 @@ Read-only discovery needs no confirmation. Pause immediately before:
 
 The user should type existing credentials into provider UI or a hidden terminal prompt. `configure-supabase` accepts the database URL through a hidden prompt or stdin and never prints it.
 
-## Hosted-first sequence
+## Milestones
+
+- **Bootstrap:** the database, owner-only control plane, model, and scheduler are deployed. Blooio is not required.
+- **Ready:** the final public URL and Blooio iMessage integration are configured and verified.
+
+## Hosted-first phase checklist
+
+### Phase 1: Prepare locally
 
 1. Read `AGENTS.md` and `docs/agent-overview.md`.
-2. Run `pnpm install` and `pnpm run setup -- --target vercel --database hosted --json`. A successful preparation returns `ok: true`; `ready: false` is expected until provider setup is complete.
-3. Parse the ordered `actions`. Use the connected integrations for provider work and the listed commands for local work.
-4. Discover a suitable Supabase project. If none exists, request confirmation and create one through the Supabase integration.
-5. Start `pnpm run openinstinct -- setup-ui` for the owner to enter `OWNER_EMAIL` and the Postgres connection URL privately. Then run `configure-supabase` as listed in the action plan and apply the migrations.
-6. Link or create the Vercel project. Read its assigned default production domain through the Vercel integration and run `pnpm run openinstinct -- set-app-url --url <production-url>`.
-7. Through the Supabase integration, set the Auth Site URL to the final app URL and allow the exact `<app-url>/api/auth/callback` redirect.
-8. Run `doctor --phase bootstrap`, synchronize the production environment to Vercel, request deployment confirmation, and deploy once.
-9. Run `configure-supabase-scheduler`; it stores the protected URL and bearer secret in Supabase Vault without displaying either value.
-10. Run the deployed smoke check. The base control plane is now deployed.
-11. Optionally configure Google with `gcloud` or the Google Cloud console, Kernel, and Blooio. Blooio is required for iMessage operation but not for deploying the control plane. After creating its webhook, synchronize the environment and redeploy once.
-12. Run `doctor --phase ready`, the smoke check, and owner magic-link onboarding.
+2. Run `pnpm install`.
+3. Run `pnpm run doctor -- --target vercel --phase bootstrap --json` before setup. Exit code `2` and missing-configuration checks are expected on a fresh clone.
+4. Run `pnpm run setup -- --target vercel --database hosted --json`. Require `ok: true`; `ready: false` remains expected.
+5. Parse the ordered `actions`. Use connected integrations for provider work and the listed commands for local work.
+
+### Phase 2: Configure the owner and Supabase
+
+1. Discover a suitable Supabase project. If none exists, request confirmation and create one through the Supabase integration.
+2. Start `pnpm run openinstinct -- setup-ui`. It opens the loopback wizard automatically; use `--no-open` when the agent should only report the URL.
+3. Ask the owner to enter only `OWNER_EMAIL` and the Postgres `DATABASE_URL` needed for this phase. Blank fields preserve existing values. Stop the form after the owner saves.
+4. Run `pnpm exec supabase login` if the CLI is not authenticated.
+5. Run `pnpm run openinstinct -- configure-supabase --project-ref <project-ref> --use-env-database-url`.
+6. Run `pnpm exec supabase db push --linked`.
+
+### Phase 3: Configure Vercel and Supabase Auth
+
+1. Link or create the Vercel project with `vercel link`. Ask before project creation.
+2. Read its assigned production domain and run `pnpm run openinstinct -- set-app-url --url <production-url>`.
+3. Through the Supabase integration, set the Auth Site URL to the exact production URL and allow the exact `<production-url>/api/auth/callback` redirect. Ask before changing production Auth settings.
+
+### Phase 4: Deploy the core
+
+1. Run `pnpm run doctor -- --target vercel --phase bootstrap --json` and resolve every failed check.
+2. Ask before credential storage, then run `pnpm run openinstinct -- push-vercel-env --environment production`.
+3. Ask before public deployment, then run `vercel deploy --prod`.
+4. Run `pnpm run openinstinct -- configure-supabase-scheduler --json`. It stores the protected URL and bearer secret in Supabase Vault without displaying either value.
+5. Run `pnpm run smoke -- --url <production-url> --json`. The core control plane is now deployed.
+
+### Phase 5: Enable iMessage and verify ready
+
+1. Optionally configure Google and Kernel after deployment. Neither blocks ready status.
+2. Open Blooio for the owner. The owner creates or selects their account, completes any KYC and billing, provisions the assistant number, and creates an API key assigned to that number. The agent may navigate to the relevant page, but it must not accept a paid plan or enter credentials for the owner.
+3. In `setup-ui`, the owner privately saves `BLOOIO_OWNER_PHONE` and `BLOOIO_API_KEY`, then clicks **Verify Blooio**. The read-only verification discovers active channels and captures `BLOOIO_CHANNEL_ID` automatically when exactly one exists. The CLI equivalent is `pnpm run openinstinct -- configure-blooio --use-env-api-key --json`.
+4. Ask before webhook registration. The owner can click **Register webhook** in the wizard, or the agent can run `pnpm run openinstinct -- create-blooio-webhook --url <production-url> --env-file .env.local`. The operation lists existing subscriptions first; it reuses a matching webhook or rotates its secret for recovery instead of creating a duplicate.
+5. Synchronize the changed environment and redeploy, with confirmation at both boundaries.
+6. Run `pnpm run doctor -- --target vercel --phase ready --json` and `pnpm run smoke -- --url <production-url> --json`.
+7. Open the control plane for owner magic-link onboarding.
 
 ## Expected pauses
 
-A fully unattended run is intentionally not the goal. A normal agent-run setup should need short user handoffs for provider login, persistent credential creation, any paid-plan decision, and hidden entry of the Supabase database URL. Everything between those boundaries should be executable and verifiable by the agent.
+A fully unattended run is intentionally not the goal. A normal agent-run setup should need short user handoffs for provider login, persistent credential creation, any paid-plan decision, hidden entry of the Supabase database URL, and Blooio account/number provisioning. Everything between those boundaries should be executable and verifiable by the agent.
 
 ## Recovery
 

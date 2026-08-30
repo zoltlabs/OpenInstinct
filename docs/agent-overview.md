@@ -203,7 +203,9 @@ pnpm exec supabase db push --linked
 pnpm run doctor -- --target vercel --phase bootstrap --json
 ```
 
-Hosted Supabase with Vercel is the normal setup path. Authorized Supabase and Vercel integrations are sufficient for the base deployment; `gcloud`, Blooio, and Kernel are optional post-deploy setup. Create the Vercel project before deploying, capture its assigned production domain with `set-app-url`, configure Supabase Auth against that URL, synchronize the environment, and deploy once. Use the local stack only for database development with `pnpm supabase:start` and `pnpm supabase:reset`.
+Hosted Supabase with Vercel is the normal setup path. Authorized Supabase and Vercel integrations are sufficient for the base deployment; `gcloud`, Blooio, and Kernel are optional post-deploy setup. The loopback setup UI renders the same ordered action plan used by agents and opens automatically unless `--no-open` is passed. Create the Vercel project before deploying, capture its assigned production domain with `set-app-url`, configure Supabase Auth against that URL, synchronize the environment, and deploy once. Use the local stack only for database development with `pnpm supabase:start` and `pnpm supabase:reset`.
+
+The owner manages Blooio account creation, KYC, billing, number provisioning, and API-key creation in Blooio. OpenInstinct may verify the supplied key with a read-only channel listing, capture a unique active channel, and idempotently register or recover the production webhook after explicit confirmation. It never purchases or removes Blooio lines.
 
 For setup or infrastructure work, run `doctor` before making changes. It emits machine-readable output and stable exit codes. `bootstrap` accepts the temporary local app URL and omits post-deploy integrations; `ready` requires a public HTTPS app URL and Blooio. Never print `.env.local` or pass secret values as CLI arguments. See `docs/agent-setup.md` for the ordered MCP-first flow and confirmation boundaries, and `docs/google-setup.md` for optional Gmail and Calendar OAuth.
 

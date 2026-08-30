@@ -49,6 +49,36 @@ export const sendMessageResultSchema = z
   })
   .passthrough();
 
+export const blooioChannelSchema = z
+  .object({
+    id: z.string().min(1),
+    type: z.string().min(1),
+    address: z.string().nullable().optional(),
+    alias: z.string().optional(),
+    status: z.string().min(1),
+    capabilities: z
+      .object({
+        protocols: z.array(z.string()).optional(),
+        content: z.array(z.string()).optional(),
+        actions: z.array(z.string()).optional(),
+        interactive: z.array(z.string()).optional(),
+        gates: z.array(z.string()).optional(),
+      })
+      .passthrough()
+      .optional(),
+  })
+  .passthrough();
+
+export const blooioWebhookSchema = z
+  .object({
+    id: z.string().min(1),
+    url: z.string().url(),
+    status: z.string().min(1),
+  })
+  .passthrough();
+
 export type BlooioWebhookEvent = z.infer<typeof blooioWebhookEventSchema>;
+export type BlooioChannel = z.infer<typeof blooioChannelSchema>;
+export type BlooioWebhook = z.infer<typeof blooioWebhookSchema>;
 export type SendMessageInput = z.infer<typeof sendMessageInputSchema>;
 export type SendMessageResult = z.infer<typeof sendMessageResultSchema>;

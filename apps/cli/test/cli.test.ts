@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { mkdtemp, readFile, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -10,6 +10,7 @@ import {
   setupActions,
 } from "../src/index";
 import { setEnvValues } from "../src/env-file";
+import { configureBlooio, ensureBlooioWebhook } from "../src/blooio-setup";
 import { startSetupUi, validateSetupWizardValues } from "../src/setup-ui";
 
 const validValues = {
@@ -217,6 +218,39 @@ describe("agent-friendly setup checks", () => {
     ).toMatchObject({
       command: "vercel deploy --prod --local-config vercel.pro.json",
     });
+    expect(
+      actions.find((action) => action.id === "setup-blooio-account"),
+    ).toMatchObject({
+      preferredTool: "user",
+      browserUrl: "https://app.blooio.com",
+    });
+    expect(
+      actions.find((action) => action.id === "register-blooio-webhook"),
+    ).toMatchObject({
+      confirmation: "required-before-webhook-registration",
+    });
+  });
+
+  it("resolves setup actions from existing configuration", () => {
+    const actions = setupActions("vercel", {
+      NEXT_PUBLIC_APP_URL: "https://assistant.example",
+      NEXT_PUBLIC_SUPABASE_URL: "https://example.supabase.co",
+      BLOOIO_API_KEY: "blooio-secret",
+      BLOOIO_WEBHOOK_SECRET: "whsec-secret",
+      BLOOIO_OWNER_PHONE: "+15555550123",
+    });
+    expect(
+      actions.find((action) => action.id === "provision-supabase"),
+    ).toHaveProperty("status", "complete");
+    expect(
+      actions.find((action) => action.id === "setup-blooio-account"),
+    ).toHaveProperty("status", "complete");
+    expect(
+      actions.find((action) => action.id === "register-blooio-webhook"),
+    ).toHaveProperty("status", "complete");
+    expect(
+      actions.find((action) => action.id === "verify-ready"),
+    ).toHaveProperty("status", "complete");
   });
 
   it("extracts current or legacy Supabase API key shapes", () => {
@@ -279,6 +313,77 @@ describe("agent-friendly setup checks", () => {
     expect(complete.errors).toEqual([]);
   });
 
+  it("verifies a user-managed Blooio account and captures its only channel", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "openinstinct-blooio-"));
+    const envPath = join(directory, ".env.local");
+    const request = vi.fn(
+      async () =>
+        new Response(
+          JSON.stringify({
+            data: [
+              {
+                id: "ch_1",
+                type: "blooio",
+                address: "+15555550100",
+                status: "active",
+              },
+            ],
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+    );
+    await expect(
+      configureBlooio({
+        envPath,
+        apiKey: "blooio-secret",
+        fetch: request as typeof fetch,
+      }),
+    ).resolves.toMatchObject({ selectedChannelId: "ch_1" });
+    expect(envFileValues(await readFile(envPath, "utf8"))).toMatchObject({
+      BLOOIO_API_KEY: "blooio-secret",
+      BLOOIO_CHANNEL_ID: "ch_1",
+    });
+  });
+
+  it("recovers an existing Blooio webhook instead of creating a duplicate", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "openinstinct-webhook-"));
+    const envPath = join(directory, ".env.local");
+    await setEnvValues(envPath, { BLOOIO_API_KEY: "blooio-secret" });
+    const request = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            data: [
+              {
+                id: "wh_1",
+                url: "https://assistant.example/api/webhooks/blooio",
+                status: "active",
+              },
+            ],
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ data: { signing_secret: "whsec_recovered" } }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      );
+    await expect(
+      ensureBlooioWebhook({
+        envPath,
+        appUrl: "https://assistant.example",
+        fetch: request as typeof fetch,
+      }),
+    ).resolves.toMatchObject({ operation: "rotated", webhookId: "wh_1" });
+    expect(
+      envFileValues(await readFile(envPath, "utf8")).BLOOIO_WEBHOOK_SECRET,
+    ).toBe("whsec_recovered");
+    expect(request).toHaveBeenCalledTimes(2);
+  });
+
   it("never renders stored secrets and rejects cross-origin form posts", async () => {
     const directory = await mkdtemp(join(tmpdir(), "openinstinct-ui-"));
     const envPath = join(directory, ".env.local");
@@ -290,6 +395,8 @@ describe("agent-friendly setup checks", () => {
       expect(page).toContain("Configured — leave blank to keep it");
       expect(page).toContain("Scheduling is handled inside Supabase");
       expect(page).toContain("Advanced deployment options");
+      expect(page).toContain("Finish Blooio");
+      expect(page).toContain("Setup plan");
       const csrf = page.match(/name="csrf" value="([^"]+)"/u)?.[1];
       expect(csrf).toBeTruthy();
       const response = await fetch(`${ui.url}/save`, {

@@ -90,6 +90,69 @@ describe("Blooio client", () => {
     ).resolves.toEqual({ id: "wh_1", signingSecret: "whsec_secret" });
   });
 
+  it("discovers active Blooio channels without exposing credentials", async () => {
+    const request = vi.fn(
+      async (input: RequestInfo | URL) =>
+        new Response(
+          JSON.stringify({
+            data: [
+              {
+                id: "ch_1",
+                type: "blooio",
+                address: "+15555550100",
+                status: "active",
+              },
+            ],
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+    );
+    const client = new BlooioClient({
+      apiKey: "key",
+      fetch: request as typeof fetch,
+    });
+    await expect(client.listActiveChannels()).resolves.toMatchObject([
+      { id: "ch_1", status: "active" },
+    ]);
+    expect(String(request.mock.calls[0]?.[0])).toContain(
+      "/channels?type=blooio&status=active",
+    );
+    expect(String(request.mock.calls[0]?.[0])).not.toContain("key");
+  });
+
+  it("lists webhooks and captures a rotated secret", async () => {
+    const request = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            data: [
+              {
+                id: "wh_1",
+                url: "https://assistant.example/api/webhooks/blooio",
+                status: "active",
+              },
+            ],
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({ data: { signing_secret: "whsec_rotated" } }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      );
+    const client = new BlooioClient({
+      apiKey: "key",
+      fetch: request as typeof fetch,
+    });
+    await expect(client.listWebhooks()).resolves.toHaveLength(1);
+    await expect(client.rotateWebhookSecret("wh_1")).resolves.toEqual({
+      signingSecret: "whsec_rotated",
+    });
+  });
+
   it("does not retry conversation wait codes", () => {
     expect(
       classifyBlooioError(
