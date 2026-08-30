@@ -4,6 +4,7 @@ import { encryptCredential, OpenInstinctStore } from "@openinstinct/db";
 import { cookies } from "next/headers";
 import { NextResponse } from "next/server";
 import { googleConfig } from "../../../../../src/lib/google-config";
+import { feedbackUrl } from "../../../../../src/lib/feedback";
 import { requireOwner } from "../../../../../src/lib/owner";
 
 export async function GET(request: Request) {
@@ -18,43 +19,41 @@ export async function GET(request: Request) {
   cookieStore.delete("oi_google_state");
   cookieStore.delete("oi_google_verifier");
   if (!code || !state || state !== expectedState || !verifier) {
-    return NextResponse.json(
-      { error: "Invalid Google OAuth state." },
-      { status: 400 },
-    );
+    return NextResponse.redirect(feedbackUrl(request.url, "google-failed"));
   }
-  const token = await exchangeGoogleCode({
-    code,
-    codeVerifier: verifier,
-    config: googleConfig(),
-  });
+  let token;
+  try {
+    token = await exchangeGoogleCode({
+      code,
+      codeVerifier: verifier,
+      config: googleConfig(),
+    });
+  } catch {
+    return NextResponse.redirect(feedbackUrl(request.url, "google-failed"));
+  }
   const profileResponse = await fetch(
     "https://openidconnect.googleapis.com/v1/userinfo",
     {
       headers: { Authorization: `Bearer ${token.accessToken}` },
       signal: AbortSignal.timeout(10_000),
     },
-  );
-  if (!profileResponse.ok)
-    return NextResponse.json(
-      { error: "Could not read Google profile." },
-      { status: 502 },
-    );
+  ).catch(() => undefined);
+  if (!profileResponse?.ok)
+    return NextResponse.redirect(feedbackUrl(request.url, "google-failed"));
   const profile = (await profileResponse.json()) as {
     sub?: string;
     email?: string;
   };
   if (!profile.sub)
-    return NextResponse.json(
-      { error: "Google profile is missing an account id." },
-      { status: 502 },
-    );
+    return NextResponse.redirect(feedbackUrl(request.url, "google-failed"));
   const connectionId = randomUUID();
   const configVersion = randomUUID();
   const databaseUrl = process.env.DATABASE_URL;
   const encryptionKey = process.env.SECRET_ENCRYPTION_KEY;
   if (!databaseUrl || !encryptionKey)
-    throw new Error("Server credential storage is not configured.");
+    return NextResponse.redirect(
+      feedbackUrl(request.url, "configuration-incomplete"),
+    );
   const store = new OpenInstinctStore(databaseUrl);
   try {
     await store.upsertConnection({
@@ -72,8 +71,10 @@ export async function GET(request: Request) {
       }),
       metadata: { accountId: profile.sub, email: profile.email, configVersion },
     });
+  } catch {
+    return NextResponse.redirect(feedbackUrl(request.url, "google-failed"));
   } finally {
     await store.close();
   }
-  return NextResponse.redirect(new URL("/?connected=google", request.url));
+  return NextResponse.redirect(feedbackUrl(request.url, "google-connected"));
 }

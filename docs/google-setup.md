@@ -193,8 +193,8 @@ If Google offers fewer scopes than requested, do not treat the connection as ful
 Run repository diagnostics first:
 
 ```bash
-pnpm run doctor -- --target vercel --phase ready --json
-pnpm run smoke -- --url "$OPENINSTINCT_APP_URL" --json
+pnpm --silent run doctor -- --target vercel --phase ready --json
+pnpm --silent run smoke -- --url "$OPENINSTINCT_APP_URL" --json
 ```
 
 Then verify from the owner conversation or control plane:

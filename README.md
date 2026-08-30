@@ -4,6 +4,10 @@ OpenInstinct is an open-source, single-owner personal assistant that lives in iM
 
 There is no new chat interface. The web app is a small owner-only control plane for setup, connectors, audit history, and approvals.
 
+> **Project status: alpha.** The safety architecture, clean setup, unit tests, production build, and database policy tests are automated. Treat the first deployment as a personal evaluation and report reproducible issues without including private data.
+
+The recommended Vercel + Supabase infrastructure can start on free tiers. Using OpenInstinct through iMessage currently requires a Blooio plan after its trial (about **$39/month** for the referenced personal Starter plan), plus model usage and any optional browser usage. You can try a model-only local preview before creating Supabase, Vercel, or Blooio resources.
+
 ## What works
 
 - Blooio v4 webhook verification, deduplication, iMessage replies, and idempotent sends
@@ -49,15 +53,26 @@ The Supabase CLI is already a repository development dependency. Project creatio
 ### Phase 1: Prepare the repository
 
 ```bash
-git clone <your-fork-url> openinstinct
+git clone https://github.com/zoltlabs/OpenInstinct.git openinstinct
 cd openinstinct
 corepack enable
 pnpm install
-pnpm run doctor -- --target vercel --phase bootstrap --json
-pnpm run setup -- --target vercel --database hosted --json
+pnpm --silent run doctor -- --target vercel --phase bootstrap --json
+pnpm --silent run setup -- --target vercel --database hosted --json
 ```
 
-The first `doctor` usually exits with code `2` and reports missing configuration; that is expected. `setup` then creates `.env.local`, generates local cryptographic secrets, selects Vercel AI Gateway by default, and returns ordered `checks` and `actions`. It should return `ok: true`; `ready: false` is expected at this stage.
+The first `doctor` usually exits with code `2` and reports missing configuration; that is expected. `setup` then creates `.env.local`, generates local cryptographic secrets, selects Vercel AI Gateway by default, and returns ordered `checks` and `actions`. It should return `ok: true`, `bootstrapReady: false`, `ready: false`, and `milestone: "local"` at this stage. `ready` is reserved for the public HTTPS + Blooio milestone. Use `pnpm --silent run ...` whenever stdout must be directly parseable JSON.
+
+### Optional: try one message before deploying
+
+Open the private setup form and select a direct model provider plus its API key, or add a Vercel AI Gateway API key for local use:
+
+```bash
+pnpm run openinstinct -- setup-ui
+pnpm run openinstinct -- try-message --message "What can you help me with?"
+```
+
+This preview calls only the configured model. It does not use Supabase, Blooio, connectors, durable memory, approvals, or external actions, and it says so in its output. It is a quick product preview rather than an end-to-end deployment test.
 
 ### Phase 2: Configure the owner and Supabase
 
@@ -102,11 +117,11 @@ Changing production Auth settings requires owner confirmation.
 ### Phase 4: Validate and deploy the core
 
 ```bash
-pnpm run doctor -- --target vercel --phase bootstrap --json
+pnpm --silent run doctor -- --target vercel --phase bootstrap --json
 pnpm run openinstinct -- push-vercel-env --environment production
 vercel deploy --prod
-pnpm run openinstinct -- configure-supabase-scheduler --json
-pnpm run smoke -- --url https://your-production-url.example --json
+pnpm --silent run openinstinct -- configure-supabase-scheduler --json
+pnpm --silent run smoke -- --url https://your-production-url.example --json
 ```
 
 Ask before storing the production environment or deploying. The scheduler command stores the protected consumer URL and `INTERNAL_API_SECRET` in Supabase Vault, then creates an idempotent one-minute Supabase Cron job. At the end of this phase, the core control plane is deployed.
@@ -114,7 +129,7 @@ Ask before storing the production environment or deploying. The scheduler comman
 ### Phase 5: Enable iMessage and reach ready
 
 1. Open Blooio from `setup-ui`. The owner completes Blooio account verification and billing, provisions the assistant number, and creates an API key assigned to it. OpenInstinct never purchases or cancels a Blooio line.
-2. Save the owner phone and API key privately, then click **Verify Blooio**. If the API key has exactly one active number, the wizard captures its channel automatically. The equivalent agent-safe command is `pnpm run openinstinct -- configure-blooio --use-env-api-key --json`.
+2. Save the owner phone and API key privately, then click **Verify Blooio**. If the API key has exactly one active number, the wizard captures its channel automatically. The equivalent agent-safe command is `pnpm --silent run openinstinct -- configure-blooio --use-env-api-key --json`.
 3. Ask before registering the production webhook. Click **Register webhook** in the wizard or use the CLI command below.
 4. Synchronize the new environment and redeploy.
 
@@ -123,8 +138,8 @@ pnpm run openinstinct -- create-blooio-webhook \
   --url https://your-production-url.example --env-file .env.local
 pnpm run openinstinct -- push-vercel-env --environment production
 vercel deploy --prod
-pnpm run doctor -- --target vercel --phase ready --json
-pnpm run smoke -- --url https://your-production-url.example --json
+pnpm --silent run doctor -- --target vercel --phase ready --json
+pnpm --silent run smoke -- --url https://your-production-url.example --json
 ```
 
 Webhook registration is recoverable: the command lists existing subscriptions, reuses an exact match when its secret is already stored, and rotates the matching webhook secret when local recovery is needed. It never blindly creates a second matching webhook, and it never displays the secret. Open the deployed URL, request the owner magic link using `OWNER_EMAIL`, and onboard with the exact E.164 value in `BLOOIO_OWNER_PHONE`. The database enforces one owner workspace per deployment.
@@ -242,8 +257,8 @@ Point Codex or another coding agent at the repository root and tell it to read [
 
 ```bash
 pnpm install
-pnpm run setup -- --target <vercel|vercel-pro|vercel-cloudflare|aws|gcp|docker> --database hosted --json
-pnpm run doctor -- --target <target> --phase bootstrap --json
+pnpm --silent run setup -- --target <vercel|vercel-pro|vercel-cloudflare|aws|gcp|docker> --database hosted --json
+pnpm --silent run doctor -- --target <target> --phase bootstrap --json
 ```
 
 Commands use stable exit codes: `0` success, `2` missing setup, `3` failed smoke check. `--json` emits machine-readable checks and external-action metadata. Agents should prefer purpose-built MCP/API integrations, then CLIs, then browser control. They must pause at project creation, credential generation, paid-plan selection, and other consequential provider actions. Secrets enter through hidden prompts, stdin, OAuth, or provider secret stores and are never included in an agent prompt or command arguments.

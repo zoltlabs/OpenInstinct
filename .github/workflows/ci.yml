@@ -20,3 +20,63 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm check
       - run: pnpm build
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.17.1
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+      - name: Start production web service
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/postgres
+          HOSTNAME: 127.0.0.1
+          PORT: 4310
+        run: node apps/web/.next/standalone/apps/web/server.js > "$RUNNER_TEMP/openinstinct-web.log" 2>&1 &
+      - name: Wait for health endpoint
+        run: |
+          for attempt in {1..30}; do
+            if curl --fail --silent http://127.0.0.1:4310/api/health > /dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          cat "$RUNNER_TEMP/openinstinct-web.log"
+          exit 1
+      - run: pnpm --silent run smoke -- --url http://127.0.0.1:4310 --json
+  database:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.17.1
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm supabase:start:test
+      - run: pnpm supabase:test
+      - if: always()
+        run: pnpm supabase:stop

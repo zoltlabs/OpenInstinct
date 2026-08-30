@@ -18,6 +18,16 @@ const baseEnvironment = {
 };
 
 describe("AI provider environment", () => {
+  it("can boot the control plane before Blooio is configured", () => {
+    expect(
+      serverEnvironmentSchema.safeParse({
+        ...baseEnvironment,
+        BLOOIO_API_KEY: undefined,
+        BLOOIO_OWNER_PHONE: undefined,
+      }).success,
+    ).toBe(true);
+  });
+
   it("requires only the selected direct provider credential", () => {
     expect(serverEnvironmentSchema.safeParse(baseEnvironment).success).toBe(
       true,

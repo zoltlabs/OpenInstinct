@@ -41,6 +41,9 @@ importers:
       "@openinstinct/runtime":
         specifier: workspace:*
         version: link:../../packages/runtime
+      "@openinstinct/worker":
+        specifier: workspace:*
+        version: link:../worker
       commander:
         specifier: 15.0.0
         version: 15.0.0

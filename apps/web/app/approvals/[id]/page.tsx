@@ -1,12 +1,16 @@
 import { notFound } from "next/navigation";
 import { requireOwner } from "../../../src/lib/owner";
+import { feedbackForCode } from "../../../src/lib/feedback";
 
 export default async function ApprovalPage({
   params,
+  searchParams,
 }: {
   params: Promise<{ id: string }>;
+  searchParams: Promise<{ feedback?: string }>;
 }) {
   const { id } = await params;
+  const feedback = feedbackForCode((await searchParams).feedback);
   const { supabase, workspace } = await requireOwner();
   if (!workspace) notFound();
   const { data: action } = await supabase
@@ -19,6 +23,11 @@ export default async function ApprovalPage({
   return (
     <main>
       <h1>Review action</h1>
+      {feedback ? (
+        <p className={`notice ${feedback.tone}`} role="status">
+          {feedback.message}
+        </p>
+      ) : null}
       <section className="card" style={{ maxWidth: 680, marginTop: 32 }}>
         <h2>{action.summary}</h2>
         <p>

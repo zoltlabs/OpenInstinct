@@ -36,8 +36,8 @@ The user should type existing credentials into provider UI or a hidden terminal 
 
 1. Read `AGENTS.md` and `docs/agent-overview.md`.
 2. Run `pnpm install`.
-3. Run `pnpm run doctor -- --target vercel --phase bootstrap --json` before setup. Exit code `2` and missing-configuration checks are expected on a fresh clone.
-4. Run `pnpm run setup -- --target vercel --database hosted --json`. Require `ok: true`; `ready: false` remains expected.
+3. Run `pnpm --silent run doctor -- --target vercel --phase bootstrap --json` before setup. Exit code `2` and missing-configuration checks are expected on a fresh clone.
+4. Run `pnpm --silent run setup -- --target vercel --database hosted --json`. Require `ok: true`; `bootstrapReady: false`, `ready: false`, and `milestone: "local"` remain expected. The `--silent` flag keeps stdout directly parseable as JSON.
 5. Parse the ordered `actions`. Use connected integrations for provider work and the listed commands for local work.
 
 ### Phase 2: Configure the owner and Supabase
@@ -57,20 +57,20 @@ The user should type existing credentials into provider UI or a hidden terminal 
 
 ### Phase 4: Deploy the core
 
-1. Run `pnpm run doctor -- --target vercel --phase bootstrap --json` and resolve every failed check.
+1. Run `pnpm --silent run doctor -- --target vercel --phase bootstrap --json` and resolve every failed check.
 2. Ask before credential storage, then run `pnpm run openinstinct -- push-vercel-env --environment production`.
 3. Ask before public deployment, then run `vercel deploy --prod`.
-4. Run `pnpm run openinstinct -- configure-supabase-scheduler --json`. It stores the protected URL and bearer secret in Supabase Vault without displaying either value.
-5. Run `pnpm run smoke -- --url <production-url> --json`. The core control plane is now deployed.
+4. Run `pnpm --silent run openinstinct -- configure-supabase-scheduler --json`. It stores the protected URL and bearer secret in Supabase Vault without displaying either value.
+5. Run `pnpm --silent run smoke -- --url <production-url> --json`. The core control plane is now deployed.
 
 ### Phase 5: Enable iMessage and verify ready
 
 1. Optionally configure Google and Kernel after deployment. Neither blocks ready status.
 2. Open Blooio for the owner. The owner creates or selects their account, completes any KYC and billing, provisions the assistant number, and creates an API key assigned to that number. The agent may navigate to the relevant page, but it must not accept a paid plan or enter credentials for the owner.
-3. In `setup-ui`, the owner privately saves `BLOOIO_OWNER_PHONE` and `BLOOIO_API_KEY`, then clicks **Verify Blooio**. The read-only verification discovers active channels and captures `BLOOIO_CHANNEL_ID` automatically when exactly one exists. The CLI equivalent is `pnpm run openinstinct -- configure-blooio --use-env-api-key --json`.
+3. In `setup-ui`, the owner privately saves `BLOOIO_OWNER_PHONE` and `BLOOIO_API_KEY`, then clicks **Verify Blooio**. The read-only verification discovers active channels and captures `BLOOIO_CHANNEL_ID` automatically when exactly one exists. The CLI equivalent is `pnpm --silent run openinstinct -- configure-blooio --use-env-api-key --json`.
 4. Ask before webhook registration. The owner can click **Register webhook** in the wizard, or the agent can run `pnpm run openinstinct -- create-blooio-webhook --url <production-url> --env-file .env.local`. The operation lists existing subscriptions first; it reuses a matching webhook or rotates its secret for recovery instead of creating a duplicate.
 5. Synchronize the changed environment and redeploy, with confirmation at both boundaries.
-6. Run `pnpm run doctor -- --target vercel --phase ready --json` and `pnpm run smoke -- --url <production-url> --json`.
+6. Run `pnpm --silent run doctor -- --target vercel --phase ready --json` and `pnpm --silent run smoke -- --url <production-url> --json`.
 7. Open the control plane for owner magic-link onboarding.
 
 ## Expected pauses

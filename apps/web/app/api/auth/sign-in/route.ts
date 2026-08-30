@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { createSupabaseServerClient } from "../../../../src/lib/supabase/server";
 import { isSameOrigin } from "../../../../src/lib/request-security";
+import { feedbackUrl } from "../../../../src/lib/feedback";
 
 export async function POST(request: Request) {
   if (!isSameOrigin(request))
@@ -10,14 +11,14 @@ export async function POST(request: Request) {
   const appUrl = process.env.NEXT_PUBLIC_APP_URL;
   const ownerEmail = process.env.OWNER_EMAIL?.trim().toLowerCase();
   if (!email || !appUrl || !ownerEmail)
-    return NextResponse.json(
-      { error: "Invalid configuration." },
-      { status: 400 },
+    return NextResponse.redirect(
+      feedbackUrl(request.url, "configuration-incomplete"),
+      303,
     );
   if (email.toLowerCase() !== ownerEmail)
-    return NextResponse.json(
-      { error: "Sign-in is not available." },
-      { status: 403 },
+    return NextResponse.redirect(
+      feedbackUrl(request.url, "signin-unavailable"),
+      303,
     );
   const supabase = await createSupabaseServerClient();
   const { error } = await supabase.auth.signInWithOtp({
@@ -27,6 +28,9 @@ export async function POST(request: Request) {
     },
   });
   if (error)
-    return NextResponse.json({ error: error.message }, { status: 400 });
-  return NextResponse.redirect(new URL("/?check-email=1", request.url), 303);
+    return NextResponse.redirect(
+      feedbackUrl(request.url, "signin-failed"),
+      303,
+    );
+  return NextResponse.redirect(feedbackUrl(request.url, "check-email"), 303);
 }

@@ -16,6 +16,7 @@
     "@openinstinct/db": "workspace:*",
     "@openinstinct/messaging": "workspace:*",
     "@openinstinct/runtime": "workspace:*",
+    "@openinstinct/worker": "workspace:*",
     "commander": "15.0.0",
     "zod": "4.4.3"
   },

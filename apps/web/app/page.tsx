@@ -1,7 +1,33 @@
 import Link from "next/link";
 import { createSupabaseServerClient } from "../src/lib/supabase/server";
+import { feedbackForCode } from "../src/lib/feedback";
+import { isValidTimeZone } from "../src/lib/validation";
 
-export default async function Home() {
+function Feedback({ code }: { code?: string }) {
+  const feedback = feedbackForCode(code);
+  return feedback ? (
+    <p className={`notice ${feedback.tone}`} role="status" aria-live="polite">
+      {feedback.message}
+    </p>
+  ) : null;
+}
+
+function formatInterval(seconds: number): string {
+  if (seconds % 86_400 === 0)
+    return `${seconds / 86_400} ${seconds === 86_400 ? "day" : "days"}`;
+  if (seconds % 3_600 === 0)
+    return `${seconds / 3_600} ${seconds === 3_600 ? "hour" : "hours"}`;
+  if (seconds % 60 === 0)
+    return `${seconds / 60} ${seconds === 60 ? "minute" : "minutes"}`;
+  return `${seconds} ${seconds === 1 ? "second" : "seconds"}`;
+}
+
+export default async function Home({
+  searchParams,
+}: {
+  searchParams: Promise<{ feedback?: string }>;
+}) {
+  const { feedback } = await searchParams;
   const supabase = await createSupabaseServerClient();
   const {
     data: { user },
@@ -15,6 +41,7 @@ export default async function Home() {
           An open personal assistant that lives in iMessage, remembers context,
           and asks before it takes consequential action.
         </p>
+        <Feedback code={feedback} />
         <section className="card" style={{ maxWidth: 420, marginTop: 40 }}>
           <h2>Owner sign in</h2>
           <p>
@@ -22,12 +49,16 @@ export default async function Home() {
             link.
           </p>
           <form action="/api/auth/sign-in" method="post">
-            <input
-              type="email"
-              name="email"
-              placeholder="you@example.com"
-              required
-            />
+            <label className="field" htmlFor="owner-email">
+              <span>Email</span>
+              <input
+                id="owner-email"
+                type="email"
+                name="email"
+                placeholder="you@example.com"
+                required
+              />
+            </label>
             <button type="submit">Send sign-in link</button>
           </form>
         </section>
@@ -50,23 +81,56 @@ export default async function Home() {
           This deployment belongs to one person. The phone must match{" "}
           <code>BLOOIO_OWNER_PHONE</code>.
         </p>
+        <Feedback code={feedback} />
         <section className="card" style={{ maxWidth: 480, marginTop: 40 }}>
           <form action="/api/onboarding" method="post">
-            <input name="displayName" placeholder="My OpenInstinct" required />
-            <input
-              name="phone"
-              type="tel"
-              placeholder="+15555550123"
-              pattern="\+[1-9][0-9]{7,14}"
-              required
-            />
-            <input name="timezone" defaultValue="UTC" required />
+            <label className="field" htmlFor="display-name">
+              <span>Assistant name</span>
+              <input
+                id="display-name"
+                name="displayName"
+                placeholder="My OpenInstinct"
+                required
+              />
+            </label>
+            <label className="field" htmlFor="owner-phone">
+              <span>Owner iMessage phone</span>
+              <small>Use exact E.164 format, such as +15555550123.</small>
+              <input
+                id="owner-phone"
+                name="phone"
+                type="tel"
+                placeholder="+15555550123"
+                pattern="\+[1-9][0-9]{7,14}"
+                required
+              />
+            </label>
+            <label className="field" htmlFor="owner-timezone">
+              <span>Time zone</span>
+              <small>Use an IANA name, such as America/Mexico_City.</small>
+              <input
+                id="owner-timezone"
+                name="timezone"
+                defaultValue="UTC"
+                required
+              />
+            </label>
             <button type="submit">Create owner workspace</button>
           </form>
         </section>
       </main>
     );
   }
+
+  const timeZone = isValidTimeZone(workspace.timezone)
+    ? workspace.timezone
+    : "UTC";
+  const formatDate = (value: string) =>
+    new Intl.DateTimeFormat("en", {
+      dateStyle: "medium",
+      timeStyle: "short",
+      timeZone,
+    }).format(new Date(value));
 
   const [
     { data: connections },
@@ -107,8 +171,9 @@ export default async function Home() {
       <h1>{workspace.display_name}</h1>
       <p className="lede">
         The dashboard is only a control plane. Talk to your assistant through
-        iMessage.
+        iMessage. Times are shown in {timeZone}.
       </p>
+      <Feedback code={feedback} />
       <div className="grid">
         <section className="card">
           <h2>Google</h2>
@@ -133,18 +198,33 @@ export default async function Home() {
             approval-required.
           </p>
           <form action="/api/connectors/mcp" method="post">
-            <input name="name" placeholder="Connector name" required />
-            <input
-              name="url"
-              type="url"
-              placeholder="https://mcp.example.com"
-              required
-            />
-            <input
-              name="bearerToken"
-              type="password"
-              placeholder="Bearer token (optional)"
-            />
+            <label className="field" htmlFor="mcp-name">
+              <span>Connector name</span>
+              <input id="mcp-name" name="name" required />
+            </label>
+            <label className="field" htmlFor="mcp-url">
+              <span>Server URL</span>
+              <small>
+                Public HTTPS only; redirects and private networks are blocked.
+              </small>
+              <input
+                id="mcp-url"
+                name="url"
+                type="url"
+                placeholder="https://mcp.example.com"
+                required
+              />
+            </label>
+            <label className="field" htmlFor="mcp-token">
+              <span>Bearer token</span>
+              <small>Optional. Stored encrypted and never shown again.</small>
+              <input
+                id="mcp-token"
+                name="bearerToken"
+                type="password"
+                placeholder="Bearer token (optional)"
+              />
+            </label>
             <button type="submit">Connect MCP</button>
           </form>
           {connections
@@ -174,10 +254,9 @@ export default async function Home() {
           {schedules?.length ? (
             schedules.map((schedule) => (
               <p key={schedule.id}>
-                <code>{schedule.kind}</code> ·{" "}
-                {new Date(schedule.run_at).toLocaleString()}
+                <code>{schedule.kind}</code> · {formatDate(schedule.run_at)}
                 {schedule.recurrence_seconds
-                  ? ` · every ${schedule.recurrence_seconds} seconds`
+                  ? ` · every ${formatInterval(schedule.recurrence_seconds)}`
                   : ""}
               </p>
             ))
@@ -203,8 +282,7 @@ export default async function Home() {
           {runs?.length ? (
             runs.map((run) => (
               <p key={run.id}>
-                <code>{run.status}</code> ·{" "}
-                {new Date(run.created_at).toLocaleString()}{" "}
+                <code>{run.status}</code> · {formatDate(run.created_at)}{" "}
                 {run.last_error ? `— ${run.last_error}` : ""}
               </p>
             ))

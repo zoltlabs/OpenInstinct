@@ -6,7 +6,7 @@ For agent-operated provisioning, prefer an authorized Supabase MCP/API integrati
 
 ## Vercel Hobby + Supabase Cron (free default)
 
-Link the repository root with `vercel link`, run `pnpm run openinstinct -- push-vercel-env --environment production`, and deploy with `vercel deploy --prod`. The sync command sends allowlisted `.env.local` values over stdin and suppresses provider output. [`vercel.json`](../../vercel.json) intentionally contains no native cron, so it deploys on Hobby. After setting the final `NEXT_PUBLIC_APP_URL`, run `pnpm run openinstinct -- configure-supabase-scheduler --json`.
+Link the repository root with `vercel link`, run `pnpm run openinstinct -- push-vercel-env --environment production`, and deploy with `vercel deploy --prod`. The sync command sends allowlisted `.env.local` values over stdin and suppresses provider output. [`vercel.json`](../../vercel.json) intentionally contains no native cron, so it deploys on Hobby. After setting the final `NEXT_PUBLIC_APP_URL`, run `pnpm --silent run openinstinct -- configure-supabase-scheduler --json`.
 
 The command stores the endpoint and bearer secret in Supabase Vault and schedules a static database function with Supabase Cron. The function performs one outbound fetch; the Next.js function claims and processes the durable queue. This keeps the default at two infrastructure accounts.
 

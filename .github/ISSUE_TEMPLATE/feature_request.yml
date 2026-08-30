@@ -1,0 +1,35 @@
+name: Feature request
+description: Propose an improvement that preserves OpenInstinct's safety boundaries.
+title: "[Feature]: "
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What owner or operator problem should this solve?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed experience
+      description: Describe the desired behavior from setup through verification.
+    validations:
+      required: true
+  - type: dropdown
+    id: risk
+    attributes:
+      label: Does this introduce a new external action?
+      options:
+        - No, read-only or local behavior
+        - Yes, an approval-gated write or communication
+        - Yes, destructive, financial, or security-sensitive behavior
+        - Unsure
+    validations:
+      required: true
+  - type: textarea
+    id: safety
+    attributes:
+      label: Safety and idempotency considerations
+      description: Explain approval, retry, ambiguous-outcome, and credential-handling needs if applicable.

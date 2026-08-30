@@ -24,7 +24,29 @@ function hasAll(
   names: readonly string[] | undefined,
 ): boolean {
   if (!names?.length) return false;
-  return names.every((name) => Boolean(values[name]));
+  return names.every((name) => requirementSatisfied(name, values[name]));
+}
+
+export function isPublicDeploymentUrl(value: string | undefined): boolean {
+  if (!value) return false;
+  try {
+    const url = new URL(value);
+    return (
+      url.protocol === "https:" &&
+      !["localhost", "127.0.0.1", "::1"].includes(url.hostname)
+    );
+  } catch {
+    return false;
+  }
+}
+
+function requirementSatisfied(
+  name: string,
+  value: string | undefined,
+): boolean {
+  return name === "NEXT_PUBLIC_APP_URL"
+    ? isPublicDeploymentUrl(value)
+    : Boolean(value);
 }
 
 function action(
@@ -34,7 +56,9 @@ function action(
   const complete = hasAll(values, input.completeWhen);
   const blocked =
     !complete &&
-    Boolean(input.requires?.some((name) => !Boolean(values[name])));
+    Boolean(
+      input.requires?.some((name) => !requirementSatisfied(name, values[name])),
+    );
   return {
     ...input,
     status: complete ? "complete" : blocked ? "blocked" : "available",
@@ -47,6 +71,16 @@ export function setupActions(
 ): SetupAction[] {
   const vercel = ["vercel", "vercel-pro", "vercel-cloudflare"].includes(target);
   const actions: SetupAction[] = [
+    action(values, {
+      id: "configure-owner",
+      phase: "infrastructure",
+      title: "Configure the owner",
+      description:
+        "Open the private loopback form and save the only email address allowed to sign in.",
+      command: "pnpm run openinstinct -- setup-ui",
+      mutatesExternalState: false,
+      completeWhen: ["OWNER_EMAIL"],
+    }),
     action(values, {
       id: "provision-supabase",
       phase: "infrastructure",
@@ -129,7 +163,7 @@ export function setupActions(
         id: "verify-bootstrap",
         phase: "deployment",
         title: "Verify bootstrap configuration",
-        command: `pnpm run doctor -- --target ${target} --phase bootstrap --json`,
+        command: `pnpm --silent run doctor -- --target ${target} --phase bootstrap --json`,
         mutatesExternalState: false,
       }),
       action(values, {
@@ -170,7 +204,8 @@ export function setupActions(
         id: "configure-scheduler",
         phase: "deployment",
         title: "Configure the scheduler",
-        command: "pnpm run openinstinct -- configure-supabase-scheduler --json",
+        command:
+          "pnpm --silent run openinstinct -- configure-supabase-scheduler --json",
         mutatesExternalState: true,
         secretInput: "read from .env.local and stored in Supabase Vault",
         requires: ["DATABASE_URL", "NEXT_PUBLIC_APP_URL"],
@@ -211,7 +246,7 @@ export function setupActions(
       description:
         "Read the active Blooio channels and capture the channel automatically when exactly one is available.",
       command:
-        "pnpm run openinstinct -- configure-blooio --use-env-api-key --json",
+        "pnpm --silent run openinstinct -- configure-blooio --use-env-api-key --json",
       mutatesExternalState: false,
       requires: ["BLOOIO_API_KEY"],
       completeWhen: ["BLOOIO_API_KEY", "BLOOIO_CHANNEL_ID"],
@@ -231,7 +266,7 @@ export function setupActions(
       id: "verify-ready",
       phase: "verify",
       title: "Verify the ready deployment",
-      command: `pnpm run doctor -- --target ${target} --phase ready --json`,
+      command: `pnpm --silent run doctor -- --target ${target} --phase ready --json`,
       mutatesExternalState: false,
       requires: [
         "BLOOIO_API_KEY",

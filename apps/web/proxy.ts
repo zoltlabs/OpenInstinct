@@ -7,6 +7,6 @@ export function proxy(request: NextRequest) {
 
 export const config = {
   matcher: [
-    "/((?!_next/static|_next/image|favicon.ico|api/webhooks/blooio|api/internal/consume).*)",
+    "/((?!_next/static|_next/image|favicon.ico|api/health|api/webhooks/blooio|api/internal/consume).*)",
   ],
 };

@@ -53,6 +53,35 @@ form {
   display: grid;
   gap: 10px;
 }
+.field {
+  display: grid;
+  gap: 6px;
+}
+.field > span {
+  color: #e7ebf0;
+  font-size: 0.92rem;
+  font-weight: 650;
+}
+.field > small {
+  color: #8f99a7;
+  line-height: 1.45;
+}
+.notice {
+  max-width: 680px;
+  margin: 24px 0 0;
+  border: 1px solid #384452;
+  border-radius: 12px;
+  padding: 12px 14px;
+  background: rgba(17, 21, 27, 0.92);
+}
+.notice.success {
+  border-color: #247247;
+  color: #a7f3c4;
+}
+.notice.error {
+  border-color: #8f3b45;
+  color: #fecdd3;
+}
 input,
 button {
   width: 100%;

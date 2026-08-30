@@ -25,24 +25,52 @@ import { executeApprovedGoogleAction, runAssistantAgent } from "./agent";
 import { PermanentJobError } from "./consumer";
 import { createAssistantModel } from "./models";
 
+export interface OutboundMessenger {
+  sendMessage(input: {
+    to: string;
+    text: string;
+    channelId?: string;
+    idempotencyKey: string;
+  }): Promise<{ message_id: string; status: string }>;
+}
+
 export class JobProcessor {
   readonly #store: OpenInstinctStore;
   readonly #env: ServerEnvironment;
-  readonly #blooio: BlooioClient;
+  readonly #messenger?: OutboundMessenger;
   readonly #model: LanguageModel;
   readonly #modelId: string;
   readonly #browser?: BrowserProvider;
+  readonly #runAgent: typeof runAssistantAgent;
 
-  constructor(input: { store: OpenInstinctStore; env: ServerEnvironment }) {
+  constructor(input: {
+    store: OpenInstinctStore;
+    env: ServerEnvironment;
+    messenger?: OutboundMessenger;
+    model?: LanguageModel;
+    modelId?: string;
+    browser?: BrowserProvider;
+    runAgent?: typeof runAssistantAgent;
+  }) {
     this.#store = input.store;
     this.#env = input.env;
-    this.#blooio = new BlooioClient({ apiKey: input.env.BLOOIO_API_KEY });
-    const assistantModel = createAssistantModel(input.env);
-    this.#model = assistantModel.model;
-    this.#modelId = assistantModel.configuredId;
-    this.#browser = input.env.KERNEL_API_KEY
-      ? new KernelBrowserProvider(input.env.KERNEL_API_KEY)
-      : undefined;
+    this.#messenger =
+      input.messenger ??
+      (input.env.BLOOIO_API_KEY
+        ? new BlooioClient({ apiKey: input.env.BLOOIO_API_KEY })
+        : undefined);
+    const assistantModel = input.model
+      ? undefined
+      : createAssistantModel(input.env);
+    this.#model = input.model ?? assistantModel!.model;
+    this.#modelId =
+      input.modelId ?? assistantModel?.configuredId ?? "injected-model";
+    this.#browser =
+      input.browser ??
+      (input.env.KERNEL_API_KEY
+        ? new KernelBrowserProvider(input.env.KERNEL_API_KEY)
+        : undefined);
+    this.#runAgent = input.runAgent ?? runAssistantAgent;
   }
 
   async process(job: AgentJob): Promise<void> {
@@ -58,8 +86,12 @@ export class JobProcessor {
         })
       )
         return;
+      if (!this.#env.BLOOIO_OWNER_PHONE)
+        throw new PermanentJobError(
+          "Blooio is not configured; reminder delivery is unavailable.",
+        );
       const text = `Reminder: ${job.message}`;
-      const sent = await this.#blooio.sendMessage({
+      const sent = await this.#sendMessage({
         to: this.#env.BLOOIO_OWNER_PHONE,
         text,
         channelId: this.#env.BLOOIO_CHANNEL_ID,
@@ -106,7 +138,7 @@ export class JobProcessor {
       } catch (error) {
         await this.#store.markActionUnknown(action.id);
         const text = `I could not confirm whether this approved action completed, so I will not retry it automatically: ${action.summary}`;
-        const sent = await this.#blooio.sendMessage({
+        const sent = await this.#sendMessage({
           to: context.ownerPhone,
           text,
           channelId: this.#env.BLOOIO_CHANNEL_ID,
@@ -126,7 +158,7 @@ export class JobProcessor {
         return;
       }
       const text = `Approved action completed: ${action.summary}`;
-      const sent = await this.#blooio.sendMessage({
+      const sent = await this.#sendMessage({
         to: context.ownerPhone,
         text,
         channelId: this.#env.BLOOIO_CHANNEL_ID,
@@ -154,7 +186,7 @@ export class JobProcessor {
       workspaceId: context.workspaceId,
       limit: 20,
     });
-    const result = await runAssistantAgent({
+    const result = await this.#runAgent({
       context,
       store: this.#store,
       google,
@@ -183,7 +215,7 @@ export class JobProcessor {
             : "legacy-unversioned",
       })),
     });
-    const sent = await this.#blooio.sendMessage({
+    const sent = await this.#sendMessage({
       to: context.ownerPhone,
       text: result.text,
       channelId: this.#env.BLOOIO_CHANNEL_ID,
@@ -204,6 +236,16 @@ export class JobProcessor {
         model: this.#modelId,
       });
     }
+  }
+
+  async #sendMessage(
+    input: Parameters<OutboundMessenger["sendMessage"]>[0],
+  ): Promise<Awaited<ReturnType<OutboundMessenger["sendMessage"]>>> {
+    if (!this.#messenger)
+      throw new PermanentJobError(
+        "Blooio is not configured; outbound delivery is unavailable.",
+      );
+    return this.#messenger.sendMessage(input);
   }
 
   async #executeSystemAction(

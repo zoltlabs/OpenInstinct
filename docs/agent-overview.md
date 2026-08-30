@@ -197,10 +197,10 @@ Use Node 22 and pnpm 10.
 ```bash
 corepack enable
 pnpm install
-pnpm run setup -- --target vercel --database hosted --json
+pnpm --silent run setup -- --target vercel --database hosted --json
 pnpm run openinstinct -- configure-supabase --project-ref <project-ref>
 pnpm exec supabase db push --linked
-pnpm run doctor -- --target vercel --phase bootstrap --json
+pnpm --silent run doctor -- --target vercel --phase bootstrap --json
 ```
 
 Hosted Supabase with Vercel is the normal setup path. Authorized Supabase and Vercel integrations are sufficient for the base deployment; `gcloud`, Blooio, and Kernel are optional post-deploy setup. The loopback setup UI renders the same ordered action plan used by agents and opens automatically unless `--no-open` is passed. Create the Vercel project before deploying, capture its assigned production domain with `set-app-url`, configure Supabase Auth against that URL, synchronize the environment, and deploy once. Use the local stack only for database development with `pnpm supabase:start` and `pnpm supabase:reset`.
@@ -215,7 +215,7 @@ Before handoff:
 pnpm check
 pnpm build
 pnpm supabase:test
-pnpm run smoke -- --url http://localhost:3000 --json
+pnpm --silent run smoke -- --url http://localhost:3000 --json
 ```
 
 Run the checks that require live services when those services are available. If one cannot run, report the exact missing dependency; do not describe it as passing.

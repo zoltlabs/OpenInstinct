@@ -6,6 +6,7 @@ import {
   type ResolvedLanguageModel,
   withFallbackModel,
 } from "../src/models";
+import { previewAssistantMessage } from "../src/preview";
 
 const environment = {
   NEXT_PUBLIC_APP_URL: "https://openinstinct.example",
@@ -85,5 +86,27 @@ describe("assistant model selection", () => {
     const selection = createAssistantModel(environment);
     expect(selection.configuredId).toBe("openai:gpt-example");
     expect(selection.model.provider).toBe("openai.responses");
+  });
+
+  it("previews a response without exposing tools or side effects", async () => {
+    const generate = vi.fn(async () => generationResult);
+    const model = {
+      specificationVersion: "v4",
+      provider: "preview",
+      modelId: "preview-model",
+      supportedUrls: {},
+      doGenerate: generate,
+      doStream: vi.fn(async () => {
+        throw new Error("not used");
+      }),
+    } satisfies ResolvedLanguageModel;
+
+    await expect(
+      previewAssistantMessage({ model, message: "What can you do?" }),
+    ).resolves.toBe("fallback");
+    expect(generate).toHaveBeenCalledOnce();
+    expect(JSON.stringify(generate.mock.calls[0])).toContain(
+      "local model-only preview",
+    );
   });
 });

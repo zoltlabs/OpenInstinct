@@ -87,11 +87,11 @@ const serverEnvironmentBaseSchema = z.object({
   SUPABASE_SECRET_KEY: environmentFieldSchemas.SUPABASE_SECRET_KEY,
   DATABASE_URL: environmentFieldSchemas.DATABASE_URL,
   SECRET_ENCRYPTION_KEY: environmentFieldSchemas.SECRET_ENCRYPTION_KEY,
-  BLOOIO_API_KEY: environmentFieldSchemas.BLOOIO_API_KEY,
+  BLOOIO_API_KEY: environmentFieldSchemas.BLOOIO_API_KEY.optional(),
   BLOOIO_WEBHOOK_SECRET:
     environmentFieldSchemas.BLOOIO_WEBHOOK_SECRET.optional(),
   BLOOIO_CHANNEL_ID: environmentFieldSchemas.BLOOIO_CHANNEL_ID.optional(),
-  BLOOIO_OWNER_PHONE: environmentFieldSchemas.BLOOIO_OWNER_PHONE,
+  BLOOIO_OWNER_PHONE: environmentFieldSchemas.BLOOIO_OWNER_PHONE.optional(),
   OWNER_EMAIL: environmentFieldSchemas.OWNER_EMAIL,
   AI_PROVIDER: environmentFieldSchemas.AI_PROVIDER,
   AI_GATEWAY_API_KEY: environmentFieldSchemas.AI_GATEWAY_API_KEY.optional(),

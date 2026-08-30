@@ -9,6 +9,22 @@ import {
 } from "ai";
 import type { AiProvider, ServerEnvironment } from "@openinstinct/runtime";
 
+export type ModelEnvironment = Pick<
+  ServerEnvironment,
+  | "NEXT_PUBLIC_APP_URL"
+  | "AI_PROVIDER"
+  | "AI_MODEL"
+  | "AI_FALLBACK_PROVIDER"
+  | "AI_FALLBACK_MODEL"
+  | "AI_GATEWAY_API_KEY"
+  | "OPENAI_API_KEY"
+  | "ANTHROPIC_API_KEY"
+  | "GOOGLE_GENERATIVE_AI_API_KEY"
+  | "OPENROUTER_API_KEY"
+  | "AI_COMPATIBLE_BASE_URL"
+  | "AI_COMPATIBLE_API_KEY"
+>;
+
 export type ResolvedLanguageModel = ReturnType<typeof wrapLanguageModel>;
 
 export interface AssistantModel {
@@ -23,7 +39,7 @@ function required(value: string | undefined, name: string): string {
 }
 
 export function createProviderModel(
-  env: ServerEnvironment,
+  env: ModelEnvironment,
   provider: AiProvider,
   modelId: string,
 ): ResolvedLanguageModel {
@@ -94,7 +110,7 @@ export function withFallbackModel(
   });
 }
 
-export function createAssistantModel(env: ServerEnvironment): AssistantModel {
+export function createAssistantModel(env: ModelEnvironment): AssistantModel {
   const primary = createProviderModel(env, env.AI_PROVIDER, env.AI_MODEL);
   const primaryId = `${env.AI_PROVIDER}:${env.AI_MODEL}`;
   if (!env.AI_FALLBACK_PROVIDER || !env.AI_FALLBACK_MODEL)

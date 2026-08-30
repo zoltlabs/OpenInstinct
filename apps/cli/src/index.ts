@@ -3,6 +3,7 @@ import { copyFile, readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { randomBytes } from "node:crypto";
+import { createInterface } from "node:readline/promises";
 import { Command } from "commander";
 import { z } from "zod";
 import { configureSupabaseScheduler } from "@openinstinct/db";
@@ -22,9 +23,14 @@ import {
 import { startSetupUi } from "./setup-ui";
 import { setupActions } from "./setup-plan";
 import { configureBlooio, ensureBlooioWebhook } from "./blooio-setup";
+import {
+  createAssistantModel,
+  previewAssistantMessage,
+  type ModelEnvironment,
+} from "@openinstinct/worker";
 
 export { envFileValues } from "./env-file";
-export { setupActions } from "./setup-plan";
+export { isPublicDeploymentUrl, setupActions } from "./setup-plan";
 
 export type Check = { name: string; ok: boolean; detail: string };
 const setupPhaseSchema = z.enum(["bootstrap", "ready"]);
@@ -97,6 +103,82 @@ async function readSecretInput(prompt: string): Promise<string> {
     process.stdin.resume();
     process.stdin.on("data", onData);
   });
+}
+
+async function readMessageInput(prompt: string): Promise<string> {
+  if (!process.stdin.isTTY) {
+    let value = "";
+    for await (const chunk of process.stdin) value += String(chunk);
+    return value.trim();
+  }
+  const readline = createInterface({
+    input: process.stdin,
+    output: process.stdout,
+  });
+  try {
+    return (await readline.question(prompt)).trim();
+  } finally {
+    readline.close();
+  }
+}
+
+function previewModelEnvironment(
+  values: Record<string, string | undefined>,
+): ModelEnvironment {
+  const provider = environmentFieldSchemas.AI_PROVIDER.parse(
+    values.AI_PROVIDER,
+  );
+  const model = environmentFieldSchemas.AI_MODEL.parse(values.AI_MODEL);
+  const appUrl = environmentFieldSchemas.NEXT_PUBLIC_APP_URL.parse(
+    values.NEXT_PUBLIC_APP_URL ?? "http://localhost:3000",
+  );
+  const fallbackProvider = values.AI_FALLBACK_PROVIDER
+    ? environmentFieldSchemas.AI_FALLBACK_PROVIDER.parse(
+        values.AI_FALLBACK_PROVIDER,
+      )
+    : undefined;
+  const fallbackModel = values.AI_FALLBACK_MODEL
+    ? environmentFieldSchemas.AI_FALLBACK_MODEL.parse(values.AI_FALLBACK_MODEL)
+    : undefined;
+  if (Boolean(fallbackProvider) !== Boolean(fallbackModel))
+    throw new Error(
+      "AI_FALLBACK_PROVIDER and AI_FALLBACK_MODEL must be configured together.",
+    );
+  if (provider === "vercel-gateway" && !values.AI_GATEWAY_API_KEY)
+    throw new Error(
+      "The local preview needs AI_GATEWAY_API_KEY. Vercel OIDC is only available after deployment, or select a direct provider locally.",
+    );
+  return {
+    NEXT_PUBLIC_APP_URL: appUrl,
+    AI_PROVIDER: provider,
+    AI_MODEL: model,
+    ...(fallbackProvider ? { AI_FALLBACK_PROVIDER: fallbackProvider } : {}),
+    ...(fallbackModel ? { AI_FALLBACK_MODEL: fallbackModel } : {}),
+    ...(values.AI_GATEWAY_API_KEY
+      ? { AI_GATEWAY_API_KEY: values.AI_GATEWAY_API_KEY }
+      : {}),
+    ...(values.OPENAI_API_KEY ? { OPENAI_API_KEY: values.OPENAI_API_KEY } : {}),
+    ...(values.ANTHROPIC_API_KEY
+      ? { ANTHROPIC_API_KEY: values.ANTHROPIC_API_KEY }
+      : {}),
+    ...(values.GOOGLE_GENERATIVE_AI_API_KEY
+      ? { GOOGLE_GENERATIVE_AI_API_KEY: values.GOOGLE_GENERATIVE_AI_API_KEY }
+      : {}),
+    ...(values.OPENROUTER_API_KEY
+      ? { OPENROUTER_API_KEY: values.OPENROUTER_API_KEY }
+      : {}),
+    ...(values.AI_COMPATIBLE_BASE_URL
+      ? {
+          AI_COMPATIBLE_BASE_URL:
+            environmentFieldSchemas.AI_COMPATIBLE_BASE_URL.parse(
+              values.AI_COMPATIBLE_BASE_URL,
+            ),
+        }
+      : {}),
+    ...(values.AI_COMPATIBLE_API_KEY
+      ? { AI_COMPATIBLE_API_KEY: values.AI_COMPATIBLE_API_KEY }
+      : {}),
+  };
 }
 
 async function openBrowser(url: string, root: string): Promise<boolean> {
@@ -424,7 +506,13 @@ program
         await setEnvValue(envPath, "GOOGLE_REDIRECT_URI", "");
       }
       const parsedDatabase = z.enum(["hosted", "local"]).parse(database);
-      const checks = await doctor(root, parsedTarget, "bootstrap", envFile);
+      const bootstrapChecks = await doctor(
+        root,
+        parsedTarget,
+        "bootstrap",
+        envFile,
+      );
+      const readyChecks = await doctor(root, parsedTarget, "ready", envFile);
       const next =
         parsedDatabase === "local"
           ? [
@@ -435,7 +523,8 @@ program
             ]
           : [
               "Use the connected Supabase integration to create or select a project.",
-              "Enter DATABASE_URL in the loopback setup UI, then capture the connection with: pnpm run openinstinct -- configure-supabase --project-ref <project-ref> --use-env-database-url.",
+              "Run: pnpm run openinstinct -- setup-ui. Save OWNER_EMAIL and DATABASE_URL, then stop the loopback form.",
+              "Capture the Supabase connection with: pnpm run openinstinct -- configure-supabase --project-ref <project-ref> --use-env-database-url.",
               "Run: pnpm exec supabase db push --linked",
               ...(["vercel", "vercel-pro", "vercel-cloudflare"].includes(
                 parsedTarget,
@@ -444,29 +533,34 @@ program
                     "Run: vercel link",
                     "Read the Vercel project's assigned production domain and store it with: pnpm run openinstinct -- set-app-url --url <production-url>",
                     "Use the Supabase integration to set Auth Site URL to NEXT_PUBLIC_APP_URL and allow NEXT_PUBLIC_APP_URL/api/auth/callback.",
-                    `Run: pnpm run doctor -- --target ${parsedTarget} --phase bootstrap --json`,
+                    `Run: pnpm --silent run doctor -- --target ${parsedTarget} --phase bootstrap --json`,
                     "Run: pnpm run openinstinct -- push-vercel-env --environment production",
                     parsedTarget === "vercel-pro"
                       ? "Run: vercel deploy --prod --local-config vercel.pro.json"
                       : "Run: vercel deploy --prod",
                     ...(parsedTarget === "vercel"
                       ? [
-                          "Run: pnpm run openinstinct -- configure-supabase-scheduler --json",
+                          "Run: pnpm --silent run openinstinct -- configure-supabase-scheduler --json",
                         ]
                       : []),
                   ]
                 : [
-                    `Run: pnpm run doctor -- --target ${parsedTarget} --phase bootstrap --json`,
+                    `Run: pnpm --silent run doctor -- --target ${parsedTarget} --phase bootstrap --json`,
                   ]),
             ];
       const resolvedValues = envFileValues(await readFile(envPath, "utf8"));
+      const bootstrapReady = bootstrapChecks.every((check) => check.ok);
+      const ready = readyChecks.every((check) => check.ok);
       const result = {
         ok: true,
-        ready: checks.every((check) => check.ok),
+        ready,
+        bootstrapReady,
+        milestone: ready ? "ready" : bootstrapReady ? "bootstrap" : "local",
         target: parsedTarget,
         database: parsedDatabase,
         envFile: envPath,
-        checks,
+        checks: bootstrapChecks,
+        readyChecks,
         next,
         actions:
           parsedDatabase === "hosted"
@@ -623,6 +717,54 @@ program
         options.json,
       );
       if (results.some((result) => !result.ok)) process.exitCode = 3;
+    },
+  );
+
+program
+  .command("try-message")
+  .description(
+    "preview one assistant response locally without Supabase, Blooio, connectors, or side effects",
+  )
+  .option(
+    "--message <message>",
+    "message to preview; omit to use stdin or a prompt",
+  )
+  .option("--env-file <path>", "environment file", ".env.local")
+  .action(
+    async ({ message, envFile }: { message?: string; envFile: string }) => {
+      const options = program.opts<{ json: boolean; root: string }>();
+      const envPath = resolve(options.root, envFile);
+      const fileValues = (await exists(envPath))
+        ? envFileValues(await readFile(envPath, "utf8"))
+        : {};
+      const values = {
+        ...fileValues,
+        ...Object.fromEntries(
+          Object.entries(process.env).filter(
+            (entry): entry is [string, string] => Boolean(entry[1]),
+          ),
+        ),
+      };
+      const previewMessage =
+        message?.trim() || (await readMessageInput("Message: "));
+      if (!previewMessage) throw new Error("A preview message is required.");
+      const selection = createAssistantModel(previewModelEnvironment(values));
+      const text = await previewAssistantMessage({
+        model: selection.model,
+        message: previewMessage,
+      });
+      emit(
+        options.json
+          ? {
+              ok: true,
+              mode: "model-only-preview",
+              model: selection.configuredId,
+              text,
+              sideEffects: false,
+            }
+          : `${text}\n\nPreview only — no database, connectors, approvals, or external actions were used.`,
+        options.json,
+      );
     },
   );
 

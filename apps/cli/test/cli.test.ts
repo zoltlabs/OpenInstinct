@@ -5,6 +5,7 @@ import { join } from "node:path";
 import {
   checkEnvironment,
   envFileValues,
+  isPublicDeploymentUrl,
   normalizePublicAppUrl,
   parseSupabaseApiKeys,
   setupActions,
@@ -38,6 +39,21 @@ describe("agent-friendly setup checks", () => {
     expect(() => normalizePublicAppUrl("http://localhost:3000")).toThrow(
       "public HTTPS",
     );
+  });
+
+  it("does not treat the generated loopback URL as a deployed app", () => {
+    expect(isPublicDeploymentUrl("http://localhost:3000")).toBe(false);
+    expect(isPublicDeploymentUrl("https://assistant.example")).toBe(true);
+    const actions = setupActions("vercel", {
+      NEXT_PUBLIC_APP_URL: "http://localhost:3000",
+      NEXT_PUBLIC_SUPABASE_URL: "https://example.supabase.co",
+    });
+    expect(
+      actions.find((action) => action.id === "capture-app-url"),
+    ).toHaveProperty("status", "available");
+    expect(
+      actions.find((action) => action.id === "deploy-final"),
+    ).toHaveProperty("status", "blocked");
   });
 
   it("parses quoted env-file values without exposing them", () => {
@@ -182,7 +198,9 @@ describe("agent-friendly setup checks", () => {
 
   it("describes hosted mutations and browser fallback for an agent", () => {
     const actions = setupActions("vercel");
-    expect(actions[0]).toMatchObject({
+    expect(
+      actions.find((action) => action.id === "provision-supabase"),
+    ).toMatchObject({
       id: "provision-supabase",
       preferredTool: "supabase-mcp",
       fallbackTool: "computer-use",
@@ -229,10 +247,17 @@ describe("agent-friendly setup checks", () => {
     ).toMatchObject({
       confirmation: "required-before-webhook-registration",
     });
+    expect(
+      actions.find((action) => action.id === "configure-owner"),
+    ).toMatchObject({
+      completeWhen: ["OWNER_EMAIL"],
+      status: "available",
+    });
   });
 
   it("resolves setup actions from existing configuration", () => {
     const actions = setupActions("vercel", {
+      OWNER_EMAIL: "owner@example.com",
       NEXT_PUBLIC_APP_URL: "https://assistant.example",
       NEXT_PUBLIC_SUPABASE_URL: "https://example.supabase.co",
       BLOOIO_API_KEY: "blooio-secret",
@@ -241,6 +266,9 @@ describe("agent-friendly setup checks", () => {
     });
     expect(
       actions.find((action) => action.id === "provision-supabase"),
+    ).toHaveProperty("status", "complete");
+    expect(
+      actions.find((action) => action.id === "configure-owner"),
     ).toHaveProperty("status", "complete");
     expect(
       actions.find((action) => action.id === "setup-blooio-account"),
@@ -387,7 +415,11 @@ describe("agent-friendly setup checks", () => {
   it("never renders stored secrets and rejects cross-origin form posts", async () => {
     const directory = await mkdtemp(join(tmpdir(), "openinstinct-ui-"));
     const envPath = join(directory, ".env.local");
-    await setEnvValues(envPath, { BLOOIO_API_KEY: "never-render-this" });
+    await setEnvValues(envPath, {
+      BLOOIO_API_KEY: "never-render-this",
+      AI_PROVIDER: "openai",
+      AI_MODEL: "gpt-5.6-sol",
+    });
     const ui = await startSetupUi({ envPath, port: 0 });
     try {
       const page = await (await fetch(ui.url)).text();
@@ -397,6 +429,11 @@ describe("agent-friendly setup checks", () => {
       expect(page).toContain("Advanced deployment options");
       expect(page).toContain("Finish Blooio");
       expect(page).toContain("Setup plan");
+      expect(page).toContain("AI provider");
+      expect(page).toContain("OpenAI API key");
+      expect(page).toContain("Public app URL");
+      expect(page).toContain('value="openai"');
+      expect(page).toContain('value="gpt-5.6-sol"');
       const csrf = page.match(/name="csrf" value="([^"]+)"/u)?.[1];
       expect(csrf).toBeTruthy();
       const response = await fetch(`${ui.url}/save`, {

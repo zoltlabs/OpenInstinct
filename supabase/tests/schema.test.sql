@@ -1,5 +1,5 @@
 begin;
-select plan(18);
+select plan(22);
 
 select has_table('public', 'workspaces', 'workspaces table exists');
 select has_table('public', 'action_requests', 'action requests table exists');
@@ -19,6 +19,44 @@ select has_column('public', 'scheduled_triggers', 'recurrence_seconds', 'schedul
 select has_column('public', 'scheduled_triggers', 'completed_at', 'schedules record completion');
 select ok((select relrowsecurity from pg_class where oid = 'public.scheduled_triggers'::regclass), 'schedules use RLS');
 select ok((select relrowsecurity from pg_class where oid = 'public.memories'::regclass), 'memories use RLS');
+select is(
+  (
+    select count(*)::integer
+    from pg_class
+    where oid in (
+      'public.workspaces'::regclass,
+      'public.owner_phone_numbers'::regclass,
+      'public.conversations'::regclass,
+      'public.messages'::regclass,
+      'public.inbound_events'::regclass,
+      'public.agent_runs'::regclass,
+      'public.action_requests'::regclass,
+      'public.approvals'::regclass,
+      'public.connections'::regclass,
+      'public.memories'::regclass,
+      'public.scheduled_triggers'::regclass,
+      'public.audit_events'::regclass,
+      'public.browser_profiles'::regclass
+    ) and relrowsecurity
+  ),
+  13,
+  'every Data API table has RLS enabled'
+);
+select ok(
+  not exists (
+    select 1 from information_schema.role_table_grants
+    where table_schema = 'public' and grantee = 'anon'
+  ),
+  'anonymous clients have no public table or view grants'
+);
+select ok(
+  not has_table_privilege('authenticated', 'public.connections', 'SELECT'),
+  'clients cannot read encrypted connection records directly'
+);
+select ok(
+  not has_table_privilege('authenticated', 'public.agent_runs', 'INSERT'),
+  'clients cannot create agent runs directly'
+);
 
 select * from finish();
 rollback;

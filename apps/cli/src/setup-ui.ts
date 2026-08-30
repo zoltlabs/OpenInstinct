@@ -44,6 +44,62 @@ const fields = [
     help: "The Postgres URL containing the generated database password.",
   },
   {
+    name: "AI_PROVIDER",
+    label: "AI provider",
+    type: "text",
+    displayStored: true,
+    help: "openai, anthropic, google, openrouter, vercel-gateway, or openai-compatible.",
+  },
+  {
+    name: "AI_MODEL",
+    label: "AI model",
+    type: "text",
+    displayStored: true,
+    help: "The provider-native model ID.",
+  },
+  {
+    name: "OPENAI_API_KEY",
+    label: "OpenAI API key",
+    type: "password",
+    help: "Required only when AI_PROVIDER is openai.",
+  },
+  {
+    name: "ANTHROPIC_API_KEY",
+    label: "Anthropic API key",
+    type: "password",
+    help: "Required only when AI_PROVIDER is anthropic.",
+  },
+  {
+    name: "GOOGLE_GENERATIVE_AI_API_KEY",
+    label: "Google Generative AI API key",
+    type: "password",
+    help: "Required only when AI_PROVIDER is google.",
+  },
+  {
+    name: "OPENROUTER_API_KEY",
+    label: "OpenRouter API key",
+    type: "password",
+    help: "Required only when AI_PROVIDER is openrouter.",
+  },
+  {
+    name: "AI_GATEWAY_API_KEY",
+    label: "Vercel AI Gateway API key",
+    type: "password",
+    help: "Needed for local previews; deployed Vercel functions can use OIDC instead.",
+  },
+  {
+    name: "AI_COMPATIBLE_BASE_URL",
+    label: "OpenAI-compatible base URL",
+    type: "url",
+    help: "Required only when AI_PROVIDER is openai-compatible.",
+  },
+  {
+    name: "AI_COMPATIBLE_API_KEY",
+    label: "OpenAI-compatible API key",
+    type: "password",
+    help: "Optional when the compatible endpoint does not require authentication.",
+  },
+  {
     name: "GOOGLE_CLIENT_ID",
     label: "Google OAuth client ID",
     type: "password",
@@ -65,6 +121,7 @@ const fields = [
     name: "NEXT_PUBLIC_APP_URL",
     label: "Public app URL",
     type: "url",
+    displayStored: true,
     help: "The final Vercel HTTPS URL. It can be added after deployment.",
   },
   {
@@ -143,11 +200,31 @@ function page(input: {
       .filter((field) => names.includes(field.name))
       .map((field) => {
         const isConfigured = configured.has(field.name);
-        return `<label><span>${escapeHtml(field.label)}</span><small>${isConfigured ? "Configured — leave blank to keep it" : escapeHtml(field.help)}</small><input name="${field.name}" type="${field.type}" autocomplete="off" placeholder="${isConfigured ? "••••••••" : "Not configured"}"></label>`;
+        const displayStored = "displayStored" in field && field.displayStored;
+        const storedValue = displayStored
+          ? input.values[field.name]
+          : undefined;
+        const help =
+          isConfigured && !displayStored
+            ? "Configured — leave blank to keep it"
+            : escapeHtml(field.help);
+        return `<label><span>${escapeHtml(field.label)}</span><small>${help}</small><input name="${field.name}" type="${field.type}" autocomplete="off"${storedValue ? ` value="${escapeHtml(storedValue)}"` : ""} placeholder="${isConfigured && !displayStored ? "••••••••" : "Not configured"}"></label>`;
       })
       .join("");
   const ownerFields = renderFields(["OWNER_EMAIL"]);
-  const providerFields = renderFields(["DATABASE_URL", "NEXT_PUBLIC_APP_URL"]);
+  const providerFields = renderFields([
+    "DATABASE_URL",
+    "NEXT_PUBLIC_APP_URL",
+    "AI_PROVIDER",
+    "AI_MODEL",
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "GOOGLE_GENERATIVE_AI_API_KEY",
+    "OPENROUTER_API_KEY",
+    "AI_GATEWAY_API_KEY",
+    "AI_COMPATIBLE_BASE_URL",
+    "AI_COMPATIBLE_API_KEY",
+  ]);
   const integrationFields = renderFields([
     "BLOOIO_OWNER_PHONE",
     "BLOOIO_API_KEY",

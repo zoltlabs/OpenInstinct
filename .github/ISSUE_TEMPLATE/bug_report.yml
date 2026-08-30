@@ -1,0 +1,62 @@
+name: Bug report
+description: Report a reproducible OpenInstinct problem without including private data.
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        Thanks for helping improve OpenInstinct. Never include credentials,
+        personal messages, OAuth tokens, webhook bodies, or database URLs.
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened?
+      description: Describe the behavior and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: Provide the smallest safe sequence of commands or actions that reproduces the issue.
+      placeholder: |
+        1. Run ...
+        2. Open ...
+        3. Observe ...
+    validations:
+      required: true
+  - type: dropdown
+    id: deployment
+    attributes:
+      label: Deployment target
+      options:
+        - Vercel Hobby + Supabase Cron
+        - Vercel Pro
+        - Docker
+        - Google Cloud Run
+        - AWS ECS/Fargate
+        - Local development
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+      placeholder: v0.1.0-alpha or commit SHA
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Safe diagnostic output
+      description: Paste redacted doctor or smoke results. Do not paste `.env.local`.
+      render: shell
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Privacy check
+      options:
+        - label: I removed secrets, personal messages, tokens, webhook payloads, and private URLs.
+          required: true

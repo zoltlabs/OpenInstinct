@@ -19,6 +19,7 @@
     "smoke": "tsx apps/cli/src/index.ts smoke",
     "openinstinct": "tsx apps/cli/src/index.ts",
     "supabase:start": "supabase start",
+    "supabase:start:test": "supabase start -x gotrue,realtime,storage-api,imgproxy,kong,mailpit,postgrest,postgres-meta,studio,edge-runtime,logflare,vector,supavisor",
     "supabase:stop": "supabase stop",
     "supabase:reset": "supabase db reset",
     "supabase:test": "supabase test db",
