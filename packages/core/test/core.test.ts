@@ -5,6 +5,9 @@ import {
   createActionRequest,
   decideSemanticAction,
   deriveSemanticGuards,
+  financialAdjustmentConfirmationPhrase,
+  financialConfirmationPhrase,
+  financialTotalAmount,
   payloadHash,
   transitionRun,
 } from "../src/index";
@@ -35,7 +38,7 @@ describe("core policy", () => {
     );
   });
 
-  it("denies financial and requires fresh destructive approval", () => {
+  it("requires fresh financial and destructive approval", () => {
     expect(
       decideSemanticAction({
         intent: {
@@ -46,8 +49,8 @@ describe("core policy", () => {
           amount: { currency: "USD", minorUnits: "100" },
           credentialUse: "payment",
         },
-      }).type,
-    ).toBe("deny");
+      }),
+    ).toMatchObject({ type: "approval", typedConfirmationRequired: true });
     expect(
       decideSemanticAction({
         intent: {
@@ -57,6 +60,31 @@ describe("core policy", () => {
         },
       }).type,
     ).toBe("approval");
+  });
+
+  it("calculates exact minor-unit totals and confirmation phrases", () => {
+    const totalAmount = financialTotalAmount({
+      unitAmount: { currency: "USD", minorUnits: "1299" },
+      quantity: 2,
+    });
+    expect(totalAmount).toEqual({ currency: "USD", minorUnits: "2598" });
+    expect(
+      financialConfirmationPhrase({
+        totalAmount,
+        merchantId: "sandbox-books",
+        paymentAliasId: "00000000-0000-4000-8000-000000000009",
+      }),
+    ).toBe(
+      "CONFIRM PURCHASE 2598 USD AT sandbox-books WITH 00000000-0000-4000-8000-000000000009",
+    );
+    expect(
+      financialAdjustmentConfirmationPhrase({
+        transactionId: "00000000-0000-4000-8000-000000000010",
+        operation: "refund",
+        amount: { currency: "USD", minorUnits: "1299" },
+        reason: "Owner requested a refund.",
+      }),
+    ).toBe("CONFIRM REFUND 1299 USD FOR 00000000-0000-4000-8000-000000000010");
   });
 
   it("binds action requests to their exact input", () => {

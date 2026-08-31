@@ -135,10 +135,10 @@ export function decideSemanticAction(input: {
       type: "deny",
       reason: "Security, password, MFA, and recovery changes are disabled.",
     };
-  if (intent.effect === "purchase" || intent.credentialUse === "payment")
+  if (intent.credentialUse === "payment" && intent.effect !== "purchase")
     return {
       type: "deny",
-      reason: "Financial commits are disabled until the financial pilot.",
+      reason: "Payment credentials are valid only inside the financial pilot.",
     };
   if (["password", "otp"].includes(intent.credentialUse))
     return {
@@ -147,6 +147,13 @@ export function decideSemanticAction(input: {
     };
   if (!intent.commitPoint)
     return { type: "allow", reason: "The action has no consequential commit." };
+  if (intent.effect === "purchase")
+    return {
+      type: "approval",
+      typedConfirmationRequired: true,
+      reason:
+        "Sandbox purchases require a fresh approval of merchant, total, recurring terms, and payment alias.",
+    };
   if (["delete", "cancel"].includes(intent.effect))
     return {
       type: "approval",

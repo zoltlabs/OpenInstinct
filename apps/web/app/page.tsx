@@ -186,6 +186,9 @@ export default async function Home({
       <p>
         <Link href="/authority">Manage bounded authority grants</Link>
       </p>
+      <p>
+        <Link href="/finance">Sandbox financial pilot</Link>
+      </p>
       <Feedback code={feedback} />
       <div className="grid">
         <section className="card wide connector-hub">

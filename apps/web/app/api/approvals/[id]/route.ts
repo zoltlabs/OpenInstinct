@@ -3,6 +3,12 @@ import { NextResponse } from "next/server";
 import { createSupabaseServerClient } from "../../../../src/lib/supabase/server";
 import { isSameOrigin } from "../../../../src/lib/request-security";
 import { feedbackUrl } from "../../../../src/lib/feedback";
+import {
+  financialAdjustmentActionInputSchema,
+  financialAdjustmentConfirmationPhrase,
+  financialConfirmationPhrase,
+  financialPurchaseActionInputSchema,
+} from "@openinstinct/core";
 
 export async function POST(
   request: Request,
@@ -39,7 +45,7 @@ export async function POST(
   if (approved) {
     const { data: action } = await supabase
       .from("action_requests")
-      .select("risk,semantic_intent")
+      .select("risk,semantic_intent,input")
       .eq("id", id)
       .eq("workspace_id", workspace.id)
       .maybeSingle();
@@ -61,7 +67,46 @@ export async function POST(
         ),
         303,
       );
+    const financial =
+      action?.risk === "financial"
+        ? financialPurchaseActionInputSchema.safeParse(action.input)
+        : undefined;
+    if (financial?.success) {
+      const requiredPhrase = financialConfirmationPhrase({
+        totalAmount: financial.data.preflight.totalAmount,
+        merchantId: financial.data.preflight.merchantId,
+        paymentAliasId: financial.data.preflight.paymentAliasId,
+      });
+      if (form.get("financialConfirmation") !== requiredPhrase)
+        return NextResponse.redirect(
+          feedbackUrl(
+            request.url,
+            "approval-confirmation-mismatch",
+            `/approvals/${id}`,
+          ),
+          303,
+        );
+    }
+    const financialAdjustment =
+      action?.risk === "financial"
+        ? financialAdjustmentActionInputSchema.safeParse(action.input)
+        : undefined;
+    if (financialAdjustment?.success) {
+      const requiredPhrase = financialAdjustmentConfirmationPhrase(
+        financialAdjustment.data,
+      );
+      if (form.get("financialConfirmation") !== requiredPhrase)
+        return NextResponse.redirect(
+          feedbackUrl(
+            request.url,
+            "approval-confirmation-mismatch",
+            `/approvals/${id}`,
+          ),
+          303,
+        );
+    }
     typedConfirmation =
+      Boolean(financial?.success || financialAdjustment?.success) ||
       action?.risk === "destructive" ||
       ["delete", "cancel"].includes(
         String(

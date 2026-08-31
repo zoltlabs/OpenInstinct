@@ -1,5 +1,5 @@
 begin;
-select plan(174);
+select plan(215);
 
 select has_table('public', 'workspaces', 'workspaces table exists');
 select has_table('public', 'action_requests', 'action requests table exists');
@@ -23,6 +23,33 @@ select has_table('public', 'credential_access_events', 'credential access audit 
 select has_table('public', 'credential_profile_bindings', 'credential profile bindings exist');
 select has_table('app_private', 'credential_secrets', 'credential ciphertext is private');
 select has_table('app_private', 'credential_injection_leases', 'credential injection leases are private');
+select has_table('public', 'financial_settings', 'financial kill switch and limits exist');
+select has_table('public', 'financial_merchants', 'sandbox merchant allowlist exists');
+select has_table('public', 'payment_aliases', 'safe payment alias metadata exists');
+select has_table('app_private', 'payment_alias_handles', 'payment provider handles are private');
+select has_table('app_private', 'financial_preflights', 'exact financial preflights are private');
+select has_table('public', 'financial_transactions', 'durable financial transactions exist');
+select has_table('public', 'spend_ledger', 'append-only spend ledger exists');
+select has_table('public', 'financial_receipts', 'owner-visible financial receipts exist');
+select has_table('public', 'financial_reconciliation_reads', 'read-only order reconciliation evidence exists');
+select ok((select relrowsecurity from pg_class where oid = 'public.financial_settings'::regclass), 'financial settings use RLS');
+select ok((select relrowsecurity from pg_class where oid = 'public.financial_merchants'::regclass), 'financial merchants use RLS');
+select ok((select relrowsecurity from pg_class where oid = 'public.payment_aliases'::regclass), 'payment aliases use RLS');
+select ok((select relrowsecurity from pg_class where oid = 'public.financial_transactions'::regclass), 'financial transactions use RLS');
+select ok((select relrowsecurity from pg_class where oid = 'public.spend_ledger'::regclass), 'spend ledger uses RLS');
+select ok((select relrowsecurity from pg_class where oid = 'public.financial_receipts'::regclass), 'financial receipts use RLS');
+select ok((select relrowsecurity from pg_class where oid = 'public.financial_reconciliation_reads'::regclass), 'financial reconciliation reads use RLS');
+select ok(not has_table_privilege('authenticated', 'app_private.payment_alias_handles', 'SELECT'), 'clients cannot read payment provider handles');
+select ok(not has_table_privilege('authenticated', 'app_private.financial_preflights', 'SELECT'), 'clients cannot read private preflight records');
+select ok(not has_table_privilege('service_role', 'app_private.payment_alias_handles', 'SELECT'), 'service role cannot bypass the direct SQL broker for payment handles');
+select ok(not has_table_privilege('service_role', 'app_private.financial_preflights', 'SELECT'), 'service role cannot read private financial preflights through the Data API');
+select ok(not has_table_privilege('authenticated', 'public.financial_transactions', 'INSERT'), 'clients cannot forge financial transactions');
+select ok(not has_table_privilege('authenticated', 'public.spend_ledger', 'INSERT'), 'clients cannot forge spend ledger entries');
+select ok(not has_table_privilege('authenticated', 'public.financial_receipts', 'INSERT'), 'clients cannot forge financial receipts');
+select ok(not has_table_privilege('authenticated', 'public.payment_aliases', 'INSERT'), 'clients cannot create payment aliases without a private handle');
+select ok(has_table_privilege('authenticated', 'public.financial_settings', 'UPDATE'), 'owners can operate the global financial kill switch');
+select ok(has_table_privilege('authenticated', 'public.financial_merchants', 'UPDATE'), 'owners can disable allowlisted merchants');
+select ok(has_table_privilege('authenticated', 'public.spend_ledger', 'SELECT'), 'owners can read spend evidence');
 select ok(
   (select convalidated from pg_constraint
     where conname = 'workflow_steps_reconciliation_input_is_safe'),
@@ -307,6 +334,125 @@ insert into public.workspaces (id, owner_user_id)
 values (
   '10000000-0000-4000-8000-000000000012',
   '10000000-0000-4000-8000-000000000011'
+);
+select lives_ok(
+  $$insert into public.financial_settings (
+      workspace_id,enabled,currency,per_transaction_limit,daily_limit,
+      monthly_limit,configuration_version
+    ) values (
+      '10000000-0000-4000-8000-000000000002',false,'USD',1000,2000,3000,
+      repeat('0',64)
+    )$$,
+  'financial settings derive a server-side configuration version'
+);
+select isnt(
+  (select configuration_version from public.financial_settings
+    where workspace_id='10000000-0000-4000-8000-000000000002'),
+  repeat('0',64),
+  'clients cannot choose the financial configuration version'
+);
+insert into public.financial_merchants (
+  id,workspace_id,merchant_key,display_name,exact_origin,enabled,
+  per_transaction_limit,configuration_version
+) values (
+  '10000000-0000-4000-8000-000000000060',
+  '10000000-0000-4000-8000-000000000002','sandbox-store','Sandbox Store',
+  'https://sandbox.openinstinct.local',false,1000,repeat('0',64)
+);
+select throws_ok(
+  $$update public.financial_merchants set exact_origin='https://evil.example'
+    where id='10000000-0000-4000-8000-000000000060'$$,
+  '55000', 'financial merchant identity is immutable',
+  'an allowlisted merchant cannot be repointed'
+);
+insert into public.payment_aliases (
+  id,workspace_id,label,status,configuration_version
+) values (
+  '10000000-0000-4000-8000-000000000061',
+  '10000000-0000-4000-8000-000000000002','Sandbox wallet','revoked',
+  repeat('0',64)
+);
+insert into public.payment_aliases (
+  id,workspace_id,label,status,configuration_version
+) values (
+  '10000000-0000-4000-8000-000000000062',
+  '10000000-0000-4000-8000-000000000002','Backed sandbox wallet','disabled',
+  repeat('0',64)
+);
+insert into app_private.payment_alias_handles (
+  payment_alias_id,workspace_id,opaque_handle
+) values (
+  '10000000-0000-4000-8000-000000000062',
+  '10000000-0000-4000-8000-000000000002','sandbox-test-handle'
+);
+select throws_ok(
+  $$update public.payment_aliases set status='active'
+    where id='10000000-0000-4000-8000-000000000061'$$,
+  '55000', 'payment alias revocation is irreversible',
+  'revoked payment aliases cannot be reactivated'
+);
+select throws_ok(
+  $$update public.financial_settings set per_transaction_limit=4000
+    where workspace_id='10000000-0000-4000-8000-000000000002'$$,
+  '23514', null,
+  'database constraints enforce monotonic financial limits'
+);
+select throws_ok(
+  $$insert into public.payment_aliases (
+      workspace_id,label,status,configuration_version
+    ) values (
+      '10000000-0000-4000-8000-000000000002','Unbacked alias','active',
+      repeat('0',64)
+    )$$,
+  '23514', 'active payment alias requires a private provider handle',
+  'an active alias requires a same-workspace private handle'
+);
+select throws_ok(
+  $$insert into public.financial_transactions (
+      workspace_id,action_request_id,preflight_id,merchant_id,payment_alias_id,
+      amount_minor_units,currency,idempotency_key,status,committed_at
+    ) values (
+      '10000000-0000-4000-8000-000000000002',
+      '10000000-0000-4000-8000-000000000070',
+      '10000000-0000-4000-8000-000000000071',
+      '10000000-0000-4000-8000-000000000060',
+      '10000000-0000-4000-8000-000000000061',100,'USD','invalid-lineage',
+      'committed',now()
+    )$$,
+  '23514', 'financial transaction requires an exact typed approved action',
+  'financial transactions require exact action and approval lineage'
+);
+select throws_ok(
+  $$insert into public.spend_ledger (
+      workspace_id,transaction_id,entry_type,amount_minor_units,currency
+    ) values (
+      '10000000-0000-4000-8000-000000000002',
+      '10000000-0000-4000-8000-000000000072','debit',100,'USD'
+    )$$,
+  '23514', 'spend ledger entry does not match its transaction',
+  'spend ledger evidence requires exact transaction lineage'
+);
+select throws_ok(
+  $$insert into public.financial_receipts (
+      workspace_id,transaction_id,receipt_number,safe_summary,evidence_hash
+    ) values (
+      '10000000-0000-4000-8000-000000000002',
+      '10000000-0000-4000-8000-000000000072','invalid-receipt',
+      '{"amount":{"currency":"USD","minorUnits":"100"}}',repeat('0',64)
+    )$$,
+  '23514', 'financial receipt does not match its transaction',
+  'financial receipts require exact transaction lineage'
+);
+select throws_ok(
+  $$insert into public.financial_reconciliation_reads (
+      workspace_id,transaction_id,action_request_id,observed_status,observed_hash
+    ) values (
+      '10000000-0000-4000-8000-000000000002',
+      '10000000-0000-4000-8000-000000000072',
+      '10000000-0000-4000-8000-000000000070','committed',repeat('0',64)
+    )$$,
+  '23514', 'financial reconciliation lineage mismatch',
+  'financial reconciliation evidence binds transaction and action'
 );
 insert into public.agent_runs (id, workspace_id, status)
 values (
@@ -1049,6 +1195,16 @@ select is(
   1,
   'the owner can read safe browser handoff state'
 );
+select is(
+  (select count(*)::integer from public.financial_settings),
+  1,
+  'the owner can read financial controls'
+);
+select lives_ok(
+  $$update public.payment_aliases set status='active'
+    where id='10000000-0000-4000-8000-000000000062'$$,
+  'the authenticated owner can activate a privately backed alias'
+);
 select set_config(
   'request.jwt.claim.sub',
   '10000000-0000-4000-8000-000000000099',
@@ -1074,7 +1230,18 @@ select is(
   0,
   'another identity cannot read browser handoff state'
 );
+select is(
+  (select count(*)::integer from public.financial_settings),
+  0,
+  'another identity cannot read financial controls'
+);
 reset role;
+select throws_ok(
+  $$delete from app_private.payment_alias_handles
+    where payment_alias_id='10000000-0000-4000-8000-000000000062'$$,
+  '55000', 'active payment alias handle cannot be removed',
+  'an active alias cannot be orphaned from its private handle'
+);
 
 set local role service_role;
 select throws_ok(

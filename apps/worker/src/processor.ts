@@ -23,6 +23,8 @@ import type { LanguageModel } from "ai";
 import { z } from "zod";
 import {
   actionEvidenceSchema,
+  financialAdjustmentActionInputSchema,
+  financialPurchaseActionInputSchema,
   payloadHash,
   normalizeJsonValue,
   stableJson,
@@ -400,29 +402,47 @@ export class JobProcessor {
       });
       await this.#store.renewRunLease(job.runId, context.claimToken);
       await this.#hitFailpoint("before_provider_invocation");
-      await this.#store.markActionInvocationStarted({
-        actionId: action.id,
-        workspaceId: action.workspaceId,
-        runId: action.runId,
-        stepId: claimed.stepId,
-        attempt: claimed.attempt,
-        claimToken: context.claimToken,
-      });
-      const outputPromise = this.#executeApprovedAction({
-        action,
-        workspaceId: context.workspaceId,
-        google,
-        googleState,
-      });
+      const financialAction = action.toolName.startsWith("finance.sandbox.");
+      if (!financialAction)
+        await this.#store.markActionInvocationStarted({
+          actionId: action.id,
+          workspaceId: action.workspaceId,
+          runId: action.runId,
+          stepId: claimed.stepId,
+          attempt: claimed.attempt,
+          claimToken: context.claimToken,
+        });
+      const outputPromise = financialAction
+        ? this.#store
+            .commitSandboxFinancialActionAtInvocation({
+              action,
+              stepId: claimed.stepId,
+              attempt: claimed.attempt,
+              claimToken: context.claimToken,
+            })
+            .then((committed) =>
+              verifiedExecution(
+                committed,
+                action.toolName === "finance.sandbox.purchase"
+                  ? "openinstinct.finance.sandbox.readback"
+                  : "openinstinct.finance.sandbox.adjustment-readback",
+                committed.providerTransactionId,
+                payloadHash(committed),
+              ),
+            )
+        : this.#executeApprovedAction({
+            action,
+            workspaceId: context.workspaceId,
+            google,
+            googleState,
+          });
       void outputPromise.catch(() => undefined);
       await this.#hitFailpoint("after_provider_invocation_before_response");
       const rawOutput = await outputPromise;
-      const verifiedExecution = verifiedExecutionSchema.safeParse(rawOutput);
+      const parsedExecution = verifiedExecutionSchema.safeParse(rawOutput);
       const output = normalizeToolOutput(
         action.toolName,
-        verifiedExecution.success
-          ? verifiedExecution.data.committed
-          : rawOutput,
+        parsedExecution.success ? parsedExecution.data.committed : rawOutput,
       );
       await this.#store.markActionResultReceived({
         actionId: action.id,
@@ -449,7 +469,7 @@ export class JobProcessor {
         startedAt: claimed.startedAt,
         completedAt,
       });
-      const evidence = verifiedExecution.success
+      const evidence = parsedExecution.success
         ? actionEvidenceSchema.parse({
             id: randomUUID(),
             workspaceId: action.workspaceId,
@@ -458,14 +478,14 @@ export class JobProcessor {
             workflowStepId: claimed.stepId,
             toolResultId: toolResult.id,
             phase: "postcondition",
-            outcome: verifiedExecution.data.evidence.outcome,
-            verifier: verifiedExecution.data.evidence.verifier,
-            verifierVersion: verifiedExecution.data.evidence.verifierVersion,
+            outcome: parsedExecution.data.evidence.outcome,
+            verifier: parsedExecution.data.evidence.verifier,
+            verifierVersion: parsedExecution.data.evidence.verifierVersion,
             safeSummary: "Approved postconditions were verified by read-back.",
             facts: {
               providerResourceId:
-                verifiedExecution.data.evidence.providerResourceId,
-              observedHash: verifiedExecution.data.evidence.observedHash,
+                parsedExecution.data.evidence.providerResourceId,
+              observedHash: parsedExecution.data.evidence.observedHash,
             },
             capturedAt: completedAt,
           })
@@ -608,9 +628,40 @@ export class JobProcessor {
       throw new Error(
         "Legacy action lacks semantic authorization and must be proposed again.",
       );
+    if (input.action.toolName === "finance.sandbox.purchase") {
+      financialPurchaseActionInputSchema.parse(value);
+      if (
+        intent.effect !== "purchase" ||
+        intent.provider !== "openinstinct_sandbox" ||
+        intent.credentialUse !== "payment" ||
+        !intent.exactOrigin
+      )
+        throw new Error("Sandbox purchase semantic guards are invalid.");
+      await this.#store.assertFinancialCommitReady(input.action);
+      return;
+    }
+    if (
+      input.action.toolName === "finance.sandbox.refund" ||
+      input.action.toolName === "finance.sandbox.cancel"
+    ) {
+      const adjustment = financialAdjustmentActionInputSchema.parse(value);
+      if (
+        intent.effect !== "cancel" ||
+        intent.provider !== "openinstinct_sandbox" ||
+        intent.credentialUse !== "none" ||
+        !intent.exactOrigin ||
+        intent.resource.id !== adjustment.transactionId ||
+        intent.amount?.currency !== adjustment.amount.currency ||
+        intent.amount.minorUnits !== adjustment.amount.minorUnits
+      )
+        throw new Error("Financial adjustment semantic guards are invalid.");
+      return;
+    }
     {
       if (["purchase", "security_change"].includes(intent.effect))
-        throw new Error("Financial and security commits are disabled.");
+        throw new Error(
+          "Unreviewed financial and security commits are disabled.",
+        );
       if (["password", "otp", "payment"].includes(intent.credentialUse))
         throw new Error("This credential-use class cannot be automated.");
       if (input.action.toolName.startsWith("google.")) {
@@ -970,6 +1021,35 @@ export class JobProcessor {
     certainty: "reconciled_succeeded" | "reconciled_failed";
     evidence: Record<string, unknown>;
   }> {
+    if (
+      action.toolName === "finance.sandbox.purchase" ||
+      action.toolName === "finance.sandbox.refund" ||
+      action.toolName === "finance.sandbox.cancel"
+    ) {
+      const observed = await this.#store.observeSandboxPurchase({
+        actionId: action.id,
+        workspaceId,
+      });
+      if (!observed)
+        throw new Error(
+          "Sandbox order absence is not proof that an ambiguous commit failed.",
+        );
+      if (observed.status === "unknown")
+        throw new Error("Sandbox order outcome remains unknown.");
+      return {
+        certainty: ["committed", "refunded", "cancelled"].includes(
+          observed.status,
+        )
+          ? "reconciled_succeeded"
+          : "reconciled_failed",
+        evidence: {
+          providerResourceId:
+            observed.providerTransactionId ?? observed.transactionId,
+          observedHash: observed.observedHash,
+          status: observed.status,
+        },
+      };
+    }
     if (action.toolName.startsWith("google.")) {
       const googleState = await this.#google(workspaceId);
       const guards = action.guardConditions;

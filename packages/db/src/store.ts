@@ -16,6 +16,12 @@ import {
   browserReadObservationSchema,
   canonicalBrowserReadUrl,
   decideSemanticAction,
+  financialConfigurationVersion,
+  financialAdjustmentActionInputSchema,
+  financialPreflightHash,
+  financialPurchaseActionInputSchema,
+  financialPurchaseSelectionSchema,
+  financialTotalAmount,
   normalizeJsonValue,
   payloadHash,
   structuredToolResultSchema,
@@ -25,6 +31,8 @@ import {
   type AuthorityGrantUsage,
   type BrowserReadDecision,
   type BrowserReadObservation,
+  type FinancialPreflight,
+  type FinancialPurchaseSelection,
   type RunEventType,
   type StructuredToolResult,
 } from "@openinstinct/core";
@@ -100,6 +108,89 @@ interface AuthorityGrantRow {
   always_require_fresh_approval: boolean;
   always_require_human_takeover: boolean;
   configuration_version: string;
+}
+
+interface FinancialCommitRow {
+  preflight_id: string;
+  action_request_id: string;
+  merchant_id: string;
+  merchant_key: string;
+  exact_origin: string;
+  payment_alias_id: string;
+  item_id: string;
+  item_description: string;
+  quantity: number;
+  unit_minor_units: string;
+  total_minor_units: string;
+  currency: string;
+  recurring_terms: unknown | null;
+  preflight_hash: string;
+  quote_expires_at: Date;
+  consumed_at: Date | null;
+  settings_enabled: boolean;
+  settings_currency: string;
+  per_transaction_limit: string;
+  daily_limit: string;
+  monthly_limit: string;
+  settings_version: string;
+  merchant_enabled: boolean;
+  merchant_limit: string;
+  merchant_version: string;
+  alias_status: string;
+  alias_version: string;
+  typed_confirmation: boolean;
+  daily_spend: string;
+  monthly_spend: string;
+}
+
+function assertFinancialCommitSnapshot(
+  action: ActionRequest,
+  row: FinancialCommitRow | undefined,
+): asserts row is FinancialCommitRow {
+  if (!row) throw new Error("Financial preflight is unavailable.");
+  const { preflight } = financialPurchaseActionInputSchema.parse(action.input);
+  const intent = action.semanticIntent;
+  if (
+    action.toolName !== "finance.sandbox.purchase" ||
+    action.risk !== "financial" ||
+    intent?.effect !== "purchase" ||
+    intent.provider !== "openinstinct_sandbox" ||
+    intent.credentialUse !== "payment" ||
+    intent.exactOrigin !== row.exact_origin ||
+    intent.counterparty?.id !== row.merchant_key ||
+    intent.amount?.currency !== row.currency ||
+    intent.amount?.minorUnits !== row.total_minor_units
+  )
+    throw new Error(
+      "Financial semantic authorization does not match the preflight.",
+    );
+  if (
+    !row.typed_confirmation ||
+    !row.settings_enabled ||
+    !row.merchant_enabled ||
+    row.alias_status !== "active" ||
+    row.consumed_at ||
+    row.quote_expires_at.getTime() <= Date.now() ||
+    row.settings_currency !== row.currency ||
+    preflight.id !== row.preflight_id ||
+    preflight.preflightHash !== row.preflight_hash ||
+    preflight.merchantId !== row.merchant_key ||
+    preflight.paymentAliasId !== row.payment_alias_id ||
+    preflight.totalAmount.minorUnits !== row.total_minor_units ||
+    preflight.totalAmount.currency !== row.currency ||
+    preflight.settingsConfigurationVersion !== row.settings_version ||
+    preflight.merchantConfigurationVersion !== row.merchant_version ||
+    preflight.paymentAliasConfigurationVersion !== row.alias_version
+  )
+    throw new Error("Financial configuration changed after approval.");
+  const total = BigInt(row.total_minor_units);
+  if (
+    total > BigInt(row.per_transaction_limit) ||
+    total > BigInt(row.merchant_limit) ||
+    BigInt(row.daily_spend) + total > BigInt(row.daily_limit) ||
+    BigInt(row.monthly_spend) + total > BigInt(row.monthly_limit)
+  )
+    throw new Error("Financial spend limit would be exceeded.");
 }
 
 function parseAuthorityGrantRow(row: AuthorityGrantRow): AuthorityGrant {
@@ -236,6 +327,376 @@ export class OpenInstinctStore {
 
   async close(): Promise<void> {
     await this.#sql.end();
+  }
+
+  async ensureFinancialPilot(workspaceId: string): Promise<void> {
+    const settingsVersion = financialConfigurationVersion({
+      enabled: false,
+      currency: "USD",
+      perTransactionLimit: "0",
+      dailyLimit: "0",
+      monthlyLimit: "0",
+    });
+    const merchantVersion = financialConfigurationVersion({
+      provider: "openinstinct_sandbox",
+      merchantKey: "sandbox-store",
+      exactOrigin: "https://sandbox.openinstinct.local",
+      enabled: false,
+      perTransactionLimit: "0",
+    });
+    const aliasVersion = financialConfigurationVersion({
+      provider: "openinstinct_sandbox",
+      label: "Sandbox wallet",
+      lastFour: null,
+      status: "disabled",
+    });
+    await this.#sql.begin(async (tx) => {
+      await tx`
+        insert into public.financial_settings (
+          workspace_id, configuration_version
+        ) values (${workspaceId}, ${settingsVersion})
+        on conflict (workspace_id) do nothing
+      `;
+      await tx`
+        insert into public.financial_merchants (
+          workspace_id, merchant_key, display_name, exact_origin,
+          configuration_version
+        ) values (
+          ${workspaceId}, 'sandbox-store', 'OpenInstinct Sandbox Store',
+          'https://sandbox.openinstinct.local', ${merchantVersion}
+        ) on conflict (workspace_id, merchant_key) do nothing
+      `;
+      await tx`
+        insert into public.payment_aliases (
+          workspace_id, label, configuration_version
+        ) select ${workspaceId}, 'Sandbox wallet', ${aliasVersion}
+        where not exists (
+          select 1 from public.payment_aliases where workspace_id = ${workspaceId}
+        )
+      `;
+      await tx`
+        insert into app_private.payment_alias_handles (
+          payment_alias_id, workspace_id, opaque_handle
+        )
+        select id, workspace_id, 'sandbox_alias_' || id::text
+        from public.payment_aliases
+        where workspace_id = ${workspaceId}
+        on conflict (payment_alias_id) do nothing
+      `;
+    });
+  }
+
+  async listFinancialPilot(workspaceId: string): Promise<{
+    settings?: {
+      enabled: boolean;
+      currency: string;
+      perTransactionLimit: string;
+      dailyLimit: string;
+      monthlyLimit: string;
+    };
+    merchants: readonly {
+      id: string;
+      merchantKey: string;
+      displayName: string;
+      exactOrigin: string;
+      enabled: boolean;
+      perTransactionLimit: string;
+    }[];
+    paymentAliases: readonly {
+      id: string;
+      label: string;
+      lastFour: string | null;
+      status: string;
+    }[];
+  }> {
+    await this.ensureFinancialPilot(workspaceId);
+    const [settings, merchants, paymentAliases] = await Promise.all([
+      this.#sql<
+        {
+          enabled: boolean;
+          currency: string;
+          per_transaction_limit: string;
+          daily_limit: string;
+          monthly_limit: string;
+        }[]
+      >`
+        select enabled, currency, per_transaction_limit, daily_limit, monthly_limit
+        from public.financial_settings where workspace_id = ${workspaceId}
+      `,
+      this.#sql<
+        {
+          id: string;
+          merchant_key: string;
+          display_name: string;
+          exact_origin: string;
+          enabled: boolean;
+          per_transaction_limit: string;
+        }[]
+      >`
+        select id, merchant_key, display_name, exact_origin, enabled,
+          per_transaction_limit
+        from public.financial_merchants where workspace_id = ${workspaceId}
+        order by merchant_key
+      `,
+      this.#sql<
+        {
+          id: string;
+          label: string;
+          last_four: string | null;
+          status: string;
+        }[]
+      >`
+        select id, label, last_four, status from public.payment_aliases
+        where workspace_id = ${workspaceId} order by created_at
+      `,
+    ]);
+    const setting = settings[0];
+    return {
+      settings: setting
+        ? {
+            enabled: setting.enabled,
+            currency: setting.currency,
+            perTransactionLimit: setting.per_transaction_limit,
+            dailyLimit: setting.daily_limit,
+            monthlyLimit: setting.monthly_limit,
+          }
+        : undefined,
+      merchants: merchants.map((row) => ({
+        id: row.id,
+        merchantKey: row.merchant_key,
+        displayName: row.display_name,
+        exactOrigin: row.exact_origin,
+        enabled: row.enabled,
+        perTransactionLimit: row.per_transaction_limit,
+      })),
+      paymentAliases: paymentAliases.map((row) => ({
+        id: row.id,
+        label: row.label,
+        lastFour: row.last_four,
+        status: row.status,
+      })),
+    };
+  }
+
+  async updateFinancialSettings(input: {
+    workspaceId: string;
+    enabled: boolean;
+    currency: string;
+    perTransactionLimit: string;
+    dailyLimit: string;
+    monthlyLimit: string;
+  }): Promise<void> {
+    const value = z
+      .object({
+        workspaceId: z.string().uuid(),
+        enabled: z.boolean(),
+        currency: z.string().regex(/^[A-Z]{3}$/u),
+        perTransactionLimit: z.string().regex(/^(0|[1-9][0-9]{0,17})$/u),
+        dailyLimit: z.string().regex(/^(0|[1-9][0-9]{0,17})$/u),
+        monthlyLimit: z.string().regex(/^(0|[1-9][0-9]{0,17})$/u),
+      })
+      .parse(input);
+    if (
+      BigInt(value.perTransactionLimit) > BigInt(value.dailyLimit) ||
+      BigInt(value.dailyLimit) > BigInt(value.monthlyLimit)
+    )
+      throw new Error("Financial limits must be monotonically increasing.");
+    const configurationVersion = financialConfigurationVersion({
+      enabled: value.enabled,
+      currency: value.currency,
+      perTransactionLimit: value.perTransactionLimit,
+      dailyLimit: value.dailyLimit,
+      monthlyLimit: value.monthlyLimit,
+    });
+    await this.#sql`
+      update public.financial_settings set enabled = ${value.enabled},
+        currency = ${value.currency},
+        per_transaction_limit = ${value.perTransactionLimit},
+        daily_limit = ${value.dailyLimit},
+        monthly_limit = ${value.monthlyLimit},
+        configuration_version = ${configurationVersion}
+      where workspace_id = ${value.workspaceId}
+    `;
+  }
+
+  async updateFinancialMerchant(input: {
+    workspaceId: string;
+    merchantId: string;
+    enabled: boolean;
+    perTransactionLimit: string;
+  }): Promise<void> {
+    const value = z
+      .object({
+        workspaceId: z.string().uuid(),
+        merchantId: z.string().uuid(),
+        enabled: z.boolean(),
+        perTransactionLimit: z.string().regex(/^(0|[1-9][0-9]{0,17})$/u),
+      })
+      .parse(input);
+    const [merchant] = await this.#sql<
+      {
+        provider: string;
+        merchant_key: string;
+        exact_origin: string;
+      }[]
+    >`
+      select provider, merchant_key, exact_origin from public.financial_merchants
+      where id = ${value.merchantId} and workspace_id = ${value.workspaceId}
+    `;
+    if (!merchant) throw new Error("Financial merchant is unavailable.");
+    const configurationVersion = financialConfigurationVersion({
+      provider: merchant.provider,
+      merchantKey: merchant.merchant_key,
+      exactOrigin: merchant.exact_origin,
+      enabled: value.enabled,
+      perTransactionLimit: value.perTransactionLimit,
+    });
+    await this.#sql`
+      update public.financial_merchants set enabled = ${value.enabled},
+        per_transaction_limit = ${value.perTransactionLimit},
+        configuration_version = ${configurationVersion}
+      where id = ${value.merchantId} and workspace_id = ${value.workspaceId}
+    `;
+  }
+
+  async updatePaymentAliasStatus(input: {
+    workspaceId: string;
+    paymentAliasId: string;
+    status: "active" | "disabled" | "revoked";
+  }): Promise<void> {
+    const [paymentAlias] = await this.#sql<
+      {
+        provider: string;
+        label: string;
+        last_four: string | null;
+        status: string;
+      }[]
+    >`
+      select provider, label, last_four, status from public.payment_aliases
+      where id = ${input.paymentAliasId} and workspace_id = ${input.workspaceId}
+    `;
+    if (!paymentAlias) throw new Error("Payment alias is unavailable.");
+    if (paymentAlias.status === "revoked" && input.status !== "revoked")
+      throw new Error("Payment alias revocation is irreversible.");
+    const configurationVersion = financialConfigurationVersion({
+      provider: paymentAlias.provider,
+      label: paymentAlias.label,
+      lastFour: paymentAlias.last_four,
+      status: input.status,
+    });
+    await this.#sql`
+      update public.payment_aliases set status = ${input.status},
+        configuration_version = ${configurationVersion}
+      where id = ${input.paymentAliasId} and workspace_id = ${input.workspaceId}
+    `;
+  }
+
+  async createFinancialPreflight(input: {
+    workspaceId: string;
+    selection: FinancialPurchaseSelection;
+  }): Promise<FinancialPreflight> {
+    const selection = financialPurchaseSelectionSchema.parse(input.selection);
+    const id = randomUUID();
+    return this.#sql.begin(async (tx) => {
+      const [settings] = await tx<
+        {
+          enabled: boolean;
+          currency: string;
+          per_transaction_limit: string;
+          configuration_version: string;
+        }[]
+      >`
+        select enabled, currency, per_transaction_limit, configuration_version
+        from public.financial_settings where workspace_id = ${input.workspaceId}
+        for share
+      `;
+      const [merchant] = await tx<
+        {
+          id: string;
+          merchant_key: string;
+          exact_origin: string;
+          enabled: boolean;
+          per_transaction_limit: string;
+          configuration_version: string;
+        }[]
+      >`
+        select id, merchant_key, exact_origin, enabled, per_transaction_limit,
+          configuration_version
+        from public.financial_merchants
+        where workspace_id = ${input.workspaceId}
+          and merchant_key = ${selection.merchantId}
+        for share
+      `;
+      const [paymentAlias] = await tx<
+        {
+          id: string;
+          status: string;
+          configuration_version: string;
+        }[]
+      >`
+        select id, status, configuration_version from public.payment_aliases
+        where workspace_id = ${input.workspaceId}
+          and id = ${selection.paymentAliasId}
+        for share
+      `;
+      if (!settings?.enabled)
+        throw new Error("Financial actions are globally disabled.");
+      if (!merchant?.enabled) throw new Error("Merchant is not enabled.");
+      if (paymentAlias?.status !== "active")
+        throw new Error("Payment alias is not active.");
+      const totalAmount = financialTotalAmount(selection);
+      if (totalAmount.currency !== settings.currency)
+        throw new Error("Purchase currency is not configured.");
+      const total = BigInt(totalAmount.minorUnits);
+      if (
+        total > BigInt(settings.per_transaction_limit) ||
+        total > BigInt(merchant.per_transaction_limit)
+      )
+        throw new Error("Purchase exceeds a configured transaction limit.");
+      const quoteExpiresAt = new Date(Date.now() + 10 * 60_000).toISOString();
+      const base = {
+        id,
+        workspaceId: input.workspaceId,
+        provider: "openinstinct_sandbox" as const,
+        ...selection,
+        totalAmount,
+        quoteExpiresAt,
+        merchantConfigurationVersion: merchant.configuration_version,
+        paymentAliasConfigurationVersion: paymentAlias.configuration_version,
+        settingsConfigurationVersion: settings.configuration_version,
+        fingerprint: payloadHash({
+          id,
+          workspaceId: input.workspaceId,
+          selection,
+        }),
+      };
+      const preflight = {
+        ...base,
+        preflightHash: financialPreflightHash(base),
+      } satisfies FinancialPreflight;
+      await tx`
+        insert into app_private.financial_preflights (
+          id, workspace_id, provider, merchant_id, merchant_key, item_id,
+          item_description, quantity, unit_minor_units, total_minor_units,
+          currency, recurring_terms, payment_alias_id,
+          merchant_configuration_version, payment_alias_configuration_version,
+          settings_configuration_version, fingerprint, preflight_hash,
+          quote_expires_at
+        ) values (
+          ${preflight.id}, ${preflight.workspaceId}, ${preflight.provider},
+          ${merchant.id}, ${preflight.merchantId}, ${preflight.itemId},
+          ${preflight.itemDescription}, ${preflight.quantity},
+          ${preflight.unitAmount.minorUnits}, ${preflight.totalAmount.minorUnits},
+          ${preflight.totalAmount.currency},
+          ${preflight.recurringTerms ? tx.json(toJson(preflight.recurringTerms)) : null},
+          ${preflight.paymentAliasId}, ${preflight.merchantConfigurationVersion},
+          ${preflight.paymentAliasConfigurationVersion},
+          ${preflight.settingsConfigurationVersion}, ${preflight.fingerprint},
+          ${preflight.preflightHash}, ${new Date(preflight.quoteExpiresAt)}
+        )
+      `;
+      return preflight;
+    });
   }
 
   async health(): Promise<boolean> {
@@ -1250,6 +1711,522 @@ export class OpenInstinctStore {
       throw new Error("Authority grant changed before the commit point.");
   }
 
+  async assertFinancialCommitReady(actionInput: ActionRequest): Promise<void> {
+    const action = actionRequestSchema.parse(actionInput);
+    const [row] = await this.#sql<FinancialCommitRow[]>`
+      select p.id as preflight_id, p.action_request_id, p.merchant_id,
+        p.merchant_key, m.exact_origin, p.payment_alias_id, p.item_id,
+        p.item_description, p.quantity, p.unit_minor_units,
+        p.total_minor_units, p.currency, p.recurring_terms, p.preflight_hash,
+        p.quote_expires_at, p.consumed_at,
+        s.enabled as settings_enabled, s.currency as settings_currency,
+        s.per_transaction_limit, s.daily_limit, s.monthly_limit,
+        s.configuration_version as settings_version,
+        m.enabled as merchant_enabled, m.per_transaction_limit as merchant_limit,
+        m.configuration_version as merchant_version,
+        pa.status as alias_status, pa.configuration_version as alias_version,
+        coalesce(ap.typed_confirmation, false) as typed_confirmation,
+        coalesce((select sum(l.amount_minor_units)::text
+          from public.spend_ledger l
+          where l.workspace_id = p.workspace_id and l.entry_type = 'debit'
+            and l.occurred_at >= date_trunc('day', now())), '0') as daily_spend,
+        coalesce((select sum(l.amount_minor_units)::text
+          from public.spend_ledger l
+          where l.workspace_id = p.workspace_id and l.entry_type = 'debit'
+            and l.occurred_at >= date_trunc('month', now())), '0') as monthly_spend
+      from app_private.financial_preflights p
+      join public.financial_settings s on s.workspace_id = p.workspace_id
+      join public.financial_merchants m on m.id = p.merchant_id
+        and m.workspace_id = p.workspace_id
+      join public.payment_aliases pa on pa.id = p.payment_alias_id
+        and pa.workspace_id = p.workspace_id
+      left join public.approvals ap on ap.action_request_id = p.action_request_id
+        and ap.workspace_id = p.workspace_id and ap.approved
+      where p.action_request_id = ${action.id}
+        and p.workspace_id = ${action.workspaceId}
+        and p.quote_expires_at > now()
+    `;
+    assertFinancialCommitSnapshot(action, row);
+  }
+
+  async #commitSandboxPurchaseTransaction(
+    tx: postgres.TransactionSql,
+    action: ActionRequest,
+  ): Promise<{
+    transactionId: string;
+    providerTransactionId: string;
+    receiptNumber: string;
+    amount: { currency: string; minorUnits: string };
+    status: "committed";
+  }> {
+    const [existing] = await tx<
+      {
+        id: string;
+        provider_transaction_id: string;
+        amount_minor_units: string;
+        currency: string;
+      }[]
+    >`
+        select id, provider_transaction_id, amount_minor_units, currency
+        from public.financial_transactions
+        where action_request_id = ${action.id}
+          and workspace_id = ${action.workspaceId}
+      `;
+    if (existing) {
+      const [receipt] = await tx<{ receipt_number: string }[]>`
+          select receipt_number from public.financial_receipts
+          where transaction_id = ${existing.id}
+        `;
+      if (!receipt) throw new Error("Committed purchase receipt is missing.");
+      return {
+        transactionId: existing.id,
+        providerTransactionId: existing.provider_transaction_id,
+        receiptNumber: receipt.receipt_number,
+        amount: {
+          currency: existing.currency,
+          minorUnits: existing.amount_minor_units,
+        },
+        status: "committed" as const,
+      };
+    }
+    const budgetLock = await tx`
+        select workspace_id from public.financial_settings
+        where workspace_id = ${action.workspaceId}
+        for update
+      `;
+    if (budgetLock.length !== 1)
+      throw new Error("Financial settings are unavailable.");
+    const [row] = await tx<FinancialCommitRow[]>`
+        select p.id as preflight_id, p.action_request_id, p.merchant_id,
+          p.merchant_key, m.exact_origin, p.payment_alias_id, p.item_id,
+          p.item_description, p.quantity, p.unit_minor_units,
+          p.total_minor_units, p.currency, p.recurring_terms, p.preflight_hash,
+          p.quote_expires_at, p.consumed_at,
+          s.enabled as settings_enabled, s.currency as settings_currency,
+          s.per_transaction_limit, s.daily_limit, s.monthly_limit,
+          s.configuration_version as settings_version,
+          m.enabled as merchant_enabled, m.per_transaction_limit as merchant_limit,
+          m.configuration_version as merchant_version,
+          pa.status as alias_status, pa.configuration_version as alias_version,
+          coalesce(ap.typed_confirmation, false) as typed_confirmation,
+          coalesce((select sum(l.amount_minor_units)::text
+            from public.spend_ledger l
+            where l.workspace_id = p.workspace_id and l.entry_type = 'debit'
+              and l.occurred_at >= date_trunc('day', now())), '0') as daily_spend,
+          coalesce((select sum(l.amount_minor_units)::text
+            from public.spend_ledger l
+            where l.workspace_id = p.workspace_id and l.entry_type = 'debit'
+              and l.occurred_at >= date_trunc('month', now())), '0') as monthly_spend
+        from app_private.financial_preflights p
+        join public.financial_settings s on s.workspace_id = p.workspace_id
+        join public.financial_merchants m on m.id = p.merchant_id
+          and m.workspace_id = p.workspace_id
+        join public.payment_aliases pa on pa.id = p.payment_alias_id
+          and pa.workspace_id = p.workspace_id
+        left join public.approvals ap on ap.action_request_id = p.action_request_id
+          and ap.workspace_id = p.workspace_id and ap.approved
+        where p.action_request_id = ${action.id}
+          and p.workspace_id = ${action.workspaceId}
+          and p.quote_expires_at > now()
+        for update of p, s, m, pa
+      `;
+    assertFinancialCommitSnapshot(action, row);
+    const transactionId = randomUUID();
+    const providerTransactionId = `sandbox_${action.id.replaceAll("-", "")}`;
+    const receiptNumber = `OI-${action.id}`;
+    const safeSummary = {
+      provider: "openinstinct_sandbox",
+      merchantId: row.merchant_key,
+      itemId: row.item_id,
+      itemDescription: row.item_description,
+      quantity: row.quantity,
+      amount: { currency: row.currency, minorUnits: row.total_minor_units },
+      recurringTerms: row.recurring_terms,
+    };
+    await tx`
+        insert into public.financial_transactions (
+          id, workspace_id, action_request_id, preflight_id, merchant_id,
+          payment_alias_id, amount_minor_units, currency, recurring_terms,
+          idempotency_key, status, provider_transaction_id, committed_at
+        ) values (
+          ${transactionId}, ${action.workspaceId}, ${action.id},
+          ${row.preflight_id}, ${row.merchant_id}, ${row.payment_alias_id},
+          ${row.total_minor_units}, ${row.currency},
+          ${row.recurring_terms ? tx.json(toJson(row.recurring_terms)) : null},
+          ${action.id}, 'committed', ${providerTransactionId}, now()
+        )
+      `;
+    await tx`
+        insert into public.spend_ledger (
+          workspace_id, transaction_id, entry_type, amount_minor_units, currency
+        ) values (
+          ${action.workspaceId}, ${transactionId}, 'debit',
+          ${row.total_minor_units}, ${row.currency}
+        )
+      `;
+    await tx`
+        insert into public.financial_receipts (
+          workspace_id, transaction_id, receipt_number, safe_summary,
+          evidence_hash
+        ) values (
+          ${action.workspaceId}, ${transactionId}, ${receiptNumber},
+          ${tx.json(toJson(safeSummary))}, ${payloadHash(safeSummary)}
+        )
+      `;
+    await tx`
+        update app_private.financial_preflights set consumed_at = now()
+        where id = ${row.preflight_id} and consumed_at is null
+      `;
+    return {
+      transactionId,
+      providerTransactionId,
+      receiptNumber,
+      amount: { currency: row.currency, minorUnits: row.total_minor_units },
+      status: "committed" as const,
+    };
+  }
+
+  async #commitSandboxFinancialAdjustmentTransaction(
+    tx: postgres.TransactionSql,
+    action: ActionRequest,
+  ): Promise<{
+    transactionId: string;
+    providerTransactionId: string;
+    receiptNumber: string;
+    amount: { currency: string; minorUnits: string };
+    status: "refunded" | "cancelled";
+  }> {
+    const adjustment = financialAdjustmentActionInputSchema.parse(action.input);
+    const expectedTool =
+      adjustment.operation === "refund"
+        ? "finance.sandbox.refund"
+        : "finance.sandbox.cancel";
+    if (action.toolName !== expectedTool || action.risk !== "financial")
+      throw new Error("Financial adjustment action is invalid.");
+    const [existing] = await tx<
+      {
+        id: string;
+        provider_transaction_id: string;
+        amount_minor_units: string;
+        currency: string;
+        status: "refunded" | "cancelled";
+      }[]
+    >`
+        select id, provider_transaction_id, amount_minor_units, currency, status
+        from public.financial_transactions
+        where action_request_id = ${action.id}
+          and workspace_id = ${action.workspaceId}
+      `;
+    if (existing) {
+      const [receipt] = await tx<{ receipt_number: string }[]>`
+          select receipt_number from public.financial_receipts
+          where transaction_id = ${existing.id}
+        `;
+      if (!receipt) throw new Error("Financial adjustment receipt is missing.");
+      return {
+        transactionId: existing.id,
+        providerTransactionId: existing.provider_transaction_id,
+        receiptNumber: receipt.receipt_number,
+        amount: {
+          currency: existing.currency,
+          minorUnits: existing.amount_minor_units,
+        },
+        status: existing.status,
+      };
+    }
+    const budgetLock = await tx`
+        select workspace_id from public.financial_settings
+        where workspace_id = ${action.workspaceId}
+        for update
+      `;
+    if (budgetLock.length !== 1)
+      throw new Error("Financial settings are unavailable.");
+    const [parent] = await tx<
+      {
+        id: string;
+        merchant_id: string;
+        merchant_key: string;
+        exact_origin: string;
+        payment_alias_id: string;
+        amount_minor_units: string;
+        currency: string;
+        status: string;
+        typed_confirmation: boolean;
+      }[]
+    >`
+        select t.id, t.merchant_id, m.merchant_key, m.exact_origin,
+          t.payment_alias_id, t.amount_minor_units, t.currency, t.status,
+          coalesce(ap.typed_confirmation, false) as typed_confirmation
+        from public.financial_transactions t
+        join public.financial_merchants m on m.id = t.merchant_id
+          and m.workspace_id = t.workspace_id
+        left join public.approvals ap on ap.action_request_id = ${action.id}
+          and ap.workspace_id = t.workspace_id and ap.approved
+        where t.id = ${adjustment.transactionId}
+          and t.workspace_id = ${action.workspaceId} and t.kind = 'purchase'
+        for update of t
+      `;
+    const intent = action.semanticIntent;
+    if (
+      !parent ||
+      parent.status !== "committed" ||
+      !parent.typed_confirmation ||
+      intent?.effect !== "cancel" ||
+      intent.provider !== "openinstinct_sandbox" ||
+      intent.exactOrigin !== parent.exact_origin ||
+      intent.counterparty?.id !== parent.merchant_key ||
+      intent.amount?.currency !== adjustment.amount.currency ||
+      intent.amount.minorUnits !== adjustment.amount.minorUnits ||
+      intent.credentialUse !== "none" ||
+      adjustment.amount.currency !== parent.currency ||
+      adjustment.amount.minorUnits !== parent.amount_minor_units
+    )
+      throw new Error("Financial adjustment no longer matches its approval.");
+    const transactionId = randomUUID();
+    const status = adjustment.operation === "refund" ? "refunded" : "cancelled";
+    const providerTransactionId = `sandbox_${status}_${action.id.replaceAll("-", "")}`;
+    const receiptNumber = `OI-${status.toUpperCase()}-${action.id}`;
+    const safeSummary = {
+      provider: "openinstinct_sandbox",
+      operation: adjustment.operation,
+      parentTransactionId: parent.id,
+      amount: adjustment.amount,
+      reason: adjustment.reason,
+    };
+    await tx`
+        insert into public.financial_transactions (
+          id, workspace_id, action_request_id, preflight_id, merchant_id,
+          payment_alias_id, kind, parent_transaction_id, amount_minor_units,
+          currency, idempotency_key, status, provider_transaction_id,
+          committed_at
+        ) values (
+          ${transactionId}, ${action.workspaceId}, ${action.id}, null,
+          ${parent.merchant_id}, ${parent.payment_alias_id},
+          ${adjustment.operation}, ${parent.id}, ${adjustment.amount.minorUnits},
+          ${adjustment.amount.currency}, ${action.id}, ${status},
+          ${providerTransactionId}, now()
+        )
+      `;
+    await tx`
+        insert into public.spend_ledger (
+          workspace_id, transaction_id, entry_type, amount_minor_units, currency
+        ) values (
+          ${action.workspaceId}, ${transactionId}, 'credit',
+          ${adjustment.amount.minorUnits}, ${adjustment.amount.currency}
+        )
+      `;
+    await tx`
+        insert into public.financial_receipts (
+          workspace_id, transaction_id, receipt_number, safe_summary,
+          evidence_hash
+        ) values (
+          ${action.workspaceId}, ${transactionId}, ${receiptNumber},
+          ${tx.json(toJson(safeSummary))}, ${payloadHash(safeSummary)}
+        )
+      `;
+    await tx`
+        update public.financial_transactions set status = ${status}
+        where id = ${parent.id} and workspace_id = ${action.workspaceId}
+          and status = 'committed'
+      `;
+    return {
+      transactionId,
+      providerTransactionId,
+      receiptNumber,
+      amount: adjustment.amount,
+      status,
+    };
+  }
+
+  async commitSandboxFinancialActionAtInvocation(input: {
+    action: ActionRequest;
+    stepId: string;
+    attempt: number;
+    claimToken: string;
+  }): Promise<{
+    transactionId: string;
+    providerTransactionId: string;
+    receiptNumber: string;
+    amount: { currency: string; minorUnits: string };
+    status: "committed" | "refunded" | "cancelled";
+  }> {
+    const action = actionRequestSchema.parse(input.action);
+    if (
+      ![
+        "finance.sandbox.purchase",
+        "finance.sandbox.refund",
+        "finance.sandbox.cancel",
+      ].includes(action.toolName)
+    )
+      throw new Error("Action is not a sandbox financial commit.");
+    return this.#sql.begin(async (tx) => {
+      const lockedRun = await tx`
+        select id from public.agent_runs
+        where id = ${action.runId} and workspace_id = ${action.workspaceId}
+          and status = 'running' and claim_token = ${input.claimToken}
+          and lease_expires_at > now()
+        for update
+      `;
+      if (lockedRun.length !== 1)
+        throw new Error("Run lease changed before the financial commit point.");
+      const approvedAction = await tx`
+        select a.id
+        from public.action_requests a
+        join public.approvals p on p.action_request_id = a.id
+          and p.workspace_id = a.workspace_id
+        where a.id = ${action.id} and a.workspace_id = ${action.workspaceId}
+          and a.run_id = ${action.runId} and a.status = 'executing'
+          and a.expires_at > now() and a.authority_grant_id is null
+          and a.tool_name = ${action.toolName} and a.risk = 'financial'
+          and a.input_hash = ${action.inputHash}
+          and a.semantic_intent_hash = ${action.semanticIntentHash ?? null}
+          and a.guard_conditions_hash = ${action.guardConditionsHash ?? null}
+          and p.approved and p.typed_confirmation
+          and p.input_hash = a.input_hash
+          and p.semantic_intent_hash = a.semantic_intent_hash
+          and p.guard_conditions_hash = a.guard_conditions_hash
+          and p.authority_grant_id is null
+        for update of a, p
+      `;
+      if (approvedAction.length !== 1)
+        throw new Error("Financial approval changed before the commit point.");
+      const step = await tx`
+        update public.workflow_steps set execution_phase = 'invocation_started'
+        where id = ${input.stepId} and workspace_id = ${action.workspaceId}
+          and run_id = ${action.runId} and action_request_id = ${action.id}
+          and status = 'running' and execution_phase = 'claimed'
+          and attempt = ${input.attempt}
+        returning id
+      `;
+      if (step.length !== 1)
+        throw new Error("Financial invocation boundary changed unexpectedly.");
+      const committed =
+        action.toolName === "finance.sandbox.purchase"
+          ? await this.#commitSandboxPurchaseTransaction(tx, action)
+          : await this.#commitSandboxFinancialAdjustmentTransaction(tx, action);
+      await this.#appendRunEvent(tx, {
+        workspaceId: action.workspaceId,
+        runId: action.runId,
+        stepId: input.stepId,
+        actionRequestId: action.id,
+        eventType: "action_invocation_started",
+        eventKey: `action:${action.id}:invocation:${input.attempt}`,
+        payload: { attempt: input.attempt, atomicFinancialCommit: true },
+      });
+      await this.#writeAuditEvent(tx, {
+        workspaceId: action.workspaceId,
+        actor: "worker",
+        action: "execution.started",
+        eventKey: `action:${action.id}:invocation:${input.attempt}`,
+        targetType: "action_request",
+        targetId: action.id,
+        runId: action.runId,
+        stepId: input.stepId,
+        actionRequestId: action.id,
+        detail: { attempt: input.attempt, atomicFinancialCommit: true },
+      });
+      return committed;
+    });
+  }
+
+  async observeSandboxPurchase(input: {
+    actionId: string;
+    workspaceId: string;
+  }): Promise<
+    | {
+        transactionId: string;
+        status: string;
+        providerTransactionId: string | null;
+        observedHash: string;
+      }
+    | undefined
+  > {
+    const [row] = await this.#sql<
+      {
+        id: string;
+        status: string;
+        provider_transaction_id: string | null;
+        amount_minor_units: string;
+        currency: string;
+        merchant_id: string;
+        payment_alias_id: string;
+      }[]
+    >`
+      select id, status, provider_transaction_id, amount_minor_units, currency,
+        merchant_id, payment_alias_id
+      from public.financial_transactions
+      where workspace_id = ${input.workspaceId}
+        and action_request_id = ${input.actionId}
+    `;
+    if (!row) return undefined;
+    const facts = {
+      id: row.id,
+      status: row.status,
+      providerTransactionId: row.provider_transaction_id,
+      amount: { currency: row.currency, minorUnits: row.amount_minor_units },
+      merchantId: row.merchant_id,
+      paymentAliasId: row.payment_alias_id,
+    };
+    const observedHash = payloadHash(facts);
+    await this.#sql`
+      insert into public.financial_reconciliation_reads (
+        workspace_id, transaction_id, action_request_id, observed_status,
+        observed_hash
+      ) values (
+        ${input.workspaceId}, ${row.id}, ${input.actionId}, ${row.status},
+        ${observedHash}
+      )
+    `;
+    return {
+      transactionId: row.id,
+      status: row.status,
+      providerTransactionId: row.provider_transaction_id,
+      observedHash,
+    };
+  }
+
+  async listFinancialTransactions(workspaceId: string): Promise<
+    readonly {
+      id: string;
+      kind: string;
+      status: string;
+      merchantId: string;
+      amount: { currency: string; minorUnits: string };
+      parentTransactionId: string | null;
+      createdAt: string;
+    }[]
+  > {
+    const rows = await this.#sql<
+      {
+        id: string;
+        kind: string;
+        status: string;
+        merchant_key: string;
+        amount_minor_units: string;
+        currency: string;
+        parent_transaction_id: string | null;
+        created_at: Date;
+      }[]
+    >`
+      select t.id, t.kind, t.status, m.merchant_key, t.amount_minor_units,
+        t.currency, t.parent_transaction_id, t.created_at
+      from public.financial_transactions t
+      join public.financial_merchants m on m.id = t.merchant_id
+        and m.workspace_id = t.workspace_id
+      where t.workspace_id = ${workspaceId}
+      order by t.created_at desc limit 50
+    `;
+    return rows.map((row) => ({
+      id: row.id,
+      kind: row.kind,
+      status: row.status,
+      merchantId: row.merchant_key,
+      amount: { currency: row.currency, minorUnits: row.amount_minor_units },
+      parentTransactionId: row.parent_transaction_id,
+      createdAt: row.created_at.toISOString(),
+    }));
+  }
+
   async saveActionRequest(
     action: ActionRequest,
     claimToken?: string,
@@ -1328,6 +2305,28 @@ export class OpenInstinctStore {
           ${new Date(value.expiresAt)}
         )
       `;
+      if (value.toolName === "finance.sandbox.purchase") {
+        const { preflight } = financialPurchaseActionInputSchema.parse(
+          value.input,
+        );
+        const bound = await tx`
+          update app_private.financial_preflights
+          set action_request_id = ${value.id}
+          where id = ${preflight.id}
+            and workspace_id = ${value.workspaceId}
+            and action_request_id is null
+            and consumed_at is null
+            and quote_expires_at > now()
+            and preflight_hash = ${preflight.preflightHash}
+            and merchant_key = ${preflight.merchantId}
+            and payment_alias_id = ${preflight.paymentAliasId}
+            and total_minor_units = ${preflight.totalAmount.minorUnits}
+            and currency = ${preflight.totalAmount.currency}
+          returning id
+        `;
+        if (bound.length !== 1)
+          throw new Error("Financial preflight is stale or already bound.");
+      }
       const [step] = await tx<{ id: string; position: number }[]>`
         insert into public.workflow_steps (
           id, workspace_id, run_id, action_request_id, position, kind,

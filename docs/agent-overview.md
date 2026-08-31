@@ -48,7 +48,7 @@ flowchart LR
 2. `packages/db` deduplicates the provider event and atomically creates the message, agent run, and `process_event` queue job.
 3. `apps/worker` claims the durable job, loads bounded context, and runs the agent for a bounded number of steps.
 4. Safe reads may execute inline. A consequential operation becomes an immutable `action_request` containing a structured semantic intent, exact executable-input hash, and guard-condition hash.
-5. Deterministic policy either denies the action, requires exact owner approval, or atomically reserves a matching bounded authority grant. Destructive actions always require fresh typed confirmation; financial and security commits remain denied.
+5. Deterministic policy either denies the action, requires exact owner approval, or atomically reserves a matching bounded authority grant. Destructive actions always require fresh typed confirmation. Financial commits are limited to the explicitly enabled sandbox pilot and also require fresh typed confirmation; security commits remain denied.
 6. Approval or a valid grant queues `resume_run`. The worker reacquires the run lease, revalidates origin/account/recipient/configuration guards immediately before the invocation fence, and executes only the stored payload.
 7. A successful semantic action requires read-only postcondition evidence. An ambiguous outcome becomes `unknown`, is never replayed, and creates a durable read-only reconciliation case.
 8. The result, evidence metadata, audit trail, and continuation outbox are persisted, and a deterministic outbound message is sent through Blooio.
@@ -63,7 +63,7 @@ Preserve these in every feature:
 2. **Authenticate before parsing or acting.** Verify public webhook signatures against raw bytes, enforce body limits, and authenticate internal routes with server-only secrets.
 3. **Ingestion is idempotent.** A provider retry must not create another run. Keep event insertion and job creation atomic.
 4. **The queue is authoritative.** Never rely on an in-memory task, a long-lived HTTP request, or a provider callback alone for durable progress.
-5. **The model cannot directly perform consequential actions.** Reads can be automatic. Writes and communications require a persisted proposal and policy decision. Financial, destructive, and security actions are denied unless the policy is deliberately redesigned and reviewed.
+5. **The model cannot directly perform consequential actions.** Reads can be automatic. Writes and communications require a persisted proposal and policy decision. Financial actions are confined to the reviewed sandbox pilot with exact preflight approval; destructive and security actions fail closed unless an explicit reviewed path exists.
 6. **Approval binds exact intent.** Hash canonical input and include the exact connector account/configuration version. Execute the stored payload; never ask the model to recreate it after approval.
 7. **Revalidate at execution time.** Confirm workspace, action state, expiry, provider, connector, tool allowlist, account, and configuration version immediately before the side effect.
 8. **Ambiguous writes are not retried.** Prefer provider idempotency keys. If a timeout or crash leaves completion uncertain, record `unknown`, notify the owner, and require reconciliation instead of replaying it.
@@ -109,6 +109,8 @@ The important durable records are:
 - `audit_events`: security-relevant history
 - `browser_profiles`: references to provider-side browser state, not raw secrets
 - `credential_items` and `credential_access_events`: owner-safe vault metadata and append-only access history; ciphertext and injection leases remain in `app_private`
+- `financial_settings`, `financial_merchants`, and `payment_aliases`: owner-controlled sandbox kill switch, limits, allowlist, and safe payment metadata
+- `financial_transactions`, `spend_ledger`, and `financial_receipts`: durable sandbox order state and append-only financial evidence; exact preflights and provider handles remain in `app_private`
 
 Run states are defined in `packages/core/src/domain.ts` and enforced by `state-machine.ts`:
 
@@ -176,6 +178,12 @@ Implement providers behind `BrowserProvider` in `packages/browser`. The current 
 Website credentials use `packages/credentials` and `app_private.credential_secrets`. The model may select metadata, but only the trusted broker can decrypt and inject into classified fields on an exact HTTPS origin. Never add a plaintext secret getter to a model-facing tool, action request, browser observation, log, or audit event. OTP, password-reset, recovery, and security-challenge messages are withheld and require owner takeover.
 
 To expose a browser capability, define a narrow named operation, classify its risk, persist writes as action requests, and execute the approved operation in the worker. Never pass arbitrary credentials or an unrestricted browsing program from model output directly to a browser provider.
+
+## How to extend the financial pilot
+
+The only automated financial commit path is `openinstinct_sandbox`. It is disabled by default and requires both the global switch and an enabled canary merchant. Every purchase binds an immutable short-lived preflight containing the exact merchant, integer-minor-unit total, recurring terms, payment alias, and configuration versions. The approval page recomputes the exact typed phrase server-side, and the worker revalidates the same snapshot and rolling limits inside the commit transaction.
+
+Never accept raw payment credentials in an agent tool or action request. A timeout after the invocation fence becomes `unknown` and is observed through the read-only transaction ledger; it is never purchased again automatically. Refunds and cancellations are distinct financial actions with fresh typed authorization, a credit ledger entry, and a separate receipt. Adding a real merchant or payment provider requires a reviewed adapter with provider idempotency and read-back evidence; generic browser or MCP execution is not a financial adapter.
 
 ## How to change the database
 

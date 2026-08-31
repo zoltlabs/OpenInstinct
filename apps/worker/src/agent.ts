@@ -12,6 +12,8 @@ import {
   createActionRequest,
   decideSemanticAction,
   deriveSemanticGuards,
+  financialAdjustmentActionInputSchema,
+  financialPurchaseSelectionSchema,
   payloadHash,
   type SemanticActionIntent,
   type ActionRequest,
@@ -138,6 +140,7 @@ export async function runAssistantAgent(input: {
     semanticIntent: SemanticActionIntent;
     connectionId?: string;
     connectionConfigVersion?: string;
+    expiresInMs?: number;
   }) => {
     const reconciledResultIds = new Set(
       input.context.toolResults
@@ -189,6 +192,7 @@ export async function runAssistantAgent(input: {
       guardConditions: guards,
       authorityGrantId:
         decision.type === "allow" ? decision.authorityGrantId : undefined,
+      expiresInMs: proposal.expiresInMs,
     });
     const persistence = await input.store.saveActionRequest(
       action,
@@ -424,6 +428,140 @@ export async function runAssistantAgent(input: {
         "List configured cloud-browser profiles that may contain owner-managed login state. Read-only; profile secrets are never returned.",
       inputSchema: z.object({}),
       execute: () => input.store.listBrowserProfiles(input.context.workspaceId),
+    }),
+    listFinancialPilot: tool({
+      description:
+        "List the owner-controlled sandbox financial pilot, including its kill switch, allowlisted merchants, and safe payment-alias metadata. Read-only.",
+      inputSchema: z.object({}),
+      execute: () => input.store.listFinancialPilot(input.context.workspaceId),
+    }),
+    proposeSandboxPurchase: tool({
+      description:
+        "Create a short-lived exact preflight and propose a purchase through the OpenInstinct sandbox provider. A fresh typed owner approval is always required; this tool never accepts raw payment credentials.",
+      inputSchema: financialPurchaseSelectionSchema,
+      execute: async (selection) => {
+        const preflight = await input.store.createFinancialPreflight({
+          workspaceId: input.context.workspaceId,
+          selection,
+        });
+        const catalog = await input.store.listFinancialPilot(
+          input.context.workspaceId,
+        );
+        const merchant = catalog.merchants.find(
+          (item) => item.merchantKey === preflight.merchantId,
+        );
+        if (!merchant) throw new Error("Sandbox merchant is unavailable.");
+        return propose({
+          toolName: "finance.sandbox.purchase",
+          risk: "financial",
+          summary: `Purchase ${preflight.itemDescription} from ${merchant.displayName} for ${preflight.totalAmount.minorUnits} ${preflight.totalAmount.currency}`,
+          payload: { preflight },
+          expiresInMs: Math.max(
+            1_000,
+            Date.parse(preflight.quoteExpiresAt) - Date.now(),
+          ),
+          semanticIntent: {
+            version: 1,
+            effect: "purchase",
+            resource: {
+              class: "sandbox_purchase",
+              id: preflight.itemId,
+              displayName: preflight.itemDescription,
+            },
+            provider: "openinstinct_sandbox",
+            exactOrigin: merchant.exactOrigin,
+            counterparty: { id: preflight.merchantId },
+            recipients: [],
+            amount: preflight.totalAmount,
+            reversibility: "conditionally_reversible",
+            commitPoint: true,
+            credentialUse: "payment",
+            postconditions: [
+              {
+                subject: "financial_transaction.status",
+                operator: "equals",
+                expected: "committed",
+              },
+              { subject: "financial_receipt.exists", operator: "exists" },
+            ],
+          },
+        });
+      },
+    }),
+    listFinancialOrders: tool({
+      description:
+        "List safe sandbox order metadata and adjustment status. Read-only; no payment credential or provider handle is returned.",
+      inputSchema: z.object({}),
+      execute: () =>
+        input.store.listFinancialTransactions(input.context.workspaceId),
+    }),
+    proposeSandboxAdjustment: tool({
+      description:
+        "Propose an independently authorized refund or cancellation for a committed sandbox purchase. Requires a fresh typed owner approval and produces separate evidence.",
+      inputSchema: financialAdjustmentActionInputSchema,
+      execute: async (value) => {
+        const orders = await input.store.listFinancialTransactions(
+          input.context.workspaceId,
+        );
+        const purchase = orders.find(
+          (item) => item.id === value.transactionId && item.kind === "purchase",
+        );
+        if (!purchase || purchase.status !== "committed")
+          return {
+            status: "denied",
+            reason: "The sandbox purchase is not eligible for this adjustment.",
+          };
+        if (
+          value.amount.currency !== purchase.amount.currency ||
+          value.amount.minorUnits !== purchase.amount.minorUnits
+        )
+          return {
+            status: "denied",
+            reason: "The adjustment amount does not match the committed order.",
+          };
+        const catalog = await input.store.listFinancialPilot(
+          input.context.workspaceId,
+        );
+        const merchant = catalog.merchants.find(
+          (item) => item.merchantKey === purchase.merchantId,
+        );
+        if (!merchant)
+          return {
+            status: "denied",
+            reason: "Merchant evidence is unavailable.",
+          };
+        return propose({
+          toolName:
+            value.operation === "refund"
+              ? "finance.sandbox.refund"
+              : "finance.sandbox.cancel",
+          risk: "financial",
+          summary: `${value.operation === "refund" ? "Refund" : "Cancel"} sandbox transaction ${value.transactionId} for ${value.amount.minorUnits} ${value.amount.currency}`,
+          payload: value,
+          semanticIntent: {
+            version: 1,
+            effect: "cancel",
+            resource: { class: "sandbox_purchase", id: value.transactionId },
+            provider: "openinstinct_sandbox",
+            exactOrigin: merchant.exactOrigin,
+            counterparty: { id: purchase.merchantId },
+            recipients: [],
+            amount: value.amount,
+            reversibility: "irreversible",
+            commitPoint: true,
+            credentialUse: "none",
+            postconditions: [
+              {
+                subject: "financial_transaction.status",
+                operator: "equals",
+                expected:
+                  value.operation === "refund" ? "refunded" : "cancelled",
+              },
+              { subject: "financial_receipt.exists", operator: "exists" },
+            ],
+          },
+        });
+      },
     }),
     searchMemory: tool({
       description: "Search owner-approved long-term memories. Read-only.",
