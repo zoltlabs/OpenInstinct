@@ -1,4 +1,5 @@
 import { BlooioClient } from "@openinstinct/messaging";
+import { randomUUID } from "node:crypto";
 import {
   decryptCredential,
   encryptCredential,
@@ -17,6 +18,13 @@ import {
 import type { ServerEnvironment } from "@openinstinct/runtime";
 import type { LanguageModel } from "ai";
 import { z } from "zod";
+import {
+  payloadHash,
+  normalizeJsonValue,
+  stableJson,
+  structuredToolResultSchema,
+  type ActionRequest,
+} from "@openinstinct/core";
 import {
   browserActionProgram,
   browserActionSchema,
@@ -37,6 +45,39 @@ export interface OutboundMessenger {
   }): Promise<{ message_id: string; status: string }>;
 }
 
+export type ExecutionFailpoint =
+  | "before_provider_invocation"
+  | "after_provider_invocation_before_response"
+  | "after_response_before_result_persistence"
+  | "after_result_persistence_before_continuation_enqueue"
+  | "after_continuation_enqueue_before_queue_ack";
+
+export interface ExecutionFailureInjector {
+  hit(point: ExecutionFailpoint): void | Promise<void>;
+}
+
+const scheduleCreateInputSchema = z
+  .object({
+    kind: z.enum(["reminder", "routine"]),
+    conversationId: z.string().uuid(),
+    message: z.string().min(1).max(4000).optional(),
+    prompt: z.string().min(1).max(4000).optional(),
+    runAt: z.string().datetime(),
+    recurrenceSeconds: z.number().int().min(60).max(31_557_600).optional(),
+  })
+  .superRefine((item, context) => {
+    if (item.kind === "reminder" && !item.message)
+      context.addIssue({
+        code: "custom",
+        message: "Reminder message is required.",
+      });
+    if (item.kind === "routine" && (!item.prompt || !item.recurrenceSeconds))
+      context.addIssue({
+        code: "custom",
+        message: "Routine prompt and recurrence are required.",
+      });
+  });
+
 export class JobProcessor {
   readonly #store: OpenInstinctStore;
   readonly #env: ServerEnvironment;
@@ -45,6 +86,7 @@ export class JobProcessor {
   readonly #modelId: string;
   readonly #browser?: BrowserProvider;
   readonly #runAgent: typeof runAssistantAgent;
+  readonly #failureInjector?: ExecutionFailureInjector;
 
   constructor(input: {
     store: OpenInstinctStore;
@@ -54,6 +96,7 @@ export class JobProcessor {
     modelId?: string;
     browser?: BrowserProvider;
     runAgent?: typeof runAssistantAgent;
+    failureInjector?: ExecutionFailureInjector;
   }) {
     this.#store = input.store;
     this.#env = input.env;
@@ -74,9 +117,11 @@ export class JobProcessor {
         ? new KernelBrowserProvider(input.env.KERNEL_API_KEY)
         : undefined);
     this.#runAgent = input.runAgent ?? runAssistantAgent;
+    this.#failureInjector = input.failureInjector;
   }
 
-  async process(job: AgentJob): Promise<void> {
+  async process(job: AgentJob, claimToken = randomUUID()): Promise<void> {
+    let resumeActionId: string | undefined;
     if (job.type === "dispatch_schedules") {
       await this.#store.dispatchDueSchedules();
       return;
@@ -109,75 +154,112 @@ export class JobProcessor {
       });
       return;
     }
-    const context = await this.#store.getRunContext(job.runId);
+    if (job.type === "resume_run") {
+      if ((await this.#store.enqueuePendingContinuations(job.runId)) > 0)
+        return;
+      resumeActionId = await this.#store.resolveResumeActionId({
+        runId: job.runId,
+        workspaceId: job.workspaceId,
+        actionId: job.actionId,
+      });
+      if (!resumeActionId) return;
+      if (await this.#store.isExecutionJobFinalized(resumeActionId)) return;
+      const recovery = await this.#store.recoverInterruptedAction(job.runId);
+      if (recovery === "continued") return;
+    }
+
+    const claimStage =
+      job.type === "resume_run"
+        ? {
+            type: "resume_run" as const,
+            workspaceId: job.workspaceId,
+            actionId: resumeActionId!,
+          }
+        : job.type === "continue_run"
+          ? {
+              type: "continue_run" as const,
+              workspaceId: job.workspaceId,
+              toolResultId: job.toolResultId,
+            }
+          : {
+              type: "process_event" as const,
+              workspaceId: job.workspaceId,
+            };
+    const context = await this.#store.getRunContext(
+      job.runId,
+      claimToken,
+      claimStage,
+    );
     const googleState = await this.#google(context.workspaceId);
     const google = googleState?.connector;
 
     if (job.type === "resume_run") {
-      const action = await this.#store.claimApprovedAction(job.runId);
-      if (!action)
-        throw new PermanentJobError(
-          "Resumed run has no claimable approved action.",
-        );
-      try {
-        if (action.toolName === "mcp.call")
-          await this.#executeMcpAction(action, context.workspaceId);
-        else if (action.toolName.startsWith("google.")) {
-          if (!google || !googleState)
-            throw new Error("Google connection is unavailable.");
-          const approvedConnection = (action.input as Record<string, unknown>)
-            .googleConnection as Record<string, unknown> | undefined;
-          if (
-            approvedConnection?.id !== googleState.id ||
-            approvedConnection?.account !== googleState.account ||
-            approvedConnection?.configVersion !== googleState.configVersion
-          )
-            throw new Error("Google connection changed after approval.");
-          await executeApprovedGoogleAction({ action, google });
-        } else {
-          await this.#executeSystemAction(action, context.workspaceId);
-        }
-        await this.#store.markActionExecuted(action.id);
-      } catch (error) {
-        await this.#store.markActionUnknown(action.id);
-        const text = `I could not confirm whether this approved action completed, so I will not retry it automatically: ${action.summary}`;
-        const sent = await this.#sendMessage({
-          to: context.ownerPhone,
-          text,
-          channelId: this.#env.BLOOIO_CHANNEL_ID,
-          idempotencyKey: `action:${action.id}:unknown`,
-        });
-        await this.#store.saveAssistantMessage({
-          workspaceId: context.workspaceId,
-          conversationId: context.conversationId,
-          content: text,
-          providerMessageId: sent.message_id,
-          status: sent.status,
-        });
-        await this.#store.completeRun({
-          runId: job.runId,
-          model: this.#modelId,
-        });
+      const claimed = await this.#store.claimApprovedAction(
+        job.runId,
+        resumeActionId!,
+        context.claimToken,
+      );
+      if (!claimed) {
+        await this.#store.releaseRunClaim(job.runId, context.claimToken);
         return;
       }
-      const text = `Approved action completed: ${action.summary}`;
-      const sent = await this.#sendMessage({
-        to: context.ownerPhone,
-        text,
-        channelId: this.#env.BLOOIO_CHANNEL_ID,
-        idempotencyKey: `action:${action.id}`,
-      });
-      await this.#store.saveAssistantMessage({
+      const { action } = claimed;
+      await this.#validateApprovedAction({
+        action,
         workspaceId: context.workspaceId,
-        conversationId: context.conversationId,
-        content: text,
-        providerMessageId: sent.message_id,
-        status: sent.status,
+        googleState,
       });
-      await this.#store.completeRun({
-        runId: job.runId,
-        model: this.#modelId,
+      await this.#store.renewRunLease(job.runId, context.claimToken);
+      await this.#hitFailpoint("before_provider_invocation");
+      await this.#store.markActionInvocationStarted({
+        actionId: action.id,
+        workspaceId: action.workspaceId,
+        runId: action.runId,
+        stepId: claimed.stepId,
+        attempt: claimed.attempt,
+        claimToken: context.claimToken,
       });
+      const outputPromise = this.#executeApprovedAction({
+        action,
+        workspaceId: context.workspaceId,
+        google,
+        googleState,
+      });
+      void outputPromise.catch(() => undefined);
+      await this.#hitFailpoint("after_provider_invocation_before_response");
+      const rawOutput = await outputPromise;
+      const output = normalizeToolOutput(action.toolName, rawOutput);
+      await this.#store.markActionResultReceived({
+        actionId: action.id,
+        workspaceId: action.workspaceId,
+        runId: action.runId,
+        stepId: claimed.stepId,
+        attempt: claimed.attempt,
+        claimToken: context.claimToken,
+      });
+      await this.#hitFailpoint("after_response_before_result_persistence");
+      const completedAt = new Date().toISOString();
+      const toolResult = structuredToolResultSchema.parse({
+        id: randomUUID(),
+        workspaceId: action.workspaceId,
+        runId: action.runId,
+        stepId: claimed.stepId,
+        actionRequestId: action.id,
+        toolName: action.toolName,
+        certainty: "succeeded",
+        attempt: claimed.attempt,
+        output,
+        outputHash: payloadHash(output),
+        retryEligible: false,
+        startedAt: claimed.startedAt,
+        completedAt,
+      });
+      await this.#store.persistToolResult(toolResult, context.claimToken);
+      await this.#hitFailpoint(
+        "after_result_persistence_before_continuation_enqueue",
+      );
+      await this.#store.enqueuePendingContinuations(job.runId);
+      await this.#hitFailpoint("after_continuation_enqueue_before_queue_ack");
       return;
     }
 
@@ -218,7 +300,10 @@ export class JobProcessor {
       to: context.ownerPhone,
       text: result.text,
       channelId: this.#env.BLOOIO_CHANNEL_ID,
-      idempotencyKey: `run:${job.runId}:response`,
+      idempotencyKey:
+        job.type === "continue_run"
+          ? `result:${job.toolResultId}:response`
+          : `run:${job.runId}:response`,
     });
     await this.#store.saveAssistantMessage({
       workspaceId: context.workspaceId,
@@ -230,6 +315,7 @@ export class JobProcessor {
     if (!result.pendingAction) {
       await this.#store.completeRun({
         runId: job.runId,
+        claimToken: context.claimToken,
         inputTokens: result.inputTokens,
         outputTokens: result.outputTokens,
         model: this.#modelId,
@@ -245,6 +331,162 @@ export class JobProcessor {
         "Blooio is not configured; outbound delivery is unavailable.",
       );
     return this.#messenger.sendMessage(input);
+  }
+
+  async #hitFailpoint(point: ExecutionFailpoint): Promise<void> {
+    await this.#failureInjector?.hit(point);
+  }
+
+  async #executeApprovedAction(input: {
+    action: ActionRequest;
+    workspaceId: string;
+    google?: GoogleConnector;
+    googleState?: {
+      connector: GoogleConnector;
+      id: string;
+      account: string;
+      configVersion: string;
+    };
+  }): Promise<unknown> {
+    if (input.action.toolName === "mcp.call")
+      return this.#executeMcpAction(input.action, input.workspaceId);
+    if (input.action.toolName.startsWith("google.")) {
+      if (!input.google || !input.googleState)
+        throw new Error("Google connection is unavailable.");
+      const approvedConnection = (input.action.input as Record<string, unknown>)
+        .googleConnection as Record<string, unknown> | undefined;
+      if (
+        approvedConnection?.id !== input.googleState.id ||
+        approvedConnection?.account !== input.googleState.account ||
+        approvedConnection?.configVersion !== input.googleState.configVersion
+      )
+        throw new Error("Google connection changed after approval.");
+      return executeApprovedGoogleAction({
+        action: input.action,
+        google: input.google,
+      });
+    }
+    return this.#executeSystemAction(input.action, input.workspaceId);
+  }
+
+  async #validateApprovedAction(input: {
+    action: ActionRequest;
+    workspaceId: string;
+    googleState?: {
+      connector: GoogleConnector;
+      id: string;
+      account: string;
+      configVersion: string;
+    };
+  }): Promise<void> {
+    const value = input.action.input as Record<string, unknown>;
+    if (input.action.toolName.startsWith("google.")) {
+      if (!input.googleState)
+        throw new Error("Google connection is unavailable.");
+      const approvedConnection = value.googleConnection as
+        | Record<string, unknown>
+        | undefined;
+      if (
+        approvedConnection?.id !== input.googleState.id ||
+        approvedConnection?.account !== input.googleState.account ||
+        approvedConnection?.configVersion !== input.googleState.configVersion
+      )
+        throw new Error("Google connection changed after approval.");
+      if (input.action.toolName === "google.gmail.create_draft")
+        z.object({
+          to: z.string().email(),
+          subject: z.string().min(1),
+          body: z.string().min(1),
+        }).parse(value);
+      else if (input.action.toolName === "google.calendar.create")
+        z.object({
+          summary: z.string().min(1),
+          description: z.string().optional(),
+          startDateTime: z.string().datetime(),
+          endDateTime: z.string().datetime(),
+          timeZone: z.string().optional(),
+          attendees: z.array(z.string().email()).optional(),
+        }).parse(value);
+      else throw new Error("Unsupported approved Google action.");
+      return;
+    }
+    if (input.action.toolName === "mcp.call") {
+      const parsed = z
+        .object({
+          connectionId: z.string().uuid(),
+          toolName: z.string().min(1),
+          arguments: z.record(z.string(), z.unknown()).optional(),
+          configVersion: z.string().min(1),
+        })
+        .parse(value);
+      const connections = await this.#store.listConnections({
+        workspaceId: input.workspaceId,
+        provider: "mcp",
+      });
+      const connection = connections.find(
+        (item) => item.id === parsed.connectionId,
+      );
+      const toolNames = Array.isArray(connection?.metadata.toolNames)
+        ? connection.metadata.toolNames.filter(
+            (item): item is string => typeof item === "string",
+          )
+        : [];
+      if (
+        !connection ||
+        !toolNames.includes(parsed.toolName) ||
+        connection.metadata.configVersion !== parsed.configVersion ||
+        typeof connection.metadata.url !== "string"
+      )
+        throw new Error("Approved MCP configuration is no longer valid.");
+      parseMcpCredential(
+        JSON.parse(
+          decryptCredential({
+            encrypted: connection.encryptedCredentials,
+            encodedKey: this.#env.SECRET_ENCRYPTION_KEY,
+            workspaceId: input.workspaceId,
+            connectionId: connection.id,
+          }),
+        ),
+      );
+      return;
+    }
+    if (input.action.toolName === "memory.save")
+      z.object({
+        kind: z.enum([
+          "profile",
+          "episodic",
+          "commitment",
+          "open_loop",
+          "preference",
+        ]),
+        content: z.string().min(1).max(4000),
+        sensitivity: z.enum(["public", "personal", "sensitive"]),
+      }).parse(value);
+    else if (input.action.toolName === "memory.delete")
+      z.object({ memoryId: z.string().uuid() }).parse(value);
+    else if (input.action.toolName === "schedule.cancel")
+      z.object({ triggerId: z.string().uuid() }).parse(value);
+    else if (input.action.toolName === "schedule.create")
+      scheduleCreateInputSchema.parse(value);
+    else if (input.action.toolName === "browser.run") {
+      if (!this.#browser) throw new Error("Cloud browser is not configured.");
+      const parsed = browserActionSchema.parse(value);
+      assertSafeWebUrl(parsed.startUrl);
+      for (const step of parsed.steps)
+        if (step.action === "goto") assertSafeWebUrl(step.url);
+      if (parsed.profileId) {
+        const profiles = await this.#store.listBrowserProfiles(
+          input.workspaceId,
+        );
+        if (
+          !profiles.some(
+            (profile) => profile.providerProfileId === parsed.profileId,
+          )
+        )
+          throw new Error("Browser profile is not registered for this owner.");
+      }
+    } else
+      throw new Error(`Unsupported approved action: ${input.action.toolName}`);
   }
 
   async #executeSystemAction(
@@ -282,36 +524,7 @@ export class JobProcessor {
         });
       }
       case "schedule.create": {
-        const parsed = z
-          .object({
-            kind: z.enum(["reminder", "routine"]),
-            conversationId: z.string().uuid(),
-            message: z.string().min(1).max(4000).optional(),
-            prompt: z.string().min(1).max(4000).optional(),
-            runAt: z.string().datetime(),
-            recurrenceSeconds: z
-              .number()
-              .int()
-              .min(60)
-              .max(31_557_600)
-              .optional(),
-          })
-          .superRefine((item, context) => {
-            if (item.kind === "reminder" && !item.message)
-              context.addIssue({
-                code: "custom",
-                message: "Reminder message is required.",
-              });
-            if (
-              item.kind === "routine" &&
-              (!item.prompt || !item.recurrenceSeconds)
-            )
-              context.addIssue({
-                code: "custom",
-                message: "Routine prompt and recurrence are required.",
-              });
-          })
-          .parse(value);
+        const parsed = scheduleCreateInputSchema.parse(value);
         return this.#store.createScheduledTrigger({
           id: action.id,
           workspaceId,
@@ -524,6 +737,28 @@ export class JobProcessor {
       configVersion,
     };
   }
+}
+
+export function normalizeToolOutput(toolName: string, value: unknown): unknown {
+  if (value === undefined) return { status: "succeeded" };
+  const normalized = normalizeJsonValue(value);
+  const serialized = stableJson(normalized);
+  const rawOutputHash = payloadHash(normalized);
+  if (toolName === "mcp.call" || toolName === "browser.run")
+    return {
+      status: "succeeded",
+      providerOutputOmitted: true,
+      rawOutputHash,
+      reason: "Untrusted provider output is not retained in plaintext.",
+    };
+  if (Buffer.byteLength(serialized, "utf8") > 120_000)
+    return {
+      status: "succeeded",
+      outputOmitted: true,
+      rawOutputHash,
+      reason: "Provider output exceeded the durable result limit.",
+    };
+  return normalized;
 }
 
 function manifestForConnection(

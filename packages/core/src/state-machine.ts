@@ -24,6 +24,7 @@ export type RunState = z.infer<typeof runStateSchema>;
 const transitions: Record<RunStatus, readonly RunStatus[]> = {
   queued: ["running", "cancelled"],
   running: [
+    "queued",
     "waiting_approval",
     "waiting_event",
     "completed",
@@ -33,7 +34,7 @@ const transitions: Record<RunStatus, readonly RunStatus[]> = {
   waiting_approval: ["queued", "cancelled", "failed"],
   waiting_event: ["queued", "cancelled", "failed"],
   completed: [],
-  failed: ["queued", "cancelled"],
+  failed: ["queued", "running", "cancelled"],
   cancelled: [],
 };
 

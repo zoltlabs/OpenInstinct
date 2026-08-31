@@ -1,4 +1,5 @@
 import { RunNotClaimableError, type OpenInstinctStore } from "@openinstinct/db";
+import { randomUUID } from "node:crypto";
 import type { JobProcessor } from "./processor";
 
 export class PermanentJobError extends Error {
@@ -24,16 +25,19 @@ export async function consumeJobs(input: {
     error?: string;
   }[] = [];
   for (const claimed of jobs) {
+    const claimToken = randomUUID();
     try {
-      await input.processor.process(claimed.job);
+      await input.processor.process(claimed.job, claimToken);
       await input.store.archiveJob(claimed.messageId);
       results.push({ messageId: claimed.messageId, status: "completed" });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       const staleClaim = error instanceof RunNotClaimableError;
       if ("runId" in claimed.job && !staleClaim)
-        await input.store.failRun(claimed.job.runId, message);
-      if (
+        await input.store.failRun(claimed.job.runId, message, claimToken);
+      if (staleClaim && error.retryable)
+        await input.store.retryJob(claimed.messageId, error.retryAfterSeconds);
+      else if (
         staleClaim ||
         error instanceof PermanentJobError ||
         claimed.readCount >= 5

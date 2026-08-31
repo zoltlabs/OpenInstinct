@@ -54,6 +54,19 @@ describe("run state", () => {
     expect(transitionRun(waiting, "queued").status).toBe("queued");
   });
 
+  it("allows durable continuation and failed-job retry claims", () => {
+    const running = {
+      id: runId,
+      workspaceId,
+      status: "running" as const,
+      attempt: 1,
+    };
+    expect(transitionRun(running, "queued").status).toBe("queued");
+    expect(
+      transitionRun({ ...running, status: "failed" }, "running").status,
+    ).toBe("running");
+  });
+
   it("rejects terminal transitions", () => {
     expect(() =>
       transitionRun(

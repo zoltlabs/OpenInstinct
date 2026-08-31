@@ -14,4 +14,15 @@ describe("scheduled jobs", () => {
       }).success,
     ).toBe(true);
   });
+
+  it("validates result continuations using stable identifiers only", () => {
+    expect(
+      agentJobSchema.parse({
+        type: "continue_run",
+        runId: "7e5e8b22-8e72-4ec1-a81f-e804d8c1fc01",
+        workspaceId: "7e5e8b22-8e72-4ec1-a81f-e804d8c1fc02",
+        toolResultId: "7e5e8b22-8e72-4ec1-a81f-e804d8c1fc03",
+      }),
+    ).not.toHaveProperty("output");
+  });
 });

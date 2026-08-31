@@ -11,6 +11,13 @@ export const agentJobSchema = z.discriminatedUnion("type", [
     type: z.literal("resume_run"),
     runId: z.string().uuid(),
     workspaceId: z.string().uuid(),
+    actionId: z.string().uuid().optional(),
+  }),
+  z.object({
+    type: z.literal("continue_run"),
+    runId: z.string().uuid(),
+    workspaceId: z.string().uuid(),
+    toolResultId: z.string().uuid(),
   }),
   z.object({
     type: z.literal("dispatch_schedules"),
