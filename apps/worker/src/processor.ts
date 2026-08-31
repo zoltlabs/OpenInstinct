@@ -26,12 +26,9 @@ import {
   type ActionRequest,
 } from "@openinstinct/core";
 import {
-  browserActionProgram,
-  browserActionSchema,
   KernelBrowserProvider,
   type BrowserProvider,
 } from "@openinstinct/browser";
-import { assertSafeWebUrl } from "@openinstinct/connectors";
 import { executeApprovedGoogleAction, runAssistantAgent } from "./agent";
 import { PermanentJobError } from "./consumer";
 import { createAssistantModel } from "./models";
@@ -118,6 +115,21 @@ export class JobProcessor {
         : undefined);
     this.#runAgent = input.runAgent ?? runAssistantAgent;
     this.#failureInjector = input.failureInjector;
+  }
+
+  async cleanupExpiredBrowserSessions(): Promise<void> {
+    if (!this.#browser) return;
+    for (const session of await this.#store.listBrowserSessionsPendingCleanup()) {
+      const closed = await this.#browser
+        .closeSession(session.providerSessionId)
+        .then(() => true)
+        .catch(() => false);
+      if (closed)
+        await this.#store.closeBrowserControlSession({
+          id: session.id,
+          workspaceId: session.workspaceId,
+        });
+    }
   }
 
   async process(job: AgentJob, claimToken = randomUUID()): Promise<void> {
@@ -469,22 +481,9 @@ export class JobProcessor {
     else if (input.action.toolName === "schedule.create")
       scheduleCreateInputSchema.parse(value);
     else if (input.action.toolName === "browser.run") {
-      if (!this.#browser) throw new Error("Cloud browser is not configured.");
-      const parsed = browserActionSchema.parse(value);
-      assertSafeWebUrl(parsed.startUrl);
-      for (const step of parsed.steps)
-        if (step.action === "goto") assertSafeWebUrl(step.url);
-      if (parsed.profileId) {
-        const profiles = await this.#store.listBrowserProfiles(
-          input.workspaceId,
-        );
-        if (
-          !profiles.some(
-            (profile) => profile.providerProfileId === parsed.profileId,
-          )
-        )
-          throw new Error("Browser profile is not registered for this owner.");
-      }
+      throw new Error(
+        "Browser writes are disabled until semantic authorization is enabled.",
+      );
     } else
       throw new Error(`Unsupported approved action: ${input.action.toolName}`);
   }
@@ -546,36 +545,9 @@ export class JobProcessor {
         });
       }
       case "browser.run": {
-        if (!this.#browser) throw new Error("Cloud browser is not configured.");
-        const parsed = browserActionSchema.parse(value);
-        assertSafeWebUrl(parsed.startUrl);
-        for (const step of parsed.steps)
-          if (step.action === "goto") assertSafeWebUrl(step.url);
-        if (parsed.profileId) {
-          const profiles = await this.#store.listBrowserProfiles(workspaceId);
-          if (
-            !profiles.some(
-              (profile) => profile.providerProfileId === parsed.profileId,
-            )
-          )
-            throw new Error(
-              "Browser profile is not registered for this owner.",
-            );
-        }
-        const session = await this.#browser.create({
-          startUrl: parsed.startUrl,
-          profileId: parsed.profileId,
-          timeoutSeconds: 180,
-        });
-        try {
-          return await this.#browser.execute({
-            sessionId: session.id,
-            code: browserActionProgram(parsed),
-            timeoutSeconds: 30,
-          });
-        } finally {
-          await this.#browser.destroy(session.id);
-        }
+        throw new Error(
+          "Browser writes are disabled until semantic authorization is enabled.",
+        );
       }
       default:
         throw new Error(`Unsupported approved action: ${action.toolName}`);

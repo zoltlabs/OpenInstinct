@@ -53,6 +53,32 @@ const feedbackMessages: Record<
     tone: "success",
     message: "Owner setup is complete.",
   },
+  "browser-invalid": {
+    tone: "error",
+    message: "Enter a label and an exact HTTPS website origin.",
+  },
+  "browser-error": {
+    tone: "error",
+    message: "The private browser profile could not be updated safely.",
+  },
+  "browser-active": {
+    tone: "success",
+    message: "The browser identity is active and ready for later sessions.",
+  },
+  "browser-login-needed": {
+    tone: "info",
+    message:
+      "Login could not be confirmed yet. Reopen the private browser and finish signing in.",
+  },
+  "browser-revoked": {
+    tone: "success",
+    message:
+      "The browser identity is revoked. Delete it to verify provider-side removal.",
+  },
+  "browser-deleted": {
+    tone: "success",
+    message: "The browser identity was verified deleted at the provider.",
+  },
   "mcp-invalid": {
     tone: "error",
     message: "Enter a connector name and a public HTTPS MCP URL.",

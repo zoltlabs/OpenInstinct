@@ -32,6 +32,19 @@ const validValues = {
 };
 
 describe("agent-friendly setup checks", () => {
+  it("reports optional browser configuration without exposing its key", () => {
+    const checks = checkEnvironment({
+      values: validValues,
+      target: "docker",
+      phase: "bootstrap",
+    });
+    expect(checks).toContainEqual({
+      name: "browser:provider-config",
+      ok: true,
+      detail: "optional; disabled",
+    });
+    expect(JSON.stringify(checks)).not.toContain("KERNEL_API_KEY=");
+  });
   it("normalizes only public HTTPS application URLs", () => {
     expect(normalizePublicAppUrl("https://assistant.example/path")).toBe(
       "https://assistant.example",

@@ -22,10 +22,7 @@ import {
   resolveMcpConnectorCandidates,
   type McpToolManifestEntry,
 } from "@openinstinct/connectors";
-import {
-  browserReadProgram,
-  type BrowserProvider,
-} from "@openinstinct/browser";
+import type { BrowserProvider } from "@openinstinct/browser";
 
 const calendarEventInputSchema = z.object({
   summary: z.string().min(1),
@@ -271,38 +268,20 @@ export async function runAssistantAgent(input: {
     }),
     readBrowserPage: tool({
       description:
-        "Open a public HTTPS page in the configured cloud browser and return visible text and links. Read-only and unavailable without Kernel.",
-      inputSchema: z.object({
-        url: z.string().url(),
-        profileId: z.string().max(500).optional(),
-      }),
-      execute: async ({ url, profileId }) => {
+        "Open a public HTTPS page in an ephemeral cloud browser and return visible text and links. Persistent owner profiles remain unavailable until durable exclusive leases and redaction are enabled.",
+      inputSchema: z.object({ url: z.string().url() }),
+      execute: async ({ url }) => {
         if (!input.browser) throw new Error("Cloud browser is not configured.");
         assertSafeWebUrl(url);
-        if (profileId) {
-          const profiles = await input.store.listBrowserProfiles(
-            input.context.workspaceId,
-          );
-          if (
-            !profiles.some((profile) => profile.providerProfileId === profileId)
-          )
-            throw new Error(
-              "Browser profile is not registered for this owner.",
-            );
-        }
-        const session = await input.browser.create({
+        const session = await input.browser.startSession({
           startUrl: url,
-          profileId,
           timeoutSeconds: 120,
+          purpose: "automation",
         });
         try {
-          return await input.browser.execute({
-            sessionId: session.id,
-            code: browserReadProgram,
-            timeoutSeconds: 30,
-          });
+          return await input.browser.observe(session.id);
         } finally {
-          await input.browser.destroy(session.id);
+          await input.browser.closeSession(session.id);
         }
       },
     }),
@@ -421,94 +400,6 @@ export async function runAssistantAgent(input: {
           risk: "destructive",
           summary: value.summary,
           payload: { triggerId: value.triggerId },
-        }),
-    }),
-    proposeBrowserAction: tool({
-      description:
-        "Propose bounded browser interaction steps (goto, click, fill, select, wait). Never place passwords, tokens, payment data, or other secrets in steps. Requires approval.",
-      inputSchema: z.object({
-        startUrl: z.string().url(),
-        profileId: z.string().max(500).optional(),
-        steps: z
-          .array(
-            z.discriminatedUnion("action", [
-              z.object({ action: z.literal("goto"), url: z.string().url() }),
-              z.object({
-                action: z.literal("click"),
-                selector: z.string().min(1).max(500),
-              }),
-              z.object({
-                action: z.literal("fill"),
-                selector: z.string().min(1).max(500),
-                value: z.string().max(10_000),
-              }),
-              z.object({
-                action: z.literal("select"),
-                selector: z.string().min(1).max(500),
-                value: z.string().max(1_000),
-              }),
-              z.object({
-                action: z.literal("wait"),
-                milliseconds: z.number().int().min(0).max(5_000),
-              }),
-            ]),
-          )
-          .min(1)
-          .max(20),
-        summary: z.string().min(1).max(500),
-      }),
-      execute: ({ summary, ...value }) =>
-        propose({
-          toolName: "browser.run",
-          risk: /\b(delete|remove|revoke|cancel|destroy|purge|unsubscribe)\b/iu.test(
-            `${summary} ${JSON.stringify(value.steps)}`,
-          )
-            ? "destructive"
-            : "write",
-          summary,
-          payload: value,
-        }),
-    }),
-    proposeDestructiveBrowserAction: tool({
-      description:
-        "Propose bounded browser steps that delete, revoke, cancel, or otherwise irreversibly alter external state. Requires destructive confirmation.",
-      inputSchema: z.object({
-        startUrl: z.string().url(),
-        profileId: z.string().max(500).optional(),
-        steps: z
-          .array(
-            z.discriminatedUnion("action", [
-              z.object({ action: z.literal("goto"), url: z.string().url() }),
-              z.object({
-                action: z.literal("click"),
-                selector: z.string().min(1).max(500),
-              }),
-              z.object({
-                action: z.literal("fill"),
-                selector: z.string().min(1).max(500),
-                value: z.string().max(10_000),
-              }),
-              z.object({
-                action: z.literal("select"),
-                selector: z.string().min(1).max(500),
-                value: z.string().max(1_000),
-              }),
-              z.object({
-                action: z.literal("wait"),
-                milliseconds: z.number().int().min(0).max(5_000),
-              }),
-            ]),
-          )
-          .min(1)
-          .max(20),
-        summary: z.string().min(1).max(500),
-      }),
-      execute: ({ summary, ...value }) =>
-        propose({
-          toolName: "browser.run",
-          risk: "destructive",
-          summary,
-          payload: value,
         }),
     }),
   };

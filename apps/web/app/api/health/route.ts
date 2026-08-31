@@ -11,7 +11,12 @@ export async function GET() {
   try {
     const database = await store.health();
     return NextResponse.json(
-      { ok: database, database, service: "openinstinct-web" },
+      {
+        ok: database,
+        database,
+        browser: { configured: Boolean(process.env.KERNEL_API_KEY) },
+        service: "openinstinct-web",
+      },
       { status: database ? 200 : 503 },
     );
   } catch {

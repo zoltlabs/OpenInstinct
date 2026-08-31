@@ -19,6 +19,7 @@ describe("queue consumption", () => {
       archiveJob: vi.fn(async () => undefined),
     } as unknown as OpenInstinctStore;
     const processor = {
+      cleanupExpiredBrowserSessions: vi.fn(async () => undefined),
       process: vi.fn(async () => {
         throw new Error("provider unavailable");
       }),
@@ -51,6 +52,7 @@ describe("queue consumption", () => {
       archiveJob: vi.fn(async () => undefined),
     } as unknown as OpenInstinctStore;
     const processor = {
+      cleanupExpiredBrowserSessions: vi.fn(async () => undefined),
       process: vi.fn(async () => {
         throw new RunNotClaimableError("actively leased", true, 30);
       }),

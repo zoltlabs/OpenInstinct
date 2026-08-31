@@ -140,6 +140,7 @@ export default async function Home({
     { data: runs },
     { data: schedules },
     { data: memories },
+    { data: browserProfiles },
   ] = await Promise.all([
     supabase
       .from("connection_summaries")
@@ -166,6 +167,10 @@ export default async function Home({
       .select("id,kind,content,sensitivity,updated_at")
       .order("updated_at", { ascending: false })
       .limit(12),
+    supabase
+      .from("browser_profile_summaries")
+      .select("id,label,provider,status,allowed_origins,updated_at")
+      .order("updated_at", { ascending: false }),
   ]);
 
   return (
@@ -336,6 +341,101 @@ export default async function Home({
                 ))}
             </div>
           ) : null}
+        </section>
+        <section className="card wide">
+          <div className="section-heading">
+            <div>
+              <p className="eyebrow">Browser identity</p>
+              <h2>Authenticated websites</h2>
+            </div>
+            <p className="section-copy">
+              Login happens in a private browser. OpenInstinct stores the
+              profile reference and allowed origin, never cookies or passwords.
+            </p>
+          </div>
+          <form action="/api/browser/profiles" method="post">
+            <label className="field" htmlFor="browser-label">
+              <span>Account label</span>
+              <input
+                id="browser-label"
+                name="label"
+                required
+                maxLength={200}
+                placeholder="Work travel"
+              />
+            </label>
+            <label className="field" htmlFor="browser-origin">
+              <span>Exact website origin</span>
+              <input
+                id="browser-origin"
+                name="origin"
+                type="url"
+                required
+                placeholder="https://example.com"
+              />
+            </label>
+            <button type="submit">Connect browser account</button>
+          </form>
+          {browserProfiles?.length ? (
+            <div className="configured-connectors">
+              {browserProfiles.map((profile) => (
+                <div key={profile.id}>
+                  <p>
+                    <span
+                      className={`status-dot ${profile.status === "active" ? "active" : profile.status === "error" ? "error" : "pending"}`}
+                    />
+                    {profile.label} · {profile.status} ·{" "}
+                    {(profile.allowed_origins as string[]).join(", ")}
+                  </p>
+                  <form
+                    action={`/api/browser/profiles/${profile.id}`}
+                    method="post"
+                  >
+                    {profile.status === "provisioning" ||
+                    profile.status === "error" ? (
+                      <button name="action" value="cleanup">
+                        Reconcile and remove
+                      </button>
+                    ) : null}
+                    {["needs_login", "active", "needs_reauth"].includes(
+                      profile.status,
+                    ) ? (
+                      <>
+                        <button
+                          className="secondary"
+                          name="action"
+                          value="health"
+                        >
+                          Check health
+                        </button>
+                        <button
+                          className="secondary"
+                          name="action"
+                          value="reauth"
+                        >
+                          Reauthenticate
+                        </button>
+                        <button
+                          className="secondary"
+                          name="action"
+                          value="revoke"
+                        >
+                          Revoke
+                        </button>
+                      </>
+                    ) : null}
+                    {profile.status === "revoked" ? (
+                      <button name="action" value="delete">
+                        Delete permanently
+                      </button>
+                    ) : null}
+                  </form>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <p className="muted">No browser identities enrolled.</p>
+          )}
         </section>
         <section className="card wide">
           <h2>Pending approvals</h2>

@@ -254,9 +254,9 @@ Before considering a feature complete, verify:
 - Scheduled routines inject their approved prompt as a durable scheduled event and run through the same agent queue, tool limits, policy, and approval boundary as owner messages.
 - The worker includes a bounded set of recent owner-approved memories in each model run. It can search all active memories, propose new memories, and propose destructive forgetting.
 - Public web fetch is read-only, HTTPS-only, response-bounded, redirect-free, and protected against private/special network destinations.
-- Kernel may read a page inline or execute an approved sequence of `goto`, `click`, `fill`, `select`, and bounded `wait` steps. Arbitrary JavaScript is not accepted from the model.
+- Kernel may read a public page in an ephemeral browser. Persistent profiles and browser writes fail closed until the later lease, redaction, and semantic-authorization phases; arbitrary JavaScript is never accepted from the model.
 - Any HTTPS MCP server can contribute discovered tools. The assistant invokes them through one generic, allowlist-checked action boundary; every invocation still requires approval, including tools described as read-only.
-- Destructive operations are no longer categorically disabled. They require a hash-bound approval plus the control plane's exact destructive confirmation phrase. Financial and security-sensitive operations remain denied.
+- Destructive connector operations require a hash-bound approval plus the control plane's exact destructive confirmation phrase. Generic browser writes, financial actions, and security-sensitive operations remain denied.
 
 ## Intentional limitations
 

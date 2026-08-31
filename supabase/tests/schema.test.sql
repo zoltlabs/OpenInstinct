@@ -1,11 +1,13 @@
 begin;
-select plan(54);
+select plan(74);
 
 select has_table('public', 'workspaces', 'workspaces table exists');
 select has_table('public', 'action_requests', 'action requests table exists');
 select has_table('public', 'workflow_steps', 'durable workflow steps table exists');
 select has_table('public', 'tool_results', 'structured tool results table exists');
 select has_table('public', 'run_events', 'append-only run events table exists');
+select has_table('public', 'browser_profile_origins', 'browser origins table exists');
+select has_table('app_private', 'browser_control_sessions', 'browser control sessions are private');
 select has_table('pgmq', 'q_agent_jobs', 'durable agent queue exists');
 select ok((select relrowsecurity from pg_class where oid = 'public.connections'::regclass), 'connections use RLS');
 select ok((select count(*) > 0 from pg_policies where schemaname = 'public' and tablename = 'connections'), 'connections have owner policies');
@@ -23,11 +25,14 @@ select has_column('public', 'scheduled_triggers', 'completed_at', 'schedules rec
 select has_column('public', 'workflow_steps', 'execution_phase', 'steps record the invocation boundary');
 select has_column('public', 'tool_results', 'certainty', 'results record certainty');
 select has_column('public', 'tool_results', 'continuation_status', 'results provide a durable continuation outbox');
+select has_column('public', 'browser_profiles', 'status', 'browser profiles have lifecycle state');
+select has_column('public', 'browser_profiles', 'configuration_version', 'browser policy has a version');
 select ok((select relrowsecurity from pg_class where oid = 'public.scheduled_triggers'::regclass), 'schedules use RLS');
 select ok((select relrowsecurity from pg_class where oid = 'public.memories'::regclass), 'memories use RLS');
 select ok((select relrowsecurity from pg_class where oid = 'public.workflow_steps'::regclass), 'workflow steps use RLS');
 select ok((select relrowsecurity from pg_class where oid = 'public.tool_results'::regclass), 'tool results use RLS');
 select ok((select relrowsecurity from pg_class where oid = 'public.run_events'::regclass), 'run events use RLS');
+select ok((select relrowsecurity from pg_class where oid = 'public.browser_profile_origins'::regclass), 'browser origins use RLS');
 select is(
   (
     select count(*)::integer
@@ -49,9 +54,10 @@ select is(
       'public.workflow_steps'::regclass,
       'public.tool_results'::regclass,
       'public.run_events'::regclass
+      ,'public.browser_profile_origins'::regclass
     ) and relrowsecurity
   ),
-  16,
+  17,
   'every Data API table has RLS enabled'
 );
 select ok(
@@ -60,6 +66,40 @@ select ok(
     where table_schema = 'public' and grantee = 'anon'
   ),
   'anonymous clients have no public table or view grants'
+);
+select ok(
+  not has_column_privilege('authenticated', 'public.browser_profiles', 'provider_profile_id', 'SELECT'),
+  'provider profile identifiers are not exposed through the Data API'
+);
+select ok(
+  not has_table_privilege('authenticated', 'public.browser_profiles', 'INSERT')
+    and not has_table_privilege('authenticated', 'public.browser_profiles', 'UPDATE')
+    and not has_table_privilege('authenticated', 'public.browser_profiles', 'DELETE'),
+  'browser lifecycle is server-written'
+);
+select ok(
+  not has_table_privilege('authenticated', 'app_private.browser_control_sessions', 'SELECT'),
+  'browser control sessions are unavailable to authenticated clients'
+);
+select ok(
+  not has_column_privilege('authenticated', 'public.browser_profiles', 'provider_capabilities', 'SELECT')
+    and not has_column_privilege('authenticated', 'public.browser_profiles', 'capabilities_hash', 'SELECT')
+    and not has_column_privilege('authenticated', 'public.browser_profiles', 'last_error_code', 'SELECT'),
+  'provider diagnostics remain server-only'
+);
+select ok(
+  not has_table_privilege('authenticated', 'public.browser_profile_origins', 'INSERT')
+    and not has_table_privilege('authenticated', 'public.browser_profile_origins', 'UPDATE')
+    and not has_table_privilege('authenticated', 'public.browser_profile_origins', 'DELETE')
+    and not has_table_privilege('anon', 'app_private.browser_control_sessions', 'SELECT')
+    and not has_table_privilege('service_role', 'app_private.browser_control_sessions', 'SELECT'),
+  'origins are server-written and private sessions have no Data API grants'
+);
+select ok(
+  exists (select 1 from pg_indexes where indexname='browser_control_sessions_one_active_profile_idx')
+    and exists (select 1 from pg_indexes where indexname='browser_control_sessions_nonce_idx')
+    and exists (select 1 from pg_indexes where indexname='browser_control_sessions_profile_fk_idx'),
+  'control sessions enforce exclusive active use and indexed cleanup'
 );
 select ok(
   not has_table_privilege('authenticated', 'public.connections', 'SELECT'),
@@ -144,6 +184,74 @@ values (
   '10000000-0000-4000-8000-000000000003',
   '10000000-0000-4000-8000-000000000002',
   'running'
+);
+insert into public.browser_profiles (
+  id,workspace_id,provider,provider_profile_id,label,status
+) values (
+  '10000000-0000-4000-8000-000000000020',
+  '10000000-0000-4000-8000-000000000002',
+  'kernel','provider-secret-reference','Canary','active'
+);
+insert into public.browser_profile_origins (profile_id,workspace_id,origin)
+values (
+  '10000000-0000-4000-8000-000000000020',
+  '10000000-0000-4000-8000-000000000002','https://example.test'
+);
+select throws_ok(
+  $$insert into public.browser_profile_origins (profile_id,workspace_id,origin)
+    values ('10000000-0000-4000-8000-000000000020',
+      '10000000-0000-4000-8000-000000000002','https://example.test/path')$$,
+  '23514', null, 'browser origins must be exact HTTPS origins'
+);
+select throws_ok(
+  $$insert into public.browser_profile_origins (profile_id,workspace_id,origin)
+    values ('10000000-0000-4000-8000-000000000020',
+      '10000000-0000-4000-8000-000000000012','https://other.example.test')$$,
+  '23503', null, 'browser origins cannot cross workspace bindings'
+);
+select throws_ok(
+  $$update public.browser_profiles set status='revoked'
+    where id='10000000-0000-4000-8000-000000000020'$$,
+  '23514', null, 'revoked browser profiles require a revocation timestamp'
+);
+select throws_ok(
+  $$update public.browser_profiles set deletion_requested_at=now()
+    where id='10000000-0000-4000-8000-000000000020'$$,
+  '23514', null, 'active browser profiles cannot enter deletion state'
+);
+select throws_ok(
+  $$insert into app_private.browser_control_sessions (
+      id,profile_id,workspace_id,provider_session_id,purpose,status,
+      takeover_nonce_hash,configuration_version,expires_at
+    ) values (
+      '10000000-0000-4000-8000-000000000021',
+      '10000000-0000-4000-8000-000000000020',
+      '10000000-0000-4000-8000-000000000002','expired-provider-session',
+      'health','active',repeat('9',64),1,now()-interval '1 minute'
+    )$$,
+  '23514', null, 'browser control sessions must expire after creation'
+);
+insert into app_private.browser_control_sessions (
+  id,profile_id,workspace_id,provider_session_id,purpose,status,
+  takeover_nonce_hash,configuration_version,expires_at
+) values (
+  '10000000-0000-4000-8000-000000000022',
+  '10000000-0000-4000-8000-000000000020',
+  '10000000-0000-4000-8000-000000000002','active-provider-session',
+  'health','active',repeat('8',64),1,now()+interval '10 minutes'
+);
+update app_private.browser_control_sessions set status='cleanup_pending'
+where id='10000000-0000-4000-8000-000000000022';
+select throws_ok(
+  $$insert into app_private.browser_control_sessions (
+      profile_id,workspace_id,provider_session_id,purpose,status,
+      takeover_nonce_hash,configuration_version,expires_at
+    ) values (
+      '10000000-0000-4000-8000-000000000020',
+      '10000000-0000-4000-8000-000000000002','second-provider-session',
+      'takeover','active',repeat('7',64),1,now()+interval '10 minutes'
+    )$$,
+  '23505', null, 'cleanup-pending provider sessions retain exclusive profile ownership'
 );
 insert into public.run_events (
   id, workspace_id, run_id, event_type, event_key, payload, payload_hash
@@ -318,6 +426,11 @@ select is(
   1,
   'the authenticated owner can read execution history'
 );
+select is(
+  (select count(*)::integer from public.browser_profile_summaries),
+  1,
+  'the owner can read safe browser profile summaries'
+);
 select set_config(
   'request.jwt.claim.sub',
   '10000000-0000-4000-8000-000000000099',
@@ -328,7 +441,29 @@ select is(
   0,
   'another authenticated identity cannot read execution history'
 );
+select is(
+  (select count(*)::integer from public.browser_profile_summaries),
+  0,
+  'another identity cannot read browser profile summaries'
+);
 reset role;
+
+set local role service_role;
+select throws_ok(
+  $$select app_private.purge_workspace_execution_history(
+      '10000000-0000-4000-8000-000000000002'
+    )$$,
+  '55000',
+  'provider browser profiles must be verifiably deleted before workspace purge',
+  'workspace purge refuses undeleted provider profiles'
+);
+reset role;
+
+update public.browser_profiles set status='revoked',revoked_at=now(),
+  deletion_requested_at=now(),deletion_verified_at=now()
+where id='10000000-0000-4000-8000-000000000020';
+delete from public.browser_profiles
+where id='10000000-0000-4000-8000-000000000020';
 
 update public.action_requests set status = 'unknown'
 where id = '10000000-0000-4000-8000-000000000006';

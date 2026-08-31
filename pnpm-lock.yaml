@@ -60,6 +60,9 @@ importers:
 
   apps/web:
     dependencies:
+      "@openinstinct/browser":
+        specifier: workspace:*
+        version: link:../../packages/browser
       "@openinstinct/connectors":
         specifier: workspace:*
         version: link:../../packages/connectors

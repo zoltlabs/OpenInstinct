@@ -395,6 +395,23 @@ export function checkEnvironment(input: {
           : "set all three Google OAuth variables or none",
     });
   }
+  const kernelConfigured = Boolean(input.values.KERNEL_API_KEY);
+  checks.push({
+    name: "browser:provider-config",
+    ok:
+      !kernelConfigured ||
+      environmentFieldSchemas.KERNEL_API_KEY.safeParse(
+        input.values.KERNEL_API_KEY,
+      ).success,
+    detail: kernelConfigured ? "configured" : "optional; disabled",
+  });
+  checks.push({
+    name: "browser:capabilities",
+    ok: true,
+    detail: kernelConfigured
+      ? "profiles,reconnect,observation,screenshot,files,takeover,replay"
+      : "not checked while provider is disabled",
+  });
   return checks;
 }
 

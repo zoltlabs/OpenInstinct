@@ -18,6 +18,7 @@ export async function consumeJobs(input: {
   }[]
 > {
   await input.store.dispatchDueSchedules();
+  await input.processor.cleanupExpiredBrowserSessions();
   const jobs = await input.store.claimJobs(input.limit ?? 5);
   const results: {
     messageId: number;

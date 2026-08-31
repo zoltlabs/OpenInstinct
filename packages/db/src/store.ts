@@ -1942,29 +1942,680 @@ export class OpenInstinctStore {
     readonly {
       id: string;
       provider: string;
-      providerProfileId: string;
       label: string;
+      status: string;
+      configurationVersion: number;
+      allowedOrigins: readonly string[];
     }[]
   > {
     const rows = await this.#sql<
       {
         id: string;
         provider: string;
-        provider_profile_id: string;
         label: string;
+        status: string;
+        configuration_version: string | number;
+        allowed_origins: string[];
       }[]
     >`
-      select id, provider, provider_profile_id, label
-      from public.browser_profiles
-      where workspace_id = ${workspaceId}
-      order by label asc limit 50
+      select p.id, p.provider, p.label, p.status, p.configuration_version,
+        coalesce(array_agg(o.origin order by o.origin) filter (where o.origin is not null), '{}') as allowed_origins
+      from public.browser_profiles p
+      left join public.browser_profile_origins o on o.profile_id = p.id
+        and o.workspace_id = p.workspace_id
+      where p.workspace_id = ${workspaceId}
+      group by p.id order by p.label asc limit 50
     `;
     return rows.map((row) => ({
       id: row.id,
       provider: row.provider,
+      label: row.label,
+      status: row.status,
+      configurationVersion: Number(row.configuration_version),
+      allowedOrigins: row.allowed_origins,
+    }));
+  }
+
+  async createProvisioningBrowserProfile(input: {
+    id: string;
+    workspaceId: string;
+    provider: string;
+    label: string;
+    origin: string;
+    capabilities: Record<string, unknown>;
+  }): Promise<void> {
+    await this.#sql.begin(async (tx) => {
+      await tx`
+        insert into public.browser_profiles (
+          id, workspace_id, provider, label, status,
+          provider_capabilities, capabilities_hash, capabilities_checked_at
+        ) values (
+          ${input.id}, ${input.workspaceId}, ${input.provider}, ${input.label},
+          'provisioning', ${tx.json(toJson(input.capabilities))},
+          ${payloadHash(input.capabilities)}, now()
+        )
+      `;
+      await tx`
+        insert into public.browser_profile_origins (profile_id, workspace_id, origin)
+        values (${input.id}, ${input.workspaceId}, ${input.origin})
+      `;
+      await this.#writeAuditEvent(tx, {
+        workspaceId: input.workspaceId,
+        actor: "owner",
+        action: "browser.profile.create_requested",
+        eventKey: `browser_profile:${input.id}:create_requested`,
+        targetType: "browser_profile",
+        targetId: input.id,
+        detail: { provider: input.provider, origin: input.origin },
+      });
+    });
+  }
+
+  async attachBrowserProviderProfile(input: {
+    id: string;
+    workspaceId: string;
+    providerProfileId: string;
+  }): Promise<void> {
+    await this.#sql.begin(async (tx) => {
+      const updated = await tx`
+        update public.browser_profiles
+        set provider_profile_id = ${input.providerProfileId}, status = 'needs_login',
+          last_error_code = null
+        where id = ${input.id} and workspace_id = ${input.workspaceId}
+          and status = 'provisioning' and provider_profile_id is null
+        returning id
+      `;
+      if (updated.length !== 1)
+        throw new Error("Browser profile provisioning state changed.");
+      await this.#writeAuditEvent(tx, {
+        workspaceId: input.workspaceId,
+        actor: "system",
+        action: "browser.profile.provisioned",
+        eventKey: `browser_profile:${input.id}:provisioned`,
+        targetType: "browser_profile",
+        targetId: input.id,
+        detail: {},
+      });
+    });
+  }
+
+  async markBrowserProfileError(input: {
+    id: string;
+    workspaceId: string;
+    errorCode: string;
+    configurationVersion: number;
+    operation: "enrollment" | "reauthentication";
+  }): Promise<void> {
+    await this.#sql.begin(async (tx) => {
+      const rows = await tx`
+        update public.browser_profiles set status='error',last_error_code=${input.errorCode}
+        where id=${input.id} and workspace_id=${input.workspaceId}
+          and configuration_version=${input.configurationVersion}
+          and (
+            (${input.operation}='enrollment' and status in ('provisioning','needs_login','error'))
+            or (${input.operation}='reauthentication' and status in ('needs_reauth','error'))
+          )
+        returning id
+      `;
+      if (rows.length !== 1) return;
+      await this.#writeAuditEvent(tx, {
+        workspaceId: input.workspaceId,
+        actor: "system",
+        action: "browser.profile.operation_failed",
+        eventKey: `browser_profile:${input.id}:${input.operation}:${input.configurationVersion}:failed`,
+        targetType: "browser_profile",
+        targetId: input.id,
+        detail: { operation: input.operation, errorCode: input.errorCode },
+      });
+    });
+  }
+
+  async beginBrowserReauthentication(input: {
+    id: string;
+    workspaceId: string;
+  }): Promise<number> {
+    return this.#sql.begin(async (tx) => {
+      const [row] = await tx<{ configuration_version: string | number }[]>`
+        update public.browser_profiles
+        set status=case when status='needs_login' then 'needs_login' else 'needs_reauth' end,
+          configuration_version=configuration_version+1,last_error_code=null
+        where id=${input.id} and workspace_id=${input.workspaceId}
+          and status in ('active','needs_login','needs_reauth','error')
+        returning configuration_version
+      `;
+      if (!row)
+        throw new Error("Browser profile cannot start reauthentication.");
+      await tx`
+        update app_private.browser_control_sessions
+        set status='cleanup_pending'
+        where profile_id=${input.id} and workspace_id=${input.workspaceId} and status='active'
+      `;
+      await this.#writeAuditEvent(tx, {
+        workspaceId: input.workspaceId,
+        actor: "owner",
+        action: "browser.reauthentication.started",
+        eventKey: `browser_profile:${input.id}:reauthentication:${row.configuration_version}:started`,
+        targetType: "browser_profile",
+        targetId: input.id,
+        detail: { configurationVersion: Number(row.configuration_version) },
+      });
+      return Number(row.configuration_version);
+    });
+  }
+
+  async deleteUnprovisionedBrowserProfile(input: {
+    id: string;
+    workspaceId: string;
+  }): Promise<void> {
+    await this.#sql.begin(async (tx) => {
+      const rows = await tx`
+        delete from public.browser_profiles
+        where id=${input.id} and workspace_id=${input.workspaceId}
+          and provider_profile_id is null and status in ('provisioning','error')
+        returning id
+      `;
+      if (rows.length !== 1)
+        throw new Error(
+          "Unprovisioned browser profile cleanup is unavailable.",
+        );
+      await this.#writeAuditEvent(tx, {
+        workspaceId: input.workspaceId,
+        actor: "system",
+        action: "browser.profile.unprovisioned_cleanup",
+        eventKey: `browser_profile:${input.id}:unprovisioned_cleanup`,
+        targetType: "browser_profile",
+        targetId: input.id,
+        detail: { providerAbsenceVerified: true },
+      });
+    });
+  }
+
+  async getBrowserProfileForManagement(input: {
+    id: string;
+    workspaceId: string;
+    configurationVersion?: number;
+  }): Promise<{
+    id: string;
+    provider: string;
+    providerProfileId: string;
+    label: string;
+    status: string;
+    configurationVersion: number;
+    allowedOrigins: readonly string[];
+  }> {
+    const [row] = await this.#sql<
+      {
+        id: string;
+        provider: string;
+        provider_profile_id: string | null;
+        label: string;
+        status: string;
+        configuration_version: string | number;
+        allowed_origins: string[];
+      }[]
+    >`
+      select p.id,p.provider,p.provider_profile_id,p.label,p.status,p.configuration_version,
+        coalesce(array_agg(o.origin order by o.origin) filter (where o.origin is not null), '{}') as allowed_origins
+      from public.browser_profiles p left join public.browser_profile_origins o
+        on o.profile_id=p.id and o.workspace_id=p.workspace_id
+      where p.id=${input.id} and p.workspace_id=${input.workspaceId}
+        and (${input.configurationVersion ?? null}::bigint is null
+          or p.configuration_version=${input.configurationVersion ?? null})
+      group by p.id
+    `;
+    if (!row?.provider_profile_id)
+      throw new Error("Browser profile is not provider-ready.");
+    return {
+      id: row.id,
+      provider: row.provider,
       providerProfileId: row.provider_profile_id,
       label: row.label,
+      status: row.status,
+      configurationVersion: Number(row.configuration_version),
+      allowedOrigins: row.allowed_origins,
+    };
+  }
+
+  async getBrowserProfileForRecovery(input: {
+    id: string;
+    workspaceId: string;
+  }): Promise<{
+    id: string;
+    provider: string;
+    providerProfileId?: string;
+    status: string;
+  }> {
+    const [row] = await this.#sql<
+      {
+        id: string;
+        provider: string;
+        provider_profile_id: string | null;
+        status: string;
+      }[]
+    >`
+      select id,provider,provider_profile_id,status
+      from public.browser_profiles
+      where id=${input.id} and workspace_id=${input.workspaceId}
+    `;
+    if (!row) throw new Error("Browser profile is unavailable.");
+    return {
+      id: row.id,
+      provider: row.provider,
+      ...(row.provider_profile_id
+        ? { providerProfileId: row.provider_profile_id }
+        : {}),
+      status: row.status,
+    };
+  }
+
+  async resolveActiveBrowserProfile(input: {
+    id: string;
+    workspaceId: string;
+    origin?: string;
+  }): Promise<string> {
+    const profile = await this.getBrowserProfileForManagement(input);
+    if (profile.status !== "active")
+      throw new Error("Browser profile requires owner attention.");
+    if (input.origin && !profile.allowedOrigins.includes(input.origin))
+      throw new Error("Browser profile is not authorized for this origin.");
+    return profile.providerProfileId;
+  }
+
+  async createBrowserControlSession(input: {
+    id: string;
+    profileId: string;
+    workspaceId: string;
+    providerSessionId: string;
+    purpose: "enrollment" | "reauthentication" | "health" | "takeover";
+    nonceHash: string;
+    configurationVersion: number;
+    expiresAt: string;
+  }): Promise<void> {
+    await this.#sql.begin(async (tx) => {
+      const rows = await tx`
+        insert into app_private.browser_control_sessions (
+          id,profile_id,workspace_id,provider_session_id,purpose,status,
+          takeover_nonce_hash,configuration_version,expires_at
+        ) select ${input.id},p.id,p.workspace_id,${input.providerSessionId},${input.purpose},
+          'active',${input.nonceHash},p.configuration_version,${new Date(input.expiresAt)}
+        from public.browser_profiles p where p.id=${input.profileId}
+          and p.workspace_id=${input.workspaceId}
+          and p.configuration_version=${input.configurationVersion}
+          and p.status in ('needs_login','needs_reauth')
+        returning id
+      `;
+      if (rows.length !== 1)
+        throw new Error("Browser control session could not be bound safely.");
+      await this.#writeAuditEvent(tx, {
+        workspaceId: input.workspaceId,
+        actor: "owner",
+        action: "browser.control.started",
+        eventKey: `browser_session:${input.id}:started`,
+        targetType: "browser_profile",
+        targetId: input.profileId,
+        detail: { purpose: input.purpose },
+      });
+    });
+  }
+
+  async getBrowserControlSession(input: {
+    nonceHash: string;
+    workspaceId: string;
+    allowCompleted?: boolean;
+  }): Promise<{
+    id: string;
+    profileId: string;
+    providerSessionId: string;
+    purpose: string;
+    status: "active" | "completed";
+    configurationVersion: number;
+    authenticationVerified?: boolean;
+    expiresAt: string;
+  }> {
+    const [row] = await this.#sql<
+      {
+        id: string;
+        profile_id: string;
+        provider_session_id: string;
+        purpose: string;
+        status: "active" | "completed";
+        configuration_version: string | number;
+        authentication_verified: boolean | null;
+        expires_at: Date;
+      }[]
+    >`
+      select s.id,s.profile_id,s.provider_session_id,s.purpose,s.status,
+        s.configuration_version,s.authentication_verified,s.expires_at
+      from app_private.browser_control_sessions s
+      join public.browser_profiles p on p.id=s.profile_id and p.workspace_id=s.workspace_id
+      where s.takeover_nonce_hash=${input.nonceHash} and s.workspace_id=${input.workspaceId}
+        and s.expires_at>now()
+        and (
+          (s.status='active' and p.status in ('needs_login','needs_reauth')
+            and p.configuration_version=s.configuration_version)
+          or (${input.allowCompleted ?? false} and s.status='completed')
+        )
+    `;
+    if (!row)
+      throw new Error(
+        "Browser takeover authorization is unavailable or expired.",
+      );
+    return {
+      id: row.id,
+      profileId: row.profile_id,
+      providerSessionId: row.provider_session_id,
+      purpose: row.purpose,
+      status: row.status,
+      configurationVersion: Number(row.configuration_version),
+      ...(row.authentication_verified === null
+        ? {}
+        : { authenticationVerified: row.authentication_verified }),
+      expiresAt: row.expires_at.toISOString(),
+    };
+  }
+
+  async recordBrowserTakeoverAccess(input: {
+    sessionId: string;
+    profileId: string;
+    workspaceId: string;
+  }): Promise<void> {
+    await this.#sql.begin(async (tx) => {
+      const rows = await tx`
+        update app_private.browser_control_sessions
+        set takeover_accessed_at=now()
+        where id=${input.sessionId} and profile_id=${input.profileId}
+          and workspace_id=${input.workspaceId} and status='active'
+          and expires_at>now() and takeover_accessed_at is null
+        returning id
+      `;
+      if (rows.length !== 1)
+        throw new Error("Browser takeover authorization changed.");
+      await this.#writeAuditEvent(tx, {
+        workspaceId: input.workspaceId,
+        actor: "owner",
+        action: "browser.takeover.accessed",
+        eventKey: `browser_session:${input.sessionId}:takeover:${randomUUID()}`,
+        targetType: "browser_profile",
+        targetId: input.profileId,
+        detail: {},
+      });
+    });
+  }
+
+  async listActiveBrowserControlSessions(input: {
+    profileId: string;
+    workspaceId: string;
+    beforeConfigurationVersion?: number;
+  }): Promise<readonly { id: string; providerSessionId: string }[]> {
+    const rows = await this.#sql<{ id: string; provider_session_id: string }[]>`
+      select id,provider_session_id from app_private.browser_control_sessions
+      where profile_id=${input.profileId} and workspace_id=${input.workspaceId}
+        and status in ('active','cleanup_pending')
+        and (${input.beforeConfigurationVersion ?? null}::bigint is null
+          or configuration_version<${input.beforeConfigurationVersion ?? null})`;
+    return rows.map((row) => ({
+      id: row.id,
+      providerSessionId: row.provider_session_id,
     }));
+  }
+
+  async listBrowserSessionsPendingCleanup(
+    limit = 20,
+  ): Promise<
+    readonly { id: string; workspaceId: string; providerSessionId: string }[]
+  > {
+    return this.#sql.begin(async (tx) => {
+      await tx`
+        update app_private.browser_control_sessions
+        set status='cleanup_pending'
+        where status='active' and expires_at<=now()
+      `;
+      const rows = await tx<
+        { id: string; workspace_id: string; provider_session_id: string }[]
+      >`
+        select id,workspace_id,provider_session_id
+        from app_private.browser_control_sessions
+        where status='cleanup_pending'
+        order by expires_at asc limit ${Math.min(Math.max(limit, 1), 100)}
+      `;
+      return rows.map((row) => ({
+        id: row.id,
+        workspaceId: row.workspace_id,
+        providerSessionId: row.provider_session_id,
+      }));
+    });
+  }
+
+  async closeBrowserControlSession(input: {
+    id: string;
+    workspaceId: string;
+    status?: "cleanup_pending" | "closed" | "failed" | "expired";
+  }): Promise<void> {
+    await this.#sql.begin(async (tx) => {
+      const status = input.status ?? "closed";
+      const rows = await tx`update app_private.browser_control_sessions
+        set status=${status},completed_at=case when ${status}='cleanup_pending' then null else now() end
+        where id=${input.id} and workspace_id=${input.workspaceId}
+          and status in ('active','cleanup_pending') returning profile_id,purpose
+      `;
+      const row = rows[0] as
+        | { profile_id: string; purpose: string }
+        | undefined;
+      if (!row) return;
+      await this.#writeAuditEvent(tx, {
+        workspaceId: input.workspaceId,
+        actor: "system",
+        action: "browser.control.closed",
+        eventKey: `browser_session:${input.id}:${status}`,
+        targetType: "browser_profile",
+        targetId: row.profile_id,
+        detail: { purpose: row.purpose, status },
+      });
+    });
+  }
+
+  async completeBrowserEnrollment(input: {
+    profileId: string;
+    workspaceId: string;
+    sessionId: string;
+    authenticated: boolean;
+  }): Promise<void> {
+    await this.#sql.begin(async (tx) => {
+      const [session] = await tx<{ configuration_version: string | number }[]>`
+        update app_private.browser_control_sessions s
+        set status='completed',completed_at=now(),authentication_verified=${input.authenticated}
+        where s.id=${input.sessionId} and s.profile_id=${input.profileId}
+          and s.workspace_id=${input.workspaceId} and s.status='active'
+          and s.expires_at>now()
+          and s.purpose in ('enrollment','reauthentication')
+          and exists (
+            select 1 from public.browser_profiles p
+            where p.id=s.profile_id and p.workspace_id=s.workspace_id
+              and p.configuration_version=s.configuration_version
+              and p.status in ('needs_login','needs_reauth')
+          )
+        returning s.configuration_version
+      `;
+      if (!session) throw new Error("Browser enrollment session changed.");
+      const profile = await tx`
+        update public.browser_profiles
+        set status=case
+            when ${input.authenticated} then 'active'
+            when status='needs_reauth' then 'needs_reauth'
+            else 'needs_login'
+          end,
+          last_health_checked_at=now(),
+          last_authenticated_at=case when ${input.authenticated} then now() else last_authenticated_at end,
+          last_error_code=${input.authenticated ? null : "authentication_unconfirmed"}
+        where id=${input.profileId} and workspace_id=${input.workspaceId}
+          and configuration_version=${Number(session.configuration_version)}
+          and status in ('needs_login','needs_reauth') returning id
+      `;
+      if (profile.length !== 1)
+        throw new Error("Browser profile enrollment state changed.");
+      await this.#writeAuditEvent(tx, {
+        workspaceId: input.workspaceId,
+        actor: "owner",
+        action: "browser.enrollment.completed",
+        eventKey: `browser_session:${input.sessionId}:completed`,
+        targetType: "browser_profile",
+        targetId: input.profileId,
+        detail: { authenticated: input.authenticated },
+      });
+    });
+  }
+
+  async failBrowserEnrollmentSession(input: {
+    sessionId: string;
+    profileId: string;
+    workspaceId: string;
+    configurationVersion: number;
+    providerClosed: boolean;
+    errorCode: string;
+  }): Promise<boolean> {
+    return this.#sql.begin(async (tx) => {
+      const rows = await tx`
+        update app_private.browser_control_sessions
+        set status=${input.providerClosed ? "failed" : "cleanup_pending"},
+          completed_at=${input.providerClosed ? new Date() : null}
+        where id=${input.sessionId} and profile_id=${input.profileId}
+          and workspace_id=${input.workspaceId}
+          and configuration_version=${input.configurationVersion}
+          and purpose in ('enrollment','reauthentication') and status='active'
+        returning id
+      `;
+      if (rows.length !== 1) return false;
+      await tx`
+        update public.browser_profiles
+        set status='error',last_error_code=${input.errorCode}
+        where id=${input.profileId} and workspace_id=${input.workspaceId}
+          and configuration_version=${input.configurationVersion}
+          and status in ('needs_login','needs_reauth')
+      `;
+      await this.#writeAuditEvent(tx, {
+        workspaceId: input.workspaceId,
+        actor: "system",
+        action: "browser.enrollment.failed",
+        eventKey: `browser_session:${input.sessionId}:failed`,
+        targetType: "browser_profile",
+        targetId: input.profileId,
+        detail: {
+          configurationVersion: input.configurationVersion,
+          cleanupPending: !input.providerClosed,
+          errorCode: input.errorCode,
+        },
+      });
+      return true;
+    });
+  }
+
+  async recordBrowserProfileHealth(input: {
+    id: string;
+    workspaceId: string;
+    healthy: boolean;
+    authenticated: boolean;
+    configurationVersion: number;
+    errorCode?: string;
+  }): Promise<void> {
+    await this.#sql.begin(async (tx) => {
+      const nextStatus = input.healthy
+        ? input.authenticated
+          ? "active"
+          : "needs_reauth"
+        : "error";
+      const rows = await tx`
+        update public.browser_profiles
+        set status=${nextStatus}, last_health_checked_at=now(),
+          last_authenticated_at=case when ${input.authenticated} then now() else last_authenticated_at end,
+          last_error_code=${input.errorCode ?? (input.authenticated ? null : "authentication_unconfirmed")}
+        where id=${input.id} and workspace_id=${input.workspaceId}
+          and configuration_version=${input.configurationVersion}
+          and status in ('active','needs_login','needs_reauth','error')
+        returning id
+      `;
+      if (rows.length !== 1)
+        throw new Error("Browser profile health state changed.");
+      await this.#writeAuditEvent(tx, {
+        workspaceId: input.workspaceId,
+        actor: "system",
+        action: "browser.profile.health_checked",
+        eventKey: `browser_profile:${input.id}:health:${randomUUID()}`,
+        targetType: "browser_profile",
+        targetId: input.id,
+        detail: {
+          healthy: input.healthy,
+          authenticated: input.authenticated,
+          errorCode: input.errorCode,
+        },
+      });
+    });
+  }
+
+  async revokeBrowserProfile(input: {
+    id: string;
+    workspaceId: string;
+  }): Promise<readonly { id: string; providerSessionId: string }[]> {
+    return this.#sql.begin(async (tx) => {
+      const rows = await tx`
+        update public.browser_profiles set status='revoked',revoked_at=coalesce(revoked_at,now()),
+          deletion_requested_at=coalesce(deletion_requested_at,now())
+        where id=${input.id} and workspace_id=${input.workspaceId}
+          and status in ('provisioning','needs_login','active','needs_reauth','error','revoked')
+        returning id
+      `;
+      if (rows.length !== 1)
+        throw new Error("Browser profile cannot be revoked.");
+      const sessions = await tx<{ id: string; provider_session_id: string }[]>`
+        update app_private.browser_control_sessions set status='cleanup_pending'
+        where profile_id=${input.id} and workspace_id=${input.workspaceId} and status='active'
+        returning id,provider_session_id
+      `;
+      await this.#writeAuditEvent(tx, {
+        workspaceId: input.workspaceId,
+        actor: "owner",
+        action: "browser.profile.revoked",
+        eventKey: `browser_profile:${input.id}:revoked`,
+        targetType: "browser_profile",
+        targetId: input.id,
+        detail: {},
+      });
+      return sessions.map((row) => ({
+        id: row.id,
+        providerSessionId: row.provider_session_id,
+      }));
+    });
+  }
+
+  async deleteVerifiedBrowserProfile(input: {
+    id: string;
+    workspaceId: string;
+  }): Promise<void> {
+    await this.#sql.begin(async (tx) => {
+      const rows = await tx<{ provider: string }[]>`
+        update public.browser_profiles set deletion_verified_at=now()
+        where id=${input.id} and workspace_id=${input.workspaceId} and status='revoked'
+          and deletion_requested_at is not null returning provider
+      `;
+      if (rows.length !== 1)
+        throw new Error("Browser profile deletion is not ready.");
+      const pending = await tx`
+        select id from app_private.browser_control_sessions
+        where profile_id=${input.id} and workspace_id=${input.workspaceId}
+          and status in ('active','cleanup_pending') limit 1
+      `;
+      if (pending.length)
+        throw new Error("Browser profile session cleanup is still pending.");
+      await this.#writeAuditEvent(tx, {
+        workspaceId: input.workspaceId,
+        actor: "owner",
+        action: "browser.profile.deletion_verified",
+        eventKey: `browser_profile:${input.id}:deletion_verified`,
+        targetType: "browser_profile",
+        targetId: input.id,
+        detail: { provider: rows[0]?.provider },
+      });
+      await tx`delete from public.browser_profiles where id=${input.id} and workspace_id=${input.workspaceId}`;
+    });
   }
 
   async createScheduledTrigger(input: {
