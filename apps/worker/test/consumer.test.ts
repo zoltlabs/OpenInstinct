@@ -13,20 +13,37 @@ describe("queue consumption", () => {
     };
     const store = {
       dispatchDueSchedules: vi.fn(async () => 0),
-      claimJobs: vi.fn(async () => [{ messageId: 7, readCount: 1, job }]),
+      enqueueAllPendingContinuations: vi.fn(async () => 0),
+      expireBrowserExecutionHandoffs: vi.fn(async () => 0),
+      recoverStaleBrowserExecutions: vi.fn(async () => 0),
+      claimJobs: vi.fn(async () => [
+        {
+          messageId: 7,
+          readCount: 1,
+          enqueuedAt: new Date().toISOString(),
+          job,
+        },
+      ]),
       failRun: vi.fn(async () => undefined),
       retryJob: vi.fn(async () => undefined),
       archiveJob: vi.fn(async () => undefined),
     } as unknown as OpenInstinctStore;
     const processor = {
       cleanupExpiredBrowserSessions: vi.fn(async () => undefined),
+      cleanupExpiredArtifacts: vi.fn(async () => undefined),
+      notifyPendingBrowserHandoffs: vi.fn(async () => undefined),
       process: vi.fn(async () => {
         throw new Error("provider unavailable");
       }),
     } as unknown as JobProcessor;
 
     await expect(consumeJobs({ store, processor })).resolves.toEqual([
-      { messageId: 7, status: "failed", error: "provider unavailable" },
+      {
+        messageId: 7,
+        status: "failed",
+        error: "provider unavailable",
+        queueLatencyMs: expect.any(Number),
+      },
     ]);
     expect(store.failRun).toHaveBeenCalledWith(
       job.runId,
@@ -46,13 +63,25 @@ describe("queue consumption", () => {
     };
     const store = {
       dispatchDueSchedules: vi.fn(async () => 0),
-      claimJobs: vi.fn(async () => [{ messageId: 8, readCount: 9, job }]),
+      enqueueAllPendingContinuations: vi.fn(async () => 0),
+      expireBrowserExecutionHandoffs: vi.fn(async () => 0),
+      recoverStaleBrowserExecutions: vi.fn(async () => 0),
+      claimJobs: vi.fn(async () => [
+        {
+          messageId: 8,
+          readCount: 9,
+          enqueuedAt: new Date().toISOString(),
+          job,
+        },
+      ]),
       failRun: vi.fn(async () => undefined),
       retryJob: vi.fn(async () => undefined),
       archiveJob: vi.fn(async () => undefined),
     } as unknown as OpenInstinctStore;
     const processor = {
       cleanupExpiredBrowserSessions: vi.fn(async () => undefined),
+      cleanupExpiredArtifacts: vi.fn(async () => undefined),
+      notifyPendingBrowserHandoffs: vi.fn(async () => undefined),
       process: vi.fn(async () => {
         throw new RunNotClaimableError("actively leased", true, 30);
       }),

@@ -11,6 +11,7 @@
     "test": "vitest run"
   },
   "dependencies": {
+    "@openinstinct/core": "workspace:*",
     "@onkernel/sdk": "0.96.0",
     "zod": "4.4.3"
   }

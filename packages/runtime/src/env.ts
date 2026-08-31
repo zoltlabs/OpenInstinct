@@ -75,6 +75,13 @@ export const environmentFieldSchemas = {
   INTERNAL_API_SECRET: z.string().min(32),
   CRON_SECRET: z.string().min(16),
   WORKER_URL: secureUrl,
+  WORKER_MODE: z.enum(["scheduled", "continuous"]),
+  WORKER_POLL_INTERVAL_MS: z.coerce.number().int().min(250).max(30_000),
+  INTERACTIVE_MAX_QUEUE_LATENCY_MS: z.coerce
+    .number()
+    .int()
+    .min(1_000)
+    .max(300_000),
 } as const;
 
 const serverEnvironmentBaseSchema = z.object({
@@ -115,6 +122,11 @@ const serverEnvironmentBaseSchema = z.object({
   INTERNAL_API_SECRET: environmentFieldSchemas.INTERNAL_API_SECRET,
   CRON_SECRET: environmentFieldSchemas.CRON_SECRET.optional(),
   WORKER_URL: optionalUrl,
+  WORKER_MODE: environmentFieldSchemas.WORKER_MODE.default("scheduled"),
+  WORKER_POLL_INTERVAL_MS:
+    environmentFieldSchemas.WORKER_POLL_INTERVAL_MS.default(1_000),
+  INTERACTIVE_MAX_QUEUE_LATENCY_MS:
+    environmentFieldSchemas.INTERACTIVE_MAX_QUEUE_LATENCY_MS.default(10_000),
 });
 
 function requireProviderConfiguration(

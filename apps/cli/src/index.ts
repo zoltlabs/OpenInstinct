@@ -278,6 +278,9 @@ const deployableEnvironmentNames = [
   "INTERNAL_API_SECRET",
   "CRON_SECRET",
   "WORKER_URL",
+  "WORKER_MODE",
+  "WORKER_POLL_INTERVAL_MS",
+  "INTERACTIVE_MAX_QUEUE_LATENCY_MS",
 ] as const;
 
 function addProviderEnvironmentNames(
@@ -411,6 +414,24 @@ export function checkEnvironment(input: {
     detail: kernelConfigured
       ? "profiles,reconnect,observation,screenshot,files,takeover,replay"
       : "not checked while provider is disabled",
+  });
+  const workerMode = input.values.WORKER_MODE ?? "scheduled";
+  const pollInterval = Number(input.values.WORKER_POLL_INTERVAL_MS ?? 1_000);
+  const maxInteractiveLatency = Number(
+    input.values.INTERACTIVE_MAX_QUEUE_LATENCY_MS ?? 10_000,
+  );
+  checks.push({
+    name: "browser:queue-latency",
+    ok:
+      !kernelConfigured ||
+      (workerMode === "continuous" &&
+        Number.isFinite(pollInterval) &&
+        pollInterval <= maxInteractiveLatency),
+    detail: !kernelConfigured
+      ? "not required while browser provider is disabled"
+      : workerMode === "continuous"
+        ? `continuous poll ${pollInterval}ms; interactive budget ${maxInteractiveLatency}ms`
+        : "scheduled consumption cannot satisfy interactive browser latency; use WORKER_MODE=continuous",
   });
   return checks;
 }

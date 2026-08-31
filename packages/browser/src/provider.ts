@@ -19,6 +19,9 @@ export const browserCapabilitySchema = z.object({
   fileTransfer: z.boolean(),
   humanTakeover: z.boolean(),
   replayControl: z.boolean(),
+  networkReadOnlyIsolation: z.boolean(),
+  sessionLookupByCorrelation: z.boolean(),
+  startIdempotency: z.boolean(),
   maxSessionSeconds: z.number().int().positive(),
 });
 export type BrowserCapabilities = z.infer<typeof browserCapabilitySchema>;
@@ -54,6 +57,7 @@ export interface BrowserObservation {
   readonly title: string;
   readonly text: string;
   readonly links: readonly { text: string; href: string }[];
+  readonly tabCount?: number;
 }
 
 export const browserInteractionSchema = z.discriminatedUnion("type", [
@@ -78,6 +82,7 @@ export const browserInteractionSchema = z.discriminatedUnion("type", [
     type: z.literal("wait"),
     milliseconds: z.number().int().min(0).max(5_000),
   }),
+  z.object({ type: z.literal("go_back") }),
   z.object({ type: z.literal("open_tab"), url: z.string().url().optional() }),
   z.object({
     type: z.literal("close_tab"),
@@ -128,7 +133,17 @@ export interface BrowserProvider {
       | "reauthentication"
       | "health"
       | "takeover";
+    correlationId?: string;
+    readOnly?: boolean;
   }): Promise<BrowserSession>;
+  findSessions(input: {
+    correlationId: string;
+    includeClosed?: boolean;
+  }): Promise<readonly BrowserSession[]>;
+  installReadOnlyGuards(
+    sessionId: string,
+    allowedOrigins: readonly string[],
+  ): Promise<{ installed: boolean; fullyIsolated: boolean }>;
   reconnectSession(sessionId: string): Promise<BrowserSession>;
   sessionHealth(sessionId: string): Promise<BrowserHealth>;
   checkpointSession(
@@ -145,6 +160,11 @@ export interface BrowserProvider {
     action: BrowserInteraction,
   ): Promise<BrowserActionResult>;
   screenshot(sessionId: string): Promise<Uint8Array>;
+  captureRedactedScreenshot(sessionId: string): Promise<{
+    bytes?: Uint8Array;
+    omittedReason?: string;
+    redactionVersion: string;
+  }>;
   uploadFile(
     sessionId: string,
     file: BrowserFile,

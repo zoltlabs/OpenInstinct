@@ -1,11 +1,23 @@
 import { randomUUID } from "node:crypto";
 import postgres, { type Sql } from "postgres";
 import {
+  artifactKindSchema,
+  artifactScanResultSchema,
+  artifactSensitivitySchema,
+  sanitizedArtifactName,
+  type ArtifactScanResult,
+} from "@openinstinct/artifacts";
+import {
   actionRequestSchema,
+  browserReadDecisionSchema,
+  browserReadObservationSchema,
+  canonicalBrowserReadUrl,
   normalizeJsonValue,
   payloadHash,
   structuredToolResultSchema,
   type ActionRequest,
+  type BrowserReadDecision,
+  type BrowserReadObservation,
   type RunEventType,
   type StructuredToolResult,
 } from "@openinstinct/core";
@@ -494,13 +506,36 @@ export class OpenInstinctStore {
 
   async claimJobs(limit = 5, visibilitySeconds = 120): Promise<ClaimedJob[]> {
     const rows = await this.#sql<
-      { msg_id: string | number; read_ct: number; message: unknown }[]
-    >`select msg_id, read_ct, message from pgmq.read('agent_jobs', ${visibilitySeconds}, ${limit})`;
+      {
+        msg_id: string | number;
+        read_ct: number;
+        enqueued_at: Date;
+        message: unknown;
+      }[]
+    >`select msg_id, read_ct, enqueued_at, message from pgmq.read('agent_jobs', ${visibilitySeconds}, ${limit})`;
     return rows.map((row) => ({
       messageId: Number(row.msg_id),
       readCount: row.read_ct,
+      enqueuedAt: row.enqueued_at.toISOString(),
       job: agentJobSchema.parse(row.message),
     }));
+  }
+
+  async recordWorkerHeartbeat(input: {
+    workerId: string;
+    jobsProcessed: number;
+    oldestQueueLatencyMs: number;
+  }): Promise<void> {
+    await this.#sql`
+      insert into app_private.worker_heartbeats (
+        worker_id,last_seen_at,last_poll_at,jobs_processed,oldest_queue_latency_ms
+      ) values (
+        ${input.workerId},now(),now(),${input.jobsProcessed},${Math.max(0, input.oldestQueueLatencyMs)}
+      ) on conflict (worker_id) do update set
+        last_seen_at=excluded.last_seen_at,last_poll_at=excluded.last_poll_at,
+        jobs_processed=app_private.worker_heartbeats.jobs_processed+excluded.jobs_processed,
+        oldest_queue_latency_ms=excluded.oldest_queue_latency_ms
+    `;
   }
 
   async archiveJob(messageId: number): Promise<void> {
@@ -1666,6 +1701,18 @@ export class OpenInstinctStore {
     });
   }
 
+  async enqueueAllPendingContinuations(limit = 100): Promise<number> {
+    const rows = await this.#sql<{ run_id: string }[]>`
+      select distinct run_id from public.tool_results
+      where continuation_status='pending'
+      order by run_id limit ${Math.min(Math.max(limit, 1), 500)}
+    `;
+    let enqueued = 0;
+    for (const row of rows)
+      enqueued += await this.enqueuePendingContinuations(row.run_id);
+    return enqueued;
+  }
+
   async isExecutionJobFinalized(actionId: string): Promise<boolean> {
     const [row] = await this.#sql<{ finalized: boolean }[]>`
       select exists (
@@ -2075,6 +2122,14 @@ export class OpenInstinctStore {
     workspaceId: string;
   }): Promise<number> {
     return this.#sql.begin(async (tx) => {
+      const activeExecution = await tx`
+        select id from public.browser_executions
+        where profile_id=${input.id} and workspace_id=${input.workspaceId}
+          and status in ('queued','running','waiting_owner','cleanup_pending')
+        limit 1 for update
+      `;
+      if (activeExecution.length)
+        throw new Error("Browser profile is owned by an active execution.");
       const [row] = await tx<{ configuration_version: string | number }[]>`
         update public.browser_profiles
         set status=case when status='needs_login' then 'needs_login' else 'needs_reauth' end,
@@ -2232,6 +2287,14 @@ export class OpenInstinctStore {
     expiresAt: string;
   }): Promise<void> {
     await this.#sql.begin(async (tx) => {
+      const activeExecution = await tx`
+        select id from public.browser_executions
+        where profile_id=${input.profileId} and workspace_id=${input.workspaceId}
+          and status in ('queued','running','waiting_owner','cleanup_pending')
+        limit 1 for update
+      `;
+      if (activeExecution.length)
+        throw new Error("Browser profile is owned by an active execution.");
       const rows = await tx`
         insert into app_private.browser_control_sessions (
           id,profile_id,workspace_id,provider_session_id,purpose,status,
@@ -2598,6 +2661,14 @@ export class OpenInstinctStore {
       `;
       if (rows.length !== 1)
         throw new Error("Browser profile deletion is not ready.");
+      const executions = await tx`
+        select id from public.browser_executions
+        where profile_id=${input.id} and workspace_id=${input.workspaceId}
+          and status in ('queued','running','waiting_owner','cleanup_pending')
+        limit 1
+      `;
+      if (executions.length)
+        throw new Error("Browser profile execution cleanup is still pending.");
       const pending = await tx`
         select id from app_private.browser_control_sessions
         where profile_id=${input.id} and workspace_id=${input.workspaceId}
@@ -2615,6 +2686,1437 @@ export class OpenInstinctStore {
         detail: { provider: rows[0]?.provider },
       });
       await tx`delete from public.browser_profiles where id=${input.id} and workspace_id=${input.workspaceId}`;
+    });
+  }
+
+  async createBrowserExecution(input: {
+    workspaceId: string;
+    runId: string;
+    claimToken: string;
+    goal: string;
+    startUrl: string;
+    allowedOrigins: readonly string[];
+    profileId?: string;
+    provider?: string;
+    maxSteps?: number;
+    maxDurationSeconds?: number;
+    maxCostUnits?: number;
+  }): Promise<{ executionId: string }> {
+    const startUrl = canonicalBrowserReadUrl(input.startUrl);
+    const allowedOrigins = [...new Set(input.allowedOrigins)].map((origin) => {
+      const parsed = new URL(origin);
+      if (parsed.protocol !== "https:" || parsed.origin !== origin)
+        throw new Error(
+          "Browser execution origins must be exact HTTPS origins.",
+        );
+      return origin;
+    });
+    if (!allowedOrigins.includes(startUrl.origin))
+      throw new Error("Browser start URL is outside the exact origin policy.");
+    if (!input.goal.trim() || input.goal.length > 8_000)
+      throw new Error("Browser research goal is outside the bounded size.");
+    const maxSteps = Math.min(Math.max(input.maxSteps ?? 12, 1), 50);
+    const maxDurationSeconds = Math.min(
+      Math.max(input.maxDurationSeconds ?? 600, 10),
+      3_600,
+    );
+    const maxCostUnits = Math.min(
+      Math.max(input.maxCostUnits ?? maxSteps, 1),
+      1_000,
+    );
+    return this.#sql.begin(async (tx) => {
+      const [run] = await tx<{ status: string }[]>`
+        select status from public.agent_runs
+        where id=${input.runId} and workspace_id=${input.workspaceId}
+          and claim_token=${input.claimToken} and status='running'
+        for update
+      `;
+      if (!run) throw new Error("Run cannot start browser research.");
+      let provider = input.provider ?? "kernel";
+      let profileConfigurationVersion: string | number | null = null;
+      if (input.profileId) {
+        const [profile] = await tx<
+          { provider: string; configuration_version: string | number }[]
+        >`
+          select p.provider,p.configuration_version from public.browser_profiles p
+          where p.id=${input.profileId} and p.workspace_id=${input.workspaceId}
+            and p.status='active' and p.provider_profile_id is not null
+            and not exists (
+              select 1 from app_private.browser_control_sessions cs
+              where cs.profile_id=p.id and cs.workspace_id=p.workspace_id
+                and cs.status in ('active','cleanup_pending')
+            )
+            and not exists (
+              select 1 from unnest(${allowedOrigins}::text[]) requested(origin)
+              where not exists (
+                select 1 from public.browser_profile_origins configured
+                where configured.profile_id=p.id and configured.workspace_id=p.workspace_id
+                  and configured.origin=requested.origin
+              )
+            )
+          for update
+        `;
+        if (!profile)
+          throw new Error(
+            "Browser profile is unavailable for the exact origin policy.",
+          );
+        provider = profile.provider;
+        profileConfigurationVersion = profile.configuration_version;
+      }
+      const [position] = await tx<{ next_position: number }[]>`
+        select coalesce(max(position),-1)+1 as next_position
+        from public.workflow_steps where run_id=${input.runId}
+      `;
+      const executionId = randomUUID();
+      const stepId = randomUUID();
+      const correlationId = randomUUID();
+      const mode = input.profileId
+        ? "persistent_read_only"
+        : "ephemeral_read_only";
+      const policy = {
+        mode,
+        allowedOrigins,
+        maxSteps,
+        maxDurationSeconds,
+        maxCostUnits,
+        actionSchema: "browser-read-v1",
+        redaction: "semantic-v1",
+      };
+      await tx`
+        insert into public.workflow_steps (
+          id,workspace_id,run_id,position,kind,tool_name,status,
+          execution_phase,input,input_hash,attempt,max_attempts,started_at
+        ) values (
+          ${stepId},${input.workspaceId},${input.runId},${position?.next_position ?? 0},
+          'tool','browser.research','running','invocation_started',
+          ${tx.json(toJson({ goal: input.goal, startUrl: startUrl.toString(), policy }))},
+          ${payloadHash({ goal: input.goal, startUrl: startUrl.toString(), policy })},1,1,now()
+        )
+      `;
+      await tx`
+        insert into public.browser_executions (
+          id,workspace_id,run_id,step_id,profile_id,profile_configuration_version,
+          mode,status,goal_hash,
+          policy_hash,max_steps,max_duration_seconds,max_cost_units
+        ) values (
+          ${executionId},${input.workspaceId},${input.runId},${stepId},
+          ${input.profileId ?? null},${profileConfigurationVersion},
+          ${mode},'queued',${payloadHash(input.goal)},
+          ${payloadHash(policy)},${maxSteps},${maxDurationSeconds},${maxCostUnits}
+        )
+      `;
+      await tx`
+        insert into app_private.browser_execution_handles (
+          execution_id,workspace_id,provider,correlation_id,allowed_origins,start_url,goal
+        ) values (
+          ${executionId},${input.workspaceId},${provider},${correlationId},
+          ${tx.json(toJson(allowedOrigins))},${startUrl.toString()},${input.goal.trim()}
+        )
+      `;
+      await tx`
+        insert into app_private.browser_execution_slices (
+          execution_id,workspace_id,ordinal,status
+        ) values (${executionId},${input.workspaceId},0,'queued')
+      `;
+      await tx`select pgmq.send('agent_jobs', ${tx.json(
+        toJson({
+          type: "browser_slice",
+          executionId,
+          workspaceId: input.workspaceId,
+        }),
+      )}::jsonb)`;
+      const updated = await tx`
+        update public.agent_runs set status='waiting_event',waiting_for=${executionId},
+          claim_token=null,lease_expires_at=null
+        where id=${input.runId} and workspace_id=${input.workspaceId}
+          and status='running' and claim_token=${input.claimToken}
+        returning id
+      `;
+      if (updated.length !== 1)
+        throw new Error("Run changed while browser research was queued.");
+      await this.#writeAuditEvent(tx, {
+        workspaceId: input.workspaceId,
+        actor: "worker",
+        action: "browser.execution.created",
+        eventKey: `browser_execution:${executionId}:created`,
+        targetType: "browser_execution",
+        targetId: executionId,
+        runId: input.runId,
+        stepId,
+        detail: { mode, policyHash: payloadHash(policy) },
+      });
+      return { executionId };
+    });
+  }
+
+  async claimBrowserExecutionSlice(input: {
+    executionId: string;
+    workspaceId: string;
+    claimToken: string;
+    leaseSeconds?: number;
+  }): Promise<
+    | {
+        executionId: string;
+        workspaceId: string;
+        runId: string;
+        stepId: string;
+        sliceId: string;
+        ordinal: number;
+        leaseEpoch: number;
+        mode: "ephemeral_read_only" | "persistent_read_only";
+        goal: string;
+        startUrl: string;
+        allowedOrigins: readonly string[];
+        provider: string;
+        correlationId: string;
+        providerSessionId?: string;
+        providerPhase: string;
+        profileId?: string;
+        providerProfileId?: string;
+        remainingSteps: number;
+        remainingCostUnits: number;
+        deadlineAt: string;
+      }
+    | undefined
+  > {
+    const leaseSeconds = Math.min(Math.max(input.leaseSeconds ?? 60, 10), 120);
+    return this.#sql.begin(async (tx) => {
+      const [row] = await tx<
+        {
+          run_id: string;
+          step_id: string;
+          profile_id: string | null;
+          profile_configuration_version: string | number | null;
+          mode: "ephemeral_read_only" | "persistent_read_only";
+          max_steps: number;
+          steps_completed: number;
+          max_duration_seconds: number;
+          max_cost_units: number;
+          cost_units_used: number;
+          started_at: Date | null;
+          provider: string;
+          correlation_id: string;
+          provider_session_id: string | null;
+          provider_phase: string;
+          lease_epoch: string | number;
+          lease_token_hash: string | null;
+          lease_expires_at: Date | null;
+          allowed_origins: string[];
+          start_url: string;
+          goal: string;
+          provider_profile_id: string | null;
+        }[]
+      >`
+        select e.run_id,e.step_id,e.profile_id,e.profile_configuration_version,
+          e.mode,e.max_steps,e.steps_completed,
+          e.max_duration_seconds,e.max_cost_units,e.cost_units_used,e.started_at,h.provider,h.correlation_id,
+          h.provider_session_id,h.provider_phase,h.lease_epoch,h.lease_token_hash,
+          h.lease_expires_at,h.allowed_origins,h.start_url,h.goal,p.provider_profile_id
+        from public.browser_executions e
+        join app_private.browser_execution_handles h on h.execution_id=e.id
+          and h.workspace_id=e.workspace_id
+        left join public.browser_profiles p on p.id=e.profile_id and p.workspace_id=e.workspace_id
+        where e.id=${input.executionId} and e.workspace_id=${input.workspaceId}
+          and e.status in ('queued','running')
+          and e.steps_completed < e.max_steps
+          and (h.lease_expires_at is null or h.lease_expires_at<=now())
+          and (
+            e.profile_id is null or (
+              p.status='active'
+              and p.configuration_version=e.profile_configuration_version
+              and p.provider_profile_id is not null
+            )
+          )
+        for update of e,h
+      `;
+      if (!row) return;
+      const [slice] = await tx<
+        { id: string; ordinal: number; cost_reserved: boolean }[]
+      >`
+        select id,ordinal,cost_reserved from app_private.browser_execution_slices
+        where execution_id=${input.executionId} and workspace_id=${input.workspaceId}
+          and status in ('queued','claimed','observation_recorded')
+        order by ordinal asc limit 1 for update
+      `;
+      if (!slice) return;
+      const nextEpoch = Number(row.lease_epoch) + 1;
+      if (!slice.cost_reserved) {
+        const reserved = await tx`
+          update public.browser_executions
+          set cost_units_used=cost_units_used+1
+          where id=${input.executionId} and workspace_id=${input.workspaceId}
+            and cost_units_used < max_cost_units
+          returning id
+        `;
+        if (reserved.length !== 1) return;
+      }
+      await tx`
+        update app_private.browser_execution_handles
+        set lease_epoch=${nextEpoch},lease_token_hash=${payloadHash(input.claimToken)},
+          lease_expires_at=now()+make_interval(secs=>${leaseSeconds}),controller='worker'
+        where execution_id=${input.executionId} and workspace_id=${input.workspaceId}
+      `;
+      await tx`
+        update app_private.browser_execution_slices
+        set status='claimed',lease_epoch=${nextEpoch},started_at=coalesce(started_at,now()),
+          cost_reserved=true,
+          redacted_observation=null,observation_hash=null,decision=null,
+          decision_hash=null,action_hash=null,result_hash=null
+        where id=${slice.id}
+      `;
+      const [execution] = await tx<{ started_at: Date }[]>`
+        update public.browser_executions set status='running',started_at=coalesce(started_at,now())
+        where id=${input.executionId} returning started_at
+      `;
+      if (!execution) return;
+      return {
+        executionId: input.executionId,
+        workspaceId: input.workspaceId,
+        runId: row.run_id,
+        stepId: row.step_id,
+        sliceId: slice.id,
+        ordinal: slice.ordinal,
+        leaseEpoch: nextEpoch,
+        mode: row.mode,
+        goal: row.goal,
+        startUrl: row.start_url,
+        allowedOrigins: row.allowed_origins,
+        provider: row.provider,
+        correlationId: row.correlation_id,
+        ...(row.provider_session_id
+          ? { providerSessionId: row.provider_session_id }
+          : {}),
+        providerPhase: row.provider_phase,
+        ...(row.profile_id ? { profileId: row.profile_id } : {}),
+        ...(row.provider_profile_id
+          ? { providerProfileId: row.provider_profile_id }
+          : {}),
+        remainingSteps: row.max_steps - row.steps_completed,
+        remainingCostUnits:
+          row.max_cost_units -
+          row.cost_units_used -
+          (slice.cost_reserved ? 0 : 1),
+        deadlineAt: new Date(
+          execution.started_at.getTime() + row.max_duration_seconds * 1_000,
+        ).toISOString(),
+      };
+    });
+  }
+
+  async renewBrowserExecutionLease(input: {
+    executionId: string;
+    workspaceId: string;
+    claimToken: string;
+    leaseEpoch: number;
+    leaseSeconds?: number;
+  }): Promise<void> {
+    const leaseSeconds = Math.min(Math.max(input.leaseSeconds ?? 60, 10), 120);
+    const updated = await this.#sql`
+      update app_private.browser_execution_handles
+      set lease_expires_at=now()+make_interval(secs=>${leaseSeconds})
+      where execution_id=${input.executionId} and workspace_id=${input.workspaceId}
+        and lease_epoch=${input.leaseEpoch}
+        and lease_token_hash=${payloadHash(input.claimToken)}
+        and lease_expires_at>now()
+        and provider_phase not in ('cleanup_requested','deleted','cleanup_unknown')
+      returning execution_id
+    `;
+    if (updated.length !== 1)
+      throw new Error("Browser execution lease was lost.");
+  }
+
+  async validateBrowserSliceAction(input: {
+    executionId: string;
+    workspaceId: string;
+    sliceId: string;
+    claimToken: string;
+    leaseEpoch: number;
+    decision: Extract<BrowserReadDecision, { type: "act" }>;
+    actionHash: string;
+  }): Promise<void> {
+    const decision = browserReadDecisionSchema.parse(input.decision);
+    const updated = await this.#sql`
+      update app_private.browser_execution_slices s
+      set status='action_validated',decision=${this.#sql.json(toJson(decision))},
+        decision_hash=${payloadHash(decision)},action_hash=${input.actionHash}
+      where s.id=${input.sliceId} and s.execution_id=${input.executionId}
+        and s.workspace_id=${input.workspaceId} and s.status='observation_recorded'
+        and s.lease_epoch=${input.leaseEpoch}
+        and exists (
+          select 1 from app_private.browser_execution_handles h
+          where h.execution_id=s.execution_id and h.workspace_id=s.workspace_id
+            and h.lease_epoch=${input.leaseEpoch}
+            and h.lease_token_hash=${payloadHash(input.claimToken)}
+            and h.lease_expires_at>now()
+        ) returning id
+    `;
+    if (updated.length !== 1)
+      throw new Error("Browser action validation fence was lost.");
+  }
+
+  async markBrowserSliceInvocationStarted(input: {
+    executionId: string;
+    workspaceId: string;
+    sliceId: string;
+    claimToken: string;
+    leaseEpoch: number;
+    actionHash: string;
+  }): Promise<void> {
+    const updated = await this.#sql`
+      update app_private.browser_execution_slices s set status='invocation_started'
+      where s.id=${input.sliceId} and s.execution_id=${input.executionId}
+        and s.workspace_id=${input.workspaceId} and s.status='action_validated'
+        and s.action_hash=${input.actionHash} and s.lease_epoch=${input.leaseEpoch}
+        and exists (
+          select 1 from app_private.browser_execution_handles h
+          where h.execution_id=s.execution_id and h.workspace_id=s.workspace_id
+            and h.lease_epoch=${input.leaseEpoch}
+            and h.lease_token_hash=${payloadHash(input.claimToken)}
+            and h.lease_expires_at>now()
+        ) returning id
+    `;
+    if (updated.length !== 1)
+      throw new Error("Browser invocation fence was lost.");
+  }
+
+  async markBrowserSliceInvocationUnknown(input: {
+    executionId: string;
+    workspaceId: string;
+    sliceId: string;
+    claimToken: string;
+    leaseEpoch: number;
+    errorCode: string;
+  }): Promise<void> {
+    await this.#sql.begin(async (tx) => {
+      const updated = await tx`
+        update app_private.browser_execution_slices s
+        set status='unknown',last_error_code=${input.errorCode},completed_at=now()
+        where s.id=${input.sliceId} and s.execution_id=${input.executionId}
+          and s.workspace_id=${input.workspaceId} and s.status='invocation_started'
+          and s.lease_epoch=${input.leaseEpoch}
+          and exists (
+            select 1 from app_private.browser_execution_handles h
+            where h.execution_id=s.execution_id and h.workspace_id=s.workspace_id
+              and h.lease_epoch=${input.leaseEpoch}
+              and h.lease_token_hash=${payloadHash(input.claimToken)}
+          ) returning id
+      `;
+      if (updated.length !== 1)
+        throw new Error("Browser unknown-outcome fence was lost.");
+      await tx`
+        update public.browser_executions set status='cleanup_pending',last_error_code=${input.errorCode}
+        where id=${input.executionId} and workspace_id=${input.workspaceId}
+          and status='running'
+      `;
+      await tx`
+        update app_private.browser_execution_handles
+        set provider_phase='cleanup_requested',lease_token_hash=null,
+          lease_expires_at=null,controller=null
+        where execution_id=${input.executionId} and workspace_id=${input.workspaceId}
+          and lease_epoch=${input.leaseEpoch}
+      `;
+      await tx`select pgmq.send('agent_jobs', ${tx.json(
+        toJson({
+          type: "browser_cleanup",
+          executionId: input.executionId,
+          workspaceId: input.workspaceId,
+        }),
+      )}::jsonb)`;
+    });
+  }
+
+  async requestBrowserExecutionCleanup(input: {
+    executionId: string;
+    workspaceId: string;
+    sliceId: string;
+    claimToken: string;
+    leaseEpoch: number;
+    errorCode: string;
+  }): Promise<void> {
+    await this.#sql.begin(async (tx) => {
+      const slice = await tx`
+        update app_private.browser_execution_slices s
+        set status='failed',last_error_code=${input.errorCode},completed_at=now()
+        where s.id=${input.sliceId} and s.execution_id=${input.executionId}
+          and s.workspace_id=${input.workspaceId}
+          and s.status in ('claimed','observation_recorded','action_validated')
+          and s.lease_epoch=${input.leaseEpoch}
+          and exists (
+            select 1 from app_private.browser_execution_handles h
+            where h.execution_id=s.execution_id and h.workspace_id=s.workspace_id
+              and h.lease_epoch=${input.leaseEpoch}
+              and h.lease_token_hash=${payloadHash(input.claimToken)}
+          ) returning id
+      `;
+      if (slice.length !== 1) return;
+      await tx`
+        update public.browser_executions
+        set status='cleanup_pending',last_error_code=${input.errorCode}
+        where id=${input.executionId} and workspace_id=${input.workspaceId}
+          and status='running'
+      `;
+      await tx`
+        update app_private.browser_execution_handles
+        set provider_phase='cleanup_requested',lease_token_hash=null,
+          lease_expires_at=null,controller=null
+        where execution_id=${input.executionId} and workspace_id=${input.workspaceId}
+      `;
+      await tx`select pgmq.send('agent_jobs', ${tx.json(
+        toJson({
+          type: "browser_cleanup",
+          executionId: input.executionId,
+          workspaceId: input.workspaceId,
+        }),
+      )}::jsonb)`;
+    });
+  }
+
+  async claimBrowserExecutionCleanup(input: {
+    executionId: string;
+    workspaceId: string;
+    claimToken: string;
+    leaseSeconds?: number;
+  }): Promise<
+    | {
+        executionId: string;
+        workspaceId: string;
+        correlationId: string;
+        providerSessionId?: string;
+        leaseEpoch: number;
+        summary?: string;
+        errorCode?: string;
+        unknown: boolean;
+      }
+    | undefined
+  > {
+    const leaseSeconds = Math.min(Math.max(input.leaseSeconds ?? 60, 10), 120);
+    return this.#sql.begin(async (tx) => {
+      const [row] = await tx<
+        {
+          correlation_id: string;
+          provider_session_id: string | null;
+          lease_epoch: string | number;
+          lease_expires_at: Date | null;
+          last_error_code: string | null;
+          summary: string | null;
+        }[]
+      >`
+        select h.correlation_id,h.provider_session_id,h.lease_epoch,h.lease_expires_at,
+          e.last_error_code,
+          (select s.decision->>'summary' from app_private.browser_execution_slices s
+            where s.execution_id=e.id and s.workspace_id=e.workspace_id
+            order by s.ordinal desc limit 1) as summary
+        from app_private.browser_execution_handles h
+        join public.browser_executions e on e.id=h.execution_id and e.workspace_id=h.workspace_id
+        where h.execution_id=${input.executionId} and h.workspace_id=${input.workspaceId}
+          and e.status='cleanup_pending'
+          and h.provider_phase in ('cleanup_requested','cleanup_unknown','deleted')
+          and (h.lease_expires_at is null or h.lease_expires_at<=now())
+        for update of h,e
+      `;
+      if (!row) return;
+      const leaseEpoch = Number(row.lease_epoch) + 1;
+      await tx`
+        update app_private.browser_execution_handles
+        set lease_epoch=${leaseEpoch},lease_token_hash=${payloadHash(input.claimToken)},
+          lease_expires_at=now()+make_interval(secs=>${leaseSeconds}),controller='cleanup'
+        where execution_id=${input.executionId} and workspace_id=${input.workspaceId}
+      `;
+      return {
+        executionId: input.executionId,
+        workspaceId: input.workspaceId,
+        correlationId: row.correlation_id,
+        ...(row.provider_session_id
+          ? { providerSessionId: row.provider_session_id }
+          : {}),
+        leaseEpoch,
+        ...(row.summary ? { summary: row.summary } : {}),
+        ...(row.last_error_code ? { errorCode: row.last_error_code } : {}),
+        unknown: row.last_error_code === "provider_action_outcome_unknown",
+      };
+    });
+  }
+
+  async bindBrowserExecutionSession(input: {
+    executionId: string;
+    workspaceId: string;
+    claimToken: string;
+    leaseEpoch: number;
+    providerSessionId: string;
+    sessionExpiresAt: string;
+    guardsInstalled: boolean;
+  }): Promise<void> {
+    const updated = await this.#sql`
+      update app_private.browser_execution_handles
+      set provider_session_id=${input.providerSessionId},
+        session_expires_at=${new Date(input.sessionExpiresAt)},
+        provider_phase=${input.guardsInstalled ? "guards_installed" : "session_bound"}
+      where execution_id=${input.executionId} and workspace_id=${input.workspaceId}
+        and lease_epoch=${input.leaseEpoch}
+        and lease_token_hash=${payloadHash(input.claimToken)}
+        and lease_expires_at>now()
+        and provider_phase in ('not_started','start_requested','session_bound','guards_installed')
+      returning execution_id
+    `;
+    if (updated.length !== 1)
+      throw new Error("Browser execution lease was lost.");
+  }
+
+  async recordBrowserSliceObservation(input: {
+    executionId: string;
+    workspaceId: string;
+    sliceId: string;
+    claimToken: string;
+    leaseEpoch: number;
+    observation: BrowserReadObservation;
+  }): Promise<void> {
+    const observation = browserReadObservationSchema.parse(input.observation);
+    const updated = await this.#sql`
+      update app_private.browser_execution_slices s
+      set status='observation_recorded',observation_hash=${observation.hash},
+        redacted_observation=${this.#sql.json(toJson(observation))}
+      where s.id=${input.sliceId} and s.execution_id=${input.executionId}
+        and s.workspace_id=${input.workspaceId} and s.status='claimed'
+        and s.lease_epoch=${input.leaseEpoch}
+        and exists (
+          select 1 from app_private.browser_execution_handles h
+          where h.execution_id=s.execution_id and h.workspace_id=s.workspace_id
+            and h.lease_epoch=${input.leaseEpoch}
+            and h.lease_token_hash=${payloadHash(input.claimToken)}
+            and h.lease_expires_at>now()
+        ) returning id
+    `;
+    if (updated.length !== 1)
+      throw new Error("Browser observation fence was lost.");
+  }
+
+  async markBrowserBootstrapInvocationStarted(input: {
+    executionId: string;
+    workspaceId: string;
+    sliceId: string;
+    claimToken: string;
+    leaseEpoch: number;
+    actionHash: string;
+  }): Promise<void> {
+    const updated = await this.#sql`
+      update app_private.browser_execution_slices s
+      set status='invocation_started',action_hash=${input.actionHash}
+      where s.id=${input.sliceId} and s.execution_id=${input.executionId}
+        and s.workspace_id=${input.workspaceId} and s.status='claimed'
+        and s.lease_epoch=${input.leaseEpoch}
+        and exists (
+          select 1 from app_private.browser_execution_handles h
+          where h.execution_id=s.execution_id and h.workspace_id=s.workspace_id
+            and h.lease_epoch=${input.leaseEpoch}
+            and h.lease_token_hash=${payloadHash(input.claimToken)}
+            and h.lease_expires_at>now() and h.provider_phase='guards_installed'
+        ) returning id
+    `;
+    if (updated.length !== 1)
+      throw new Error("Browser bootstrap invocation fence was lost.");
+  }
+
+  async completeBrowserBootstrapInvocation(input: {
+    executionId: string;
+    workspaceId: string;
+    sliceId: string;
+    claimToken: string;
+    leaseEpoch: number;
+    actionHash: string;
+    resultHash: string;
+  }): Promise<void> {
+    const updated = await this.#sql`
+      update app_private.browser_execution_slices s
+      set status='claimed',result_hash=${input.resultHash}
+      where s.id=${input.sliceId} and s.execution_id=${input.executionId}
+        and s.workspace_id=${input.workspaceId} and s.status='invocation_started'
+        and s.action_hash=${input.actionHash} and s.lease_epoch=${input.leaseEpoch}
+        and exists (
+          select 1 from app_private.browser_execution_handles h
+          where h.execution_id=s.execution_id and h.workspace_id=s.workspace_id
+            and h.lease_epoch=${input.leaseEpoch}
+            and h.lease_token_hash=${payloadHash(input.claimToken)}
+            and h.lease_expires_at>now()
+        ) returning id
+    `;
+    if (updated.length !== 1)
+      throw new Error("Browser bootstrap result fence was lost.");
+  }
+
+  async abortBrowserExecutionSlice(input: {
+    executionId: string;
+    workspaceId: string;
+    sliceId: string;
+    claimToken: string;
+    leaseEpoch: number;
+    decision: Exclude<BrowserReadDecision, { type: "act" }>;
+    errorCode: string;
+  }): Promise<void> {
+    const decision = browserReadDecisionSchema.parse(input.decision);
+    const updated = await this.#sql`
+      update app_private.browser_execution_slices s
+      set status='failed',decision=${this.#sql.json(toJson(decision))},
+        decision_hash=${payloadHash(decision)},last_error_code=${input.errorCode},
+        completed_at=now()
+      where s.id=${input.sliceId} and s.execution_id=${input.executionId}
+        and s.workspace_id=${input.workspaceId} and s.status='claimed'
+        and s.lease_epoch=${input.leaseEpoch}
+        and exists (
+          select 1 from app_private.browser_execution_handles h
+          where h.execution_id=s.execution_id and h.workspace_id=s.workspace_id
+            and h.lease_epoch=${input.leaseEpoch}
+            and h.lease_token_hash=${payloadHash(input.claimToken)}
+            and h.lease_expires_at>now()
+        ) returning id
+    `;
+    if (updated.length !== 1) throw new Error("Browser abort fence was lost.");
+  }
+
+  async completeBrowserExecutionSlice(input: {
+    executionId: string;
+    workspaceId: string;
+    sliceId: string;
+    claimToken: string;
+    leaseEpoch: number;
+    decision: BrowserReadDecision;
+    actionHash?: string;
+    resultHash?: string;
+  }): Promise<{ nextQueued: boolean; exhausted: boolean }> {
+    const decision = browserReadDecisionSchema.parse(input.decision);
+    return this.#sql.begin(async (tx) => {
+      const [slice] = await tx<{ ordinal: number }[]>`
+        update app_private.browser_execution_slices s
+        set status='completed',decision=${tx.json(toJson(decision))},
+          decision_hash=${payloadHash(decision)},action_hash=${input.actionHash ?? null},
+          result_hash=${input.resultHash ?? null},completed_at=now()
+        where s.id=${input.sliceId} and s.execution_id=${input.executionId}
+          and s.workspace_id=${input.workspaceId}
+          and s.status=${decision.type === "act" ? "invocation_started" : "observation_recorded"}
+          and s.lease_epoch=${input.leaseEpoch}
+          and exists (
+            select 1 from app_private.browser_execution_handles h
+            where h.execution_id=s.execution_id and h.workspace_id=s.workspace_id
+              and h.lease_epoch=${input.leaseEpoch}
+              and h.lease_token_hash=${payloadHash(input.claimToken)}
+              and h.lease_expires_at>now()
+          ) returning ordinal
+      `;
+      if (!slice) throw new Error("Browser action fence was lost.");
+      const [execution] = await tx<
+        {
+          steps_completed: number;
+          max_steps: number;
+          cost_units_used: number;
+          max_cost_units: number;
+        }[]
+      >`
+        update public.browser_executions
+        set steps_completed=steps_completed+1
+        where id=${input.executionId} and workspace_id=${input.workspaceId}
+          and status='running'
+        returning steps_completed,max_steps,cost_units_used,max_cost_units
+      `;
+      if (!execution) throw new Error("Browser execution state changed.");
+      const exhausted =
+        execution.steps_completed >= execution.max_steps ||
+        execution.cost_units_used >= execution.max_cost_units;
+      const shouldQueue = decision.type === "act" && !exhausted;
+      if (shouldQueue) {
+        await tx`
+          insert into app_private.browser_execution_slices (
+            execution_id,workspace_id,ordinal,status
+          ) values (${input.executionId},${input.workspaceId},${slice.ordinal + 1},'queued')
+        `;
+        await tx`select pgmq.send('agent_jobs', ${tx.json(
+          toJson({
+            type: "browser_slice",
+            executionId: input.executionId,
+            workspaceId: input.workspaceId,
+          }),
+        )}::jsonb)`;
+      }
+      if (shouldQueue)
+        await tx`
+          update app_private.browser_execution_handles
+          set lease_token_hash=null,lease_expires_at=null,controller=null
+          where execution_id=${input.executionId} and workspace_id=${input.workspaceId}
+            and lease_epoch=${input.leaseEpoch}
+            and lease_token_hash=${payloadHash(input.claimToken)}
+        `;
+      return { nextQueued: shouldQueue, exhausted };
+    });
+  }
+
+  async requestBrowserExecutionHandoff(input: {
+    handoffId: string;
+    executionId: string;
+    workspaceId: string;
+    sliceId: string;
+    claimToken: string;
+    leaseEpoch: number;
+    decision: Extract<BrowserReadDecision, { type: "request_owner_takeover" }>;
+    providerSessionId: string;
+    reasonCode: string;
+    expiresAt: string;
+  }): Promise<void> {
+    const decision = browserReadDecisionSchema.parse(input.decision);
+    await this.#sql.begin(async (tx) => {
+      const [slice] = await tx<{ ordinal: number }[]>`
+        update app_private.browser_execution_slices s
+        set status='completed',decision=${tx.json(toJson(decision))},
+          decision_hash=${payloadHash(decision)},completed_at=now()
+        where s.id=${input.sliceId} and s.execution_id=${input.executionId}
+          and s.workspace_id=${input.workspaceId}
+          and s.status in ('claimed','observation_recorded')
+          and s.lease_epoch=${input.leaseEpoch}
+          and exists (
+            select 1 from app_private.browser_execution_handles h
+            where h.execution_id=s.execution_id and h.workspace_id=s.workspace_id
+              and h.provider_session_id=${input.providerSessionId}
+              and h.lease_epoch=${input.leaseEpoch}
+              and h.lease_token_hash=${payloadHash(input.claimToken)}
+              and h.lease_expires_at>now()
+          ) returning ordinal
+      `;
+      if (!slice) throw new Error("Browser handoff fence was lost.");
+      const execution = await tx`
+        update public.browser_executions
+        set status='waiting_owner',steps_completed=steps_completed+1,
+          last_error_code=${input.reasonCode}
+        where id=${input.executionId} and workspace_id=${input.workspaceId}
+          and status='running' returning id
+      `;
+      if (execution.length !== 1)
+        throw new Error("Browser handoff execution state changed.");
+      await tx`
+        insert into public.browser_handoffs (
+          id,workspace_id,execution_id,status,reason_code,expires_at
+        ) values (
+          ${input.handoffId},${input.workspaceId},${input.executionId},'requested',
+          ${input.reasonCode},${new Date(input.expiresAt)}
+        )
+      `;
+      await tx`
+        insert into app_private.browser_handoff_handles (
+          handoff_id,workspace_id,provider_session_id
+        ) values (${input.handoffId},${input.workspaceId},${input.providerSessionId})
+      `;
+      await tx`
+        update app_private.browser_execution_handles
+        set lease_token_hash=null,lease_expires_at=null,controller='owner'
+        where execution_id=${input.executionId} and workspace_id=${input.workspaceId}
+          and lease_epoch=${input.leaseEpoch}
+      `;
+      await this.#writeAuditEvent(tx, {
+        workspaceId: input.workspaceId,
+        actor: "worker",
+        action: "browser.handoff.requested",
+        eventKey: `browser_handoff:${input.handoffId}:requested`,
+        targetType: "browser_execution",
+        targetId: input.executionId,
+        detail: { reasonCode: input.reasonCode },
+      });
+    });
+  }
+
+  async accessBrowserExecutionHandoff(input: {
+    handoffId: string;
+    workspaceId: string;
+  }): Promise<{ providerSessionId: string }> {
+    return this.#sql.begin(async (tx) => {
+      const [row] = await tx<{ provider_session_id: string }[]>`
+        select hh.provider_session_id
+        from public.browser_handoffs bh
+        join app_private.browser_handoff_handles hh
+          on hh.handoff_id=bh.id and hh.workspace_id=bh.workspace_id
+        where bh.id=${input.handoffId} and bh.workspace_id=${input.workspaceId}
+          and bh.status in ('requested','active') and bh.expires_at>now()
+          and hh.access_count<20
+        for update of bh,hh
+      `;
+      if (!row) throw new Error("Browser handoff is unavailable.");
+      await tx`
+        update public.browser_handoffs set status='active',
+          first_accessed_at=coalesce(first_accessed_at,now())
+        where id=${input.handoffId} and workspace_id=${input.workspaceId}
+      `;
+      await tx`
+        update app_private.browser_handoff_handles
+        set access_count=access_count+1,last_accessed_at=now()
+        where handoff_id=${input.handoffId} and workspace_id=${input.workspaceId}
+      `;
+      return { providerSessionId: row.provider_session_id };
+    });
+  }
+
+  async listPendingBrowserHandoffNotifications(
+    limit = 20,
+  ): Promise<readonly { id: string; workspaceId: string }[]> {
+    const rows = await this.#sql<{ id: string; workspace_id: string }[]>`
+      select bh.id,bh.workspace_id from public.browser_handoffs bh
+      join app_private.browser_handoff_handles hh
+        on hh.handoff_id=bh.id and hh.workspace_id=bh.workspace_id
+      where bh.status in ('requested','active') and bh.expires_at>now()
+        and hh.notification_status='pending' and hh.notification_attempts<100
+      order by bh.created_at asc limit ${Math.min(Math.max(limit, 1), 100)}
+    `;
+    return rows.map((row) => ({ id: row.id, workspaceId: row.workspace_id }));
+  }
+
+  async markBrowserHandoffNotificationSent(input: {
+    handoffId: string;
+    workspaceId: string;
+  }): Promise<void> {
+    await this.#sql`
+      update app_private.browser_handoff_handles
+      set notification_status='sent',notification_attempts=notification_attempts+1,
+        notification_sent_at=now()
+      where handoff_id=${input.handoffId} and workspace_id=${input.workspaceId}
+        and notification_status='pending'
+    `;
+  }
+
+  async recordBrowserHandoffNotificationFailure(input: {
+    handoffId: string;
+    workspaceId: string;
+  }): Promise<void> {
+    await this.#sql`
+      update app_private.browser_handoff_handles
+      set notification_attempts=least(notification_attempts+1,100)
+      where handoff_id=${input.handoffId} and workspace_id=${input.workspaceId}
+        and notification_status='pending'
+    `;
+  }
+
+  async completeBrowserExecutionHandoff(input: {
+    handoffId: string;
+    workspaceId: string;
+  }): Promise<void> {
+    await this.#sql.begin(async (tx) => {
+      const [handoff] = await tx<
+        { execution_id: string; reason_code: string }[]
+      >`
+        update public.browser_handoffs set status='completed',completed_at=now()
+        where id=${input.handoffId} and workspace_id=${input.workspaceId}
+          and status in ('requested','active') and expires_at>now()
+        returning execution_id,reason_code
+      `;
+      if (!handoff) throw new Error("Browser handoff cannot be completed.");
+      const [execution] = await tx<
+        {
+          steps_completed: number;
+          max_steps: number;
+          cost_units_used: number;
+          max_cost_units: number;
+        }[]
+      >`
+        select steps_completed,max_steps,cost_units_used,max_cost_units
+        from public.browser_executions
+        where id=${handoff.execution_id} and workspace_id=${input.workspaceId}
+          and status='waiting_owner' for update
+      `;
+      if (!execution) throw new Error("Browser handoff execution changed.");
+      const cannotResume =
+        handoff.reason_code === "provider_read_only_isolation_unavailable" ||
+        execution.steps_completed >= execution.max_steps ||
+        execution.cost_units_used >= execution.max_cost_units;
+      if (cannotResume) {
+        await tx`
+          update public.browser_executions
+          set status='cleanup_pending',
+            last_error_code=case
+              when ${handoff.reason_code}='provider_read_only_isolation_unavailable' then null
+              else 'browser_budget_exhausted_after_handoff'
+            end
+          where id=${handoff.execution_id} and workspace_id=${input.workspaceId}
+            and status='waiting_owner'
+        `;
+        await tx`
+          update app_private.browser_execution_handles
+          set provider_phase='cleanup_requested',controller=null,
+            lease_token_hash=null,lease_expires_at=null
+          where execution_id=${handoff.execution_id} and workspace_id=${input.workspaceId}
+        `;
+        await tx`select pgmq.send('agent_jobs', ${tx.json(
+          toJson({
+            type: "browser_cleanup",
+            executionId: handoff.execution_id,
+            workspaceId: input.workspaceId,
+          }),
+        )}::jsonb)`;
+        return;
+      }
+      const [ordinal] = await tx<{ ordinal: number }[]>`
+        select coalesce(max(ordinal),-1)::integer as ordinal
+        from app_private.browser_execution_slices
+        where execution_id=${handoff.execution_id} and workspace_id=${input.workspaceId}
+      `;
+      await tx`
+        insert into app_private.browser_execution_slices (
+          execution_id,workspace_id,ordinal,status
+        ) values (
+          ${handoff.execution_id},${input.workspaceId},${(ordinal?.ordinal ?? -1) + 1},'queued'
+        )
+      `;
+      await tx`
+        update public.browser_executions set status='queued',last_error_code=null
+        where id=${handoff.execution_id} and workspace_id=${input.workspaceId}
+          and status='waiting_owner'
+      `;
+      await tx`
+        update app_private.browser_execution_handles set controller=null
+        where execution_id=${handoff.execution_id} and workspace_id=${input.workspaceId}
+          and controller='owner'
+      `;
+      await tx`select pgmq.send('agent_jobs', ${tx.json(
+        toJson({
+          type: "browser_slice",
+          executionId: handoff.execution_id,
+          workspaceId: input.workspaceId,
+        }),
+      )}::jsonb)`;
+    });
+  }
+
+  async expireBrowserExecutionHandoffs(limit = 50): Promise<number> {
+    return this.#sql.begin(async (tx) => {
+      const rows = await tx<
+        { id: string; execution_id: string; workspace_id: string }[]
+      >`
+        select id,execution_id,workspace_id from public.browser_handoffs
+        where status in ('requested','active') and expires_at<=now()
+        order by expires_at asc limit ${Math.min(Math.max(limit, 1), 200)}
+        for update skip locked
+      `;
+      for (const row of rows) {
+        await tx`
+          update public.browser_handoffs set status='expired'
+          where id=${row.id} and status in ('requested','active')
+        `;
+        await tx`
+          update public.browser_executions
+          set status='cleanup_pending',last_error_code='owner_handoff_expired'
+          where id=${row.execution_id} and workspace_id=${row.workspace_id}
+            and status='waiting_owner'
+        `;
+        await tx`
+          update app_private.browser_execution_handles
+          set provider_phase='cleanup_requested',controller=null,
+            lease_token_hash=null,lease_expires_at=null
+          where execution_id=${row.execution_id} and workspace_id=${row.workspace_id}
+        `;
+        await tx`select pgmq.send('agent_jobs', ${tx.json(
+          toJson({
+            type: "browser_cleanup",
+            executionId: row.execution_id,
+            workspaceId: row.workspace_id,
+          }),
+        )}::jsonb)`;
+      }
+      return rows.length;
+    });
+  }
+
+  async recoverStaleBrowserExecutions(limit = 100): Promise<number> {
+    return this.#sql.begin(async (tx) => {
+      const validated = await tx`
+        update app_private.browser_execution_slices s
+        set status='observation_recorded',decision=null,decision_hash=null,action_hash=null
+        from app_private.browser_execution_handles h
+        where s.execution_id=h.execution_id and s.workspace_id=h.workspace_id
+          and s.status='action_validated'
+          and (h.lease_expires_at is null or h.lease_expires_at<=now())
+      `;
+      const unknown = await tx<
+        { execution_id: string; workspace_id: string }[]
+      >`
+        update app_private.browser_execution_slices s
+        set status='unknown',last_error_code='provider_action_outcome_unknown',
+          completed_at=coalesce(completed_at,now())
+        from app_private.browser_execution_handles h
+        where s.execution_id=h.execution_id and s.workspace_id=h.workspace_id
+          and s.status='invocation_started'
+          and (h.lease_expires_at is null or h.lease_expires_at<=now())
+        returning s.execution_id,s.workspace_id
+      `;
+      for (const row of unknown)
+        await tx`
+          update public.browser_executions
+          set status='cleanup_pending',last_error_code='provider_action_outcome_unknown'
+          where id=${row.execution_id} and workspace_id=${row.workspace_id}
+            and status='running'
+        `;
+      await tx`
+        update public.browser_executions e
+        set status='cleanup_pending',
+          last_error_code=coalesce(e.last_error_code,'browser_cleanup_recovered')
+        from app_private.browser_execution_handles h
+        where h.execution_id=e.id and h.workspace_id=e.workspace_id
+          and e.status='running'
+          and (h.lease_expires_at is null or h.lease_expires_at<=now())
+          and not exists (
+            select 1 from app_private.browser_execution_slices s
+            where s.execution_id=e.id and s.workspace_id=e.workspace_id
+              and s.status in (
+                'queued','claimed','observation_recorded','action_validated','invocation_started'
+              )
+          )
+      `;
+      await tx`
+        update app_private.browser_execution_handles h
+        set provider_phase=case
+              when h.provider_phase='deleted' then 'deleted'
+              else 'cleanup_requested'
+            end,
+          lease_token_hash=null,lease_expires_at=null,controller=null
+        from public.browser_executions e
+        where e.id=h.execution_id and e.workspace_id=h.workspace_id
+          and e.status='cleanup_pending'
+          and (h.lease_expires_at is null or h.lease_expires_at<=now())
+      `;
+      const pending = await tx<{ id: string; workspace_id: string }[]>`
+        select e.id,e.workspace_id from public.browser_executions e
+        join app_private.browser_execution_handles h
+          on h.execution_id=e.id and h.workspace_id=e.workspace_id
+        where e.status='cleanup_pending'
+          and (h.lease_expires_at is null or h.lease_expires_at<=now())
+        order by e.updated_at asc limit ${Math.min(Math.max(limit, 1), 500)}
+      `;
+      for (const row of pending)
+        await tx`select pgmq.send('agent_jobs', ${tx.json(
+          toJson({
+            type: "browser_cleanup",
+            executionId: row.id,
+            workspaceId: row.workspace_id,
+          }),
+        )}::jsonb)`;
+      return validated.count + unknown.length + pending.length;
+    });
+  }
+
+  async finishBrowserExecution(input: {
+    executionId: string;
+    workspaceId: string;
+    claimToken: string;
+    leaseEpoch: number;
+    summary?: string;
+    errorCode?: string;
+    unknown?: boolean;
+  }): Promise<void> {
+    await this.#sql.begin(async (tx) => {
+      const [execution] = await tx<
+        {
+          run_id: string;
+          step_id: string;
+          started_at: Date;
+        }[]
+      >`
+        update public.browser_executions e
+        set status=${input.unknown ? "unknown" : input.errorCode ? "failed" : "completed"},
+          last_error_code=${input.errorCode ?? null},
+          completed_at=now()
+        where e.id=${input.executionId} and e.workspace_id=${input.workspaceId}
+          and e.status in ('running','cleanup_pending')
+          and exists (
+            select 1 from app_private.browser_execution_handles h
+            where h.execution_id=e.id and h.workspace_id=e.workspace_id
+              and h.lease_epoch=${input.leaseEpoch}
+              and h.lease_token_hash=${payloadHash(input.claimToken)}
+              and h.lease_expires_at>now()
+              and h.provider_phase='deleted'
+          ) returning run_id,step_id,started_at
+      `;
+      if (!execution) throw new Error("Browser completion fence was lost.");
+      await tx`
+        update public.agent_runs set status='running'
+        where id=${execution.run_id} and workspace_id=${input.workspaceId}
+          and status='waiting_event' and waiting_for=${input.executionId}
+      `;
+      const output = input.errorCode
+        ? { status: "failed", errorCode: input.errorCode }
+        : {
+            status: "completed",
+            summary: input.summary ?? "Research completed.",
+          };
+      const result = structuredToolResultSchema.parse({
+        id: randomUUID(),
+        workspaceId: input.workspaceId,
+        runId: execution.run_id,
+        stepId: execution.step_id,
+        toolName: "browser.research",
+        certainty: input.unknown
+          ? "unknown"
+          : input.errorCode
+            ? "failed_before_effect"
+            : "succeeded",
+        attempt: 1,
+        output,
+        outputHash: payloadHash(output),
+        errorCode: input.errorCode,
+        retryEligible: false,
+        startedAt: execution.started_at.toISOString(),
+        completedAt: new Date().toISOString(),
+      });
+      await this.#persistToolResultProjection(tx, result);
+      await tx`
+        update app_private.browser_execution_handles
+        set lease_token_hash=null,lease_expires_at=null,controller=null
+        where execution_id=${input.executionId}
+      `;
+    });
+    await this.enqueuePendingContinuations(
+      (
+        await this.#sql<{ run_id: string }[]>`
+          select run_id from public.browser_executions where id=${input.executionId}
+        `
+      )[0]!.run_id,
+    );
+  }
+
+  async markBrowserExecutionSessionDeleted(input: {
+    executionId: string;
+    workspaceId: string;
+    claimToken: string;
+    leaseEpoch: number;
+  }): Promise<void> {
+    const updated = await this.#sql`
+      update app_private.browser_execution_handles
+      set provider_phase='deleted'
+      where execution_id=${input.executionId} and workspace_id=${input.workspaceId}
+        and lease_epoch=${input.leaseEpoch}
+        and lease_token_hash=${payloadHash(input.claimToken)}
+        and lease_expires_at>now() returning execution_id
+    `;
+    if (updated.length !== 1)
+      throw new Error("Browser cleanup fence was lost.");
+  }
+
+  async reserveArtifact(input: {
+    id: string;
+    workspaceId: string;
+    browserExecutionId?: string;
+    stepId?: string;
+    kind: string;
+    sensitivity: string;
+    displayName: string;
+    declaredMimeType: string;
+    uploadToken: string;
+  }): Promise<"reserved" | "available" | "rejected"> {
+    const kind = artifactKindSchema.parse(input.kind);
+    const sensitivity = artifactSensitivitySchema.parse(input.sensitivity);
+    const displayName = sanitizedArtifactName(input.displayName);
+    return this.#sql.begin(async (tx) => {
+      const [artifact] = await tx<{ state: string }[]>`
+        insert into public.artifacts (
+          id,workspace_id,browser_execution_id,step_id,kind,sensitivity,state,
+          display_name,declared_mime_type
+        ) values (
+          ${input.id},${input.workspaceId},${input.browserExecutionId ?? null},
+          ${input.stepId ?? null},${kind},${sensitivity},'pending_upload',
+          ${displayName},${input.declaredMimeType}
+        ) on conflict (id) do update set id=excluded.id
+        where artifacts.workspace_id=excluded.workspace_id
+          and artifacts.browser_execution_id is not distinct from excluded.browser_execution_id
+          and artifacts.step_id is not distinct from excluded.step_id
+          and artifacts.kind=excluded.kind and artifacts.sensitivity=excluded.sensitivity
+          and artifacts.display_name=excluded.display_name
+          and artifacts.declared_mime_type=excluded.declared_mime_type
+          and artifacts.state in ('pending_upload','quarantined','scanning','available','rejected')
+        returning state
+      `;
+      if (!artifact)
+        throw new Error(
+          "Artifact reservation conflicts with existing metadata.",
+        );
+      if (artifact.state === "available" || artifact.state === "rejected")
+        return artifact.state;
+      const lease = await tx`
+        insert into app_private.artifact_ingest_leases (
+          artifact_id,workspace_id,lease_token_hash,lease_expires_at
+        ) values (
+          ${input.id},${input.workspaceId},${payloadHash(input.uploadToken)},
+          now()+interval '5 minutes'
+        ) on conflict (artifact_id) do update
+          set lease_token_hash=excluded.lease_token_hash,
+            lease_expires_at=excluded.lease_expires_at,updated_at=now()
+          where artifact_ingest_leases.lease_expires_at<=now()
+        returning artifact_id
+      `;
+      if (lease.length !== 1)
+        throw new Error("Artifact upload is already leased.");
+      return "reserved";
+    });
+  }
+
+  async bindArtifactLocation(input: {
+    id: string;
+    workspaceId: string;
+    bucketId: "openinstinct-quarantine" | "openinstinct-artifacts";
+    storageKey: string;
+    etag?: string;
+    sizeBytes: number;
+    sha256: string;
+    uploadToken: string;
+  }): Promise<void> {
+    await this.#sql.begin(async (tx) => {
+      await tx`
+        insert into app_private.artifact_locations (
+          artifact_id,workspace_id,bucket_id,storage_key,etag
+        ) values (
+          ${input.id},${input.workspaceId},${input.bucketId},${input.storageKey},
+          ${input.etag ?? null}
+        ) on conflict (artifact_id) do update set artifact_id=excluded.artifact_id
+        where artifact_locations.workspace_id=excluded.workspace_id
+          and artifact_locations.bucket_id=excluded.bucket_id
+          and artifact_locations.storage_key=excluded.storage_key
+      `;
+      const updated = await tx`
+        update public.artifacts set state='quarantined',size_bytes=${input.sizeBytes},
+          sha256=${input.sha256}
+        where id=${input.id} and workspace_id=${input.workspaceId}
+          and state in ('pending_upload','quarantined','scanning')
+          and (sha256 is null or sha256=${input.sha256})
+          and (size_bytes is null or size_bytes=${input.sizeBytes})
+          and exists (
+            select 1 from app_private.artifact_ingest_leases l
+            where l.artifact_id=public.artifacts.id
+              and l.workspace_id=public.artifacts.workspace_id
+              and l.lease_token_hash=${payloadHash(input.uploadToken)}
+              and l.lease_expires_at>now()
+          ) returning id
+      `;
+      if (updated.length !== 1)
+        throw new Error("Artifact upload binding state changed.");
+      await tx`
+        delete from app_private.artifact_ingest_leases
+        where artifact_id=${input.id} and workspace_id=${input.workspaceId}
+          and lease_token_hash=${payloadHash(input.uploadToken)}
+      `;
+    });
+  }
+
+  async completeArtifactScan(input: {
+    id: string;
+    workspaceId: string;
+    result: ArtifactScanResult;
+    detectedMimeType?: string;
+    redactionStatus?: "redacted" | "withheld" | "not_applicable";
+    redactionVersion?: string;
+  }): Promise<void> {
+    const result = artifactScanResultSchema.parse(input.result);
+    const clean = result.verdict === "clean";
+    const updated = await this.#sql`
+      update public.artifacts
+      set state=${clean ? "available" : "rejected"},scan_verdict=${result.verdict},
+        scan_version=${result.scannerVersion},scan_code=${result.safeCode ?? null},
+        detected_mime_type=${input.detectedMimeType ?? null},
+        redaction_status=${input.redactionStatus ?? null},
+        redaction_version=${input.redactionVersion ?? null},
+        available_at=case when ${clean} then now() else null end
+      where id=${input.id} and workspace_id=${input.workspaceId}
+        and (
+          state in ('quarantined','scanning') or (
+            state=${clean ? "available" : "rejected"}
+            and scan_verdict=${result.verdict}
+            and scan_version=${result.scannerVersion}
+          )
+        ) returning id
+    `;
+    if (updated.length !== 1) throw new Error("Artifact scan state changed.");
+  }
+
+  async getArtifactLocationForDeletion(input: {
+    id: string;
+    workspaceId: string;
+  }): Promise<{ storageKey: string; bucketId: string }> {
+    const [row] = await this.#sql<
+      {
+        storage_key: string | null;
+        bucket_id: string | null;
+      }[]
+    >`
+      update public.artifacts set state='deletion_pending',
+        deletion_requested_at=coalesce(deletion_requested_at,now())
+      where id=${input.id} and workspace_id=${input.workspaceId}
+        and (
+          state <> 'deleted'
+          or (deletion_recheck_until>now() and next_deletion_check_at<=now())
+        )
+        and not exists (
+          select 1 from app_private.artifact_ingest_leases il
+          where il.artifact_id=public.artifacts.id
+            and il.workspace_id=public.artifacts.workspace_id
+            and il.lease_expires_at>now()
+        )
+      returning (
+        select storage_key from app_private.artifact_locations l
+        where l.artifact_id=public.artifacts.id and l.workspace_id=public.artifacts.workspace_id
+      ) as storage_key, (
+        select bucket_id from app_private.artifact_locations l
+        where l.artifact_id=public.artifacts.id and l.workspace_id=public.artifacts.workspace_id
+      ) as bucket_id
+    `;
+    if (!row) throw new Error("Artifact is unavailable for deletion.");
+    return {
+      storageKey: row.storage_key ?? `${input.workspaceId}/${input.id}/content`,
+      bucketId: row.bucket_id ?? "openinstinct-quarantine",
+    };
+  }
+
+  async listArtifactsPendingCleanup(
+    limit = 50,
+  ): Promise<readonly { id: string; workspaceId: string }[]> {
+    const rows = await this.#sql<{ id: string; workspace_id: string }[]>`
+      select a.id,a.workspace_id from public.artifacts a
+      where (
+        a.state in ('rejected','deletion_pending','deletion_unknown')
+        or (a.state='available' and a.retention_expires_at<=now())
+        or (a.state in ('pending_upload','quarantined','scanning')
+          and a.created_at<=now()-interval '15 minutes')
+        or (a.state='deleted' and a.deletion_recheck_until>now()
+          and a.next_deletion_check_at<=now())
+      )
+      and not exists (
+        select 1 from app_private.artifact_ingest_leases il
+        where il.artifact_id=a.id and il.workspace_id=a.workspace_id
+          and il.lease_expires_at>now()
+      )
+      order by a.retention_expires_at asc
+      limit ${Math.min(Math.max(limit, 1), 200)}
+    `;
+    return rows.map((row) => ({ id: row.id, workspaceId: row.workspace_id }));
+  }
+
+  async completeArtifactDeletion(input: {
+    id: string;
+    workspaceId: string;
+    verified: boolean;
+  }): Promise<void> {
+    await this.#sql.begin(async (tx) => {
+      const updated = await tx`
+        update public.artifacts
+        set state=${input.verified ? "deleted" : "deletion_unknown"},
+          deletion_verified_at=case when ${input.verified} then now() else null end,
+          deletion_recheck_until=case when ${input.verified}
+            then coalesce(deletion_recheck_until,now()+interval '24 hours')
+            else deletion_recheck_until end,
+          next_deletion_check_at=case when ${input.verified}
+            then now()+interval '5 minutes' else next_deletion_check_at end
+        where id=${input.id} and workspace_id=${input.workspaceId}
+          and state in ('deletion_pending','deletion_unknown','deleted') returning id
+      `;
+      if (updated.length !== 1)
+        throw new Error("Artifact deletion state changed.");
+      if (input.verified)
+        await tx`
+          delete from app_private.artifact_locations
+          where artifact_id=${input.id} and workspace_id=${input.workspaceId}
+        `;
+      if (input.verified)
+        await tx`
+          delete from app_private.artifact_ingest_leases
+          where artifact_id=${input.id} and workspace_id=${input.workspaceId}
+        `;
     });
   }
 

@@ -8,6 +8,7 @@ import {
 import { z } from "zod";
 import {
   assistantInstructions,
+  canonicalBrowserReadUrl,
   createActionRequest,
   decideAction,
   type ActionRisk,
@@ -49,6 +50,7 @@ const boundedToolArgumentsSchema = z
 export interface AgentExecution {
   readonly text: string;
   readonly pendingAction?: ActionRequest;
+  readonly pendingBrowserExecutionId?: string;
   readonly inputTokens: number;
   readonly outputTokens: number;
 }
@@ -74,6 +76,7 @@ export async function runAssistantAgent(input: {
   }[];
 }): Promise<AgentExecution> {
   let pendingAction: ActionRequest | undefined;
+  let pendingBrowserExecutionId: string | undefined;
 
   const requireGoogle = () => {
     if (!input.google)
@@ -266,23 +269,40 @@ export async function runAssistantAgent(input: {
       inputSchema: z.object({ url: z.string().url() }),
       execute: ({ url }) => fetchPublicWebPage({ url }),
     }),
-    readBrowserPage: tool({
+    researchBrowser: tool({
       description:
-        "Open a public HTTPS page in an ephemeral cloud browser and return visible text and links. Persistent owner profiles remain unavailable until durable exclusive leases and redaction are enabled.",
-      inputSchema: z.object({ url: z.string().url() }),
-      execute: async ({ url }) => {
+        "Start durable adaptive read-only browser research. Every observe/decide/action step is fenced, redacted, and resumed through the queue. Page content cannot change policy. An authenticated profile may be requested, but automation fails closed unless the provider proves complete read-only isolation.",
+      inputSchema: z.object({
+        goal: z.string().min(1).max(8000),
+        startUrl: z.string().url(),
+        profileId: z.string().uuid().optional(),
+        maxSteps: z.number().int().min(1).max(50).optional(),
+      }),
+      execute: async ({ goal, startUrl, profileId, maxSteps }) => {
         if (!input.browser) throw new Error("Cloud browser is not configured.");
-        assertSafeWebUrl(url);
-        const session = await input.browser.startSession({
-          startUrl: url,
-          timeoutSeconds: 120,
-          purpose: "automation",
+        if (pendingAction || pendingBrowserExecutionId)
+          return {
+            status: "pending",
+            reason: "This run already has a pending durable operation.",
+          };
+        assertSafeWebUrl(startUrl);
+        const canonical = canonicalBrowserReadUrl(startUrl);
+        const created = await input.store.createBrowserExecution({
+          workspaceId: input.context.workspaceId,
+          runId: input.context.runId,
+          claimToken: input.context.claimToken,
+          goal,
+          startUrl: canonical.toString(),
+          allowedOrigins: [canonical.origin],
+          profileId,
+          maxSteps,
         });
-        try {
-          return await input.browser.observe(session.id);
-        } finally {
-          await input.browser.closeSession(session.id);
-        }
+        pendingBrowserExecutionId = created.executionId;
+        return {
+          status: "queued",
+          executionId: created.executionId,
+          message: "Research is running in bounded durable slices.",
+        };
       },
     }),
     listBrowserProfiles: tool({
@@ -433,8 +453,13 @@ export async function runAssistantAgent(input: {
   return {
     text:
       result.text ||
-      (pendingAction ? "I prepared that action for your approval." : "Done."),
+      (pendingAction
+        ? "I prepared that action for your approval."
+        : pendingBrowserExecutionId
+          ? "I started the browser research and will continue when it finishes."
+          : "Done."),
     pendingAction,
+    pendingBrowserExecutionId,
     inputTokens: result.totalUsage.inputTokens ?? 0,
     outputTokens: result.totalUsage.outputTokens ?? 0,
   };
@@ -485,7 +510,7 @@ export function modelSafeExecutionResults(
       ? { reconcilesResultId: result.reconcilesResultId }
       : {}),
     output:
-      result.toolName === "mcp.call" || result.toolName === "browser.run"
+      result.toolName === "mcp.call" || result.toolName === "browser.research"
         ? "[untrusted provider payload omitted from model context]"
         : sanitize(result.output),
   }));

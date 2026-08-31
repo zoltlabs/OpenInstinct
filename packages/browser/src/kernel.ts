@@ -23,6 +23,7 @@ const observationSchema = z.object({
   links: z
     .array(z.object({ text: z.string().max(1_000), href: z.string().url() }))
     .max(100),
+  tabCount: z.number().int().min(1).max(100).default(1),
 });
 
 export class KernelBrowserProvider implements BrowserProvider {
@@ -42,6 +43,9 @@ export class KernelBrowserProvider implements BrowserProvider {
       fileTransfer: true,
       humanTakeover: true,
       replayControl: true,
+      networkReadOnlyIsolation: false,
+      sessionLookupByCorrelation: true,
+      startIdempotency: true,
       maxSessionSeconds: 259_200,
     });
   }
@@ -104,23 +108,94 @@ export class KernelBrowserProvider implements BrowserProvider {
       | "reauthentication"
       | "health"
       | "takeover";
+    correlationId?: string;
+    readOnly?: boolean;
   }): Promise<BrowserSession> {
     const timeout = Math.min(
       Math.max(input.timeoutSeconds ?? 900, 10),
       259_200,
     );
     const browser = await this.#client.browsers.create({
-      start_url: input.startUrl,
+      start_url: input.readOnly ? "about:blank" : input.startUrl,
       headless: false,
       stealth: true,
       telemetry: { enabled: false },
       timeout_seconds: timeout,
+      ...(input.correlationId
+        ? {
+            invocation_id: input.correlationId,
+            name: `openinstinct-${input.correlationId}`,
+          }
+        : {}),
+      ...(input.readOnly ? { network: { private_hosts: [] } } : {}),
       profile: input.profileId
-        ? { id: input.profileId, save_changes: true }
+        ? { id: input.profileId, save_changes: !input.readOnly }
         : undefined,
-      tags: { purpose: input.purpose },
+      tags: {
+        purpose: input.purpose,
+        ...(input.correlationId
+          ? { openinstinct_correlation: input.correlationId }
+          : {}),
+        ...(input.readOnly ? { openinstinct_read_only: "true" } : {}),
+      },
     });
     return safeSession(browser, timeout);
+  }
+  async findSessions(input: {
+    correlationId: string;
+    includeClosed?: boolean;
+  }): Promise<readonly BrowserSession[]> {
+    const sessions: BrowserSession[] = [];
+    for await (const browser of this.#client.browsers.list({
+      limit: 100,
+      status: input.includeClosed ? "all" : "active",
+      tags: { openinstinct_correlation: input.correlationId },
+    })) {
+      sessions.push(safeSession(browser, browser.timeout_seconds));
+      if (sessions.length >= 100) break;
+    }
+    return sessions;
+  }
+  async installReadOnlyGuards(
+    sessionId: string,
+    rawAllowedOrigins: readonly string[],
+  ): Promise<{ installed: boolean; fullyIsolated: boolean }> {
+    const allowedOrigins = rawAllowedOrigins.map((value) => {
+      const url = new URL(value);
+      if (url.protocol !== "https:" || url.origin !== value)
+        throw new Error(
+          "Read-only browser origins must be exact HTTPS origins.",
+        );
+      return url.origin;
+    });
+    const encodedOrigins = JSON.stringify([
+      ...new Set(allowedOrigins),
+    ]).replaceAll("<", "\\u003c");
+    await this.#executeFixed(
+      sessionId,
+      `const allowed=new Set(${encodedOrigins});
+await page.context().route("**/*", async route => {
+  const request=route.request();
+  let target;
+  try { target=new URL(request.url()); } catch { await route.abort("blockedbyclient"); return; }
+  const method=request.method().toUpperCase();
+  if(!allowed.has(target.origin) || !["GET","HEAD","OPTIONS"].includes(method)) { await route.abort("blockedbyclient"); return; }
+  await route.continue();
+});
+await page.context().addInitScript(() => {
+  const blocked=() => { throw new Error("Blocked by OpenInstinct read-only policy"); };
+  Object.defineProperty(navigator,"sendBeacon",{value:() => false,configurable:false});
+  Object.defineProperty(navigator,"serviceWorker",{value:undefined,configurable:false});
+  Object.defineProperty(window,"WebSocket",{value:class { constructor(){ blocked(); } },configurable:false});
+  Object.defineProperty(window,"EventSource",{value:class { constructor(){ blocked(); } },configurable:false});
+  Object.defineProperty(window,"open",{value:blocked,configurable:false});
+});
+return { installed:true };`,
+    );
+    // Playwright routing and page-level guards cannot prove coverage for every
+    // browser/network path (notably existing service workers), so callers must
+    // never treat this adapter as strong isolation for authenticated profiles.
+    return { installed: true, fullyIsolated: false };
   }
   async reconnectSession(sessionId: string): Promise<BrowserSession> {
     const browser = await this.#client.browsers.retrieve(sessionId);
@@ -160,7 +235,7 @@ export class KernelBrowserProvider implements BrowserProvider {
     return observationSchema.parse(
       await this.#executeFixed(
         sessionId,
-        `return { url: page.url(), title: (await page.title()).slice(0, 2000), text: (await page.locator("body").innerText()).slice(0, 20000), links: await page.locator("a[href]").evaluateAll(nodes => nodes.slice(0,100).map(node => ({ text: (node.textContent || "").trim().slice(0,1000), href: node.href }))) };`,
+        `return { url: page.url(), title: (await page.title()).slice(0, 2000), text: (await page.locator("body").innerText()).slice(0, 20000), links: await page.locator("a[href]").evaluateAll(nodes => nodes.slice(0,100).map(node => ({ text: (node.textContent || "").trim().slice(0,1000), href: node.href }))), tabCount: page.context().pages().length };`,
       ),
     );
   }
@@ -195,6 +270,7 @@ else if(action.type==="select") await page.locator(action.selector).selectOption
 else if(action.type==="scroll") await page.mouse.wheel(0,action.deltaY);
 else if(action.type==="press_key") await page.keyboard.press(action.key);
 else if(action.type==="wait") await page.waitForTimeout(action.milliseconds);
+else if(action.type==="go_back") await page.goBack({waitUntil:"domcontentloaded"});
 else if(action.type==="open_tab") { const p=await page.context().newPage(); if(action.url) await p.goto(action.url,{waitUntil:"domcontentloaded"}); }
 else if(action.type==="close_tab") { const pages=page.context().pages(); if(pages[action.index]) await pages[action.index].close(); }
 else if(action.type==="switch_tab") { const pages=page.context().pages(); if(!pages[action.index]) throw new Error("Tab is unavailable"); await pages[action.index].bringToFront(); }
@@ -216,6 +292,18 @@ return { completed:true, url:page.url(), title:(await page.title()).slice(0,2000
     if (bytes.byteLength > 10_000_000)
       throw new Error("Browser screenshot exceeds the size limit.");
     return bytes;
+  }
+  async captureRedactedScreenshot(_sessionId: string): Promise<{
+    omittedReason: string;
+    redactionVersion: string;
+  }> {
+    // DOM masking cannot safely redact sensitive text rendered outside form
+    // fields, canvases, videos, or cross-origin frames. Until a reviewed OCR
+    // redactor is available, withhold screenshots from adaptive execution.
+    return {
+      omittedReason: "ocr_redaction_unavailable",
+      redactionVersion: "withheld-v1",
+    };
   }
   async uploadFile(
     sessionId: string,

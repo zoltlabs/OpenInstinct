@@ -16,6 +16,8 @@ import type {
 export class FakeBrowserProvider implements BrowserProvider {
   readonly #profiles = new Map<string, BrowserProfile>();
   readonly #sessions = new Map<string, BrowserSession>();
+  readonly #sessionCorrelations = new Map<string, string>();
+  readonly #correlationSessions = new Map<string, string>();
   readonly #files = new Map<string, BrowserFile>();
   async capabilities(): Promise<BrowserCapabilities> {
     return {
@@ -27,6 +29,9 @@ export class FakeBrowserProvider implements BrowserProvider {
       fileTransfer: true,
       humanTakeover: true,
       replayControl: true,
+      networkReadOnlyIsolation: true,
+      sessionLookupByCorrelation: true,
+      startIdempotency: true,
       maxSessionSeconds: 3600,
     };
   }
@@ -68,8 +73,15 @@ export class FakeBrowserProvider implements BrowserProvider {
       | "reauthentication"
       | "health"
       | "takeover";
+    correlationId?: string;
+    readOnly?: boolean;
   }): Promise<BrowserSession> {
     if (input.profileId) await this.inspectProfile(input.profileId);
+    const existingId = input.correlationId
+      ? this.#correlationSessions.get(input.correlationId)
+      : undefined;
+    const existing = existingId ? this.#sessions.get(existingId) : undefined;
+    if (existing?.status === "active") return existing;
     const now = new Date();
     const value = {
       id: randomUUID(),
@@ -81,15 +93,44 @@ export class FakeBrowserProvider implements BrowserProvider {
       ).toISOString(),
     };
     this.#sessions.set(value.id, value);
+    if (input.correlationId) {
+      this.#sessionCorrelations.set(value.id, input.correlationId);
+      this.#correlationSessions.set(input.correlationId, value.id);
+    }
     return value;
+  }
+  async findSessions(input: {
+    correlationId: string;
+    includeClosed?: boolean;
+  }): Promise<readonly BrowserSession[]> {
+    return [...this.#sessions.values()].filter(
+      (session) =>
+        this.#sessionCorrelations.get(session.id) === input.correlationId &&
+        (input.includeClosed || session.status === "active"),
+    );
+  }
+  async installReadOnlyGuards(
+    id: string,
+    allowedOrigins: readonly string[],
+  ): Promise<{ installed: boolean; fullyIsolated: boolean }> {
+    this.#session(id);
+    if (
+      allowedOrigins.some((origin) => {
+        const url = new URL(origin);
+        return url.protocol !== "https:" || url.origin !== origin;
+      })
+    )
+      throw new Error("Read-only browser origins must be exact HTTPS origins.");
+    return { installed: true, fullyIsolated: true };
   }
   async reconnectSession(id: string): Promise<BrowserSession> {
     return this.#session(id);
   }
   async sessionHealth(id: string): Promise<BrowserHealth> {
+    const session = this.#sessions.get(id);
     return this.#health(
-      this.#sessions.has(id),
-      this.#sessions.has(id) ? "active" : "missing",
+      session?.status === "active",
+      session?.status ?? "missing",
     );
   }
   async checkpointSession(id: string): Promise<{ checkpointed: boolean }> {
@@ -97,7 +138,8 @@ export class FakeBrowserProvider implements BrowserProvider {
     return { checkpointed: true };
   }
   async closeSession(id: string): Promise<void> {
-    this.#sessions.delete(id);
+    const value = this.#session(id);
+    this.#sessions.set(id, { ...value, status: "closed" });
   }
   async observe(id: string): Promise<BrowserObservation> {
     this.#session(id);
@@ -106,6 +148,7 @@ export class FakeBrowserProvider implements BrowserProvider {
       title: "Example",
       text: "Fake page",
       links: [],
+      tabCount: 1,
     };
   }
   async verifyAuthentication(
@@ -129,6 +172,13 @@ export class FakeBrowserProvider implements BrowserProvider {
   async screenshot(id: string): Promise<Uint8Array> {
     this.#session(id);
     return new Uint8Array([1, 2, 3]);
+  }
+  async captureRedactedScreenshot(id: string): Promise<{
+    bytes: Uint8Array;
+    redactionVersion: string;
+  }> {
+    this.#session(id);
+    return { bytes: new Uint8Array([1, 2, 3]), redactionVersion: "fake-v1" };
   }
   async uploadFile(
     id: string,

@@ -15,22 +15,37 @@ export async function consumeJobs(input: {
     messageId: number;
     status: "completed" | "failed";
     error?: string;
+    queueLatencyMs: number;
   }[]
 > {
   await input.store.dispatchDueSchedules();
+  await input.store.enqueueAllPendingContinuations();
+  await input.store.expireBrowserExecutionHandoffs();
+  await input.store.recoverStaleBrowserExecutions();
   await input.processor.cleanupExpiredBrowserSessions();
+  await input.processor.cleanupExpiredArtifacts();
+  await input.processor.notifyPendingBrowserHandoffs();
   const jobs = await input.store.claimJobs(input.limit ?? 5);
   const results: {
     messageId: number;
     status: "completed" | "failed";
     error?: string;
+    queueLatencyMs: number;
   }[] = [];
   for (const claimed of jobs) {
     const claimToken = randomUUID();
+    const queueLatencyMs = Math.max(
+      0,
+      Date.now() - new Date(claimed.enqueuedAt).getTime(),
+    );
     try {
       await input.processor.process(claimed.job, claimToken);
       await input.store.archiveJob(claimed.messageId);
-      results.push({ messageId: claimed.messageId, status: "completed" });
+      results.push({
+        messageId: claimed.messageId,
+        status: "completed",
+        queueLatencyMs,
+      });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       const staleClaim = error instanceof RunNotClaimableError;
@@ -39,6 +54,12 @@ export async function consumeJobs(input: {
       if (staleClaim && error.retryable)
         await input.store.retryJob(claimed.messageId, error.retryAfterSeconds);
       else if (
+        claimed.job.type === "browser_slice" ||
+        claimed.job.type === "browser_cleanup"
+      ) {
+        const delay = Math.min(300, 2 ** Math.min(claimed.readCount, 8));
+        await input.store.retryJob(claimed.messageId, delay);
+      } else if (
         staleClaim ||
         error instanceof PermanentJobError ||
         claimed.readCount >= 5
@@ -52,6 +73,7 @@ export async function consumeJobs(input: {
         messageId: claimed.messageId,
         status: "failed",
         error: message,
+        queueLatencyMs,
       });
     }
   }

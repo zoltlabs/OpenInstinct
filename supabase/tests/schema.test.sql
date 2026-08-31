@@ -1,5 +1,5 @@
 begin;
-select plan(74);
+select plan(105);
 
 select has_table('public', 'workspaces', 'workspaces table exists');
 select has_table('public', 'action_requests', 'action requests table exists');
@@ -8,6 +8,15 @@ select has_table('public', 'tool_results', 'structured tool results table exists
 select has_table('public', 'run_events', 'append-only run events table exists');
 select has_table('public', 'browser_profile_origins', 'browser origins table exists');
 select has_table('app_private', 'browser_control_sessions', 'browser control sessions are private');
+select has_table('public', 'browser_executions', 'durable browser executions exist');
+select has_table('public', 'browser_handoffs', 'durable owner browser handoffs exist');
+select has_table('public', 'artifacts', 'provider-neutral artifact metadata exists');
+select has_table('public', 'site_support', 'site support registry exists');
+select has_table('app_private', 'browser_execution_handles', 'browser provider handles are private');
+select has_table('app_private', 'browser_execution_slices', 'browser observations and decisions are private');
+select has_table('app_private', 'browser_handoff_handles', 'browser handoff provider state is private');
+select has_table('app_private', 'artifact_locations', 'artifact byte locations are private');
+select has_table('app_private', 'worker_heartbeats', 'continuous worker heartbeats are private');
 select has_table('pgmq', 'q_agent_jobs', 'durable agent queue exists');
 select ok((select relrowsecurity from pg_class where oid = 'public.connections'::regclass), 'connections use RLS');
 select ok((select count(*) > 0 from pg_policies where schemaname = 'public' and tablename = 'connections'), 'connections have owner policies');
@@ -27,12 +36,19 @@ select has_column('public', 'tool_results', 'certainty', 'results record certain
 select has_column('public', 'tool_results', 'continuation_status', 'results provide a durable continuation outbox');
 select has_column('public', 'browser_profiles', 'status', 'browser profiles have lifecycle state');
 select has_column('public', 'browser_profiles', 'configuration_version', 'browser policy has a version');
+select has_column('public', 'browser_executions', 'max_cost_units', 'browser executions have a provider cost budget');
+select has_column('public', 'browser_executions', 'cost_units_used', 'browser executions persist cost-budget use');
+select has_column('public', 'artifacts', 'retention_expires_at', 'artifacts have bounded retention');
 select ok((select relrowsecurity from pg_class where oid = 'public.scheduled_triggers'::regclass), 'schedules use RLS');
 select ok((select relrowsecurity from pg_class where oid = 'public.memories'::regclass), 'memories use RLS');
 select ok((select relrowsecurity from pg_class where oid = 'public.workflow_steps'::regclass), 'workflow steps use RLS');
 select ok((select relrowsecurity from pg_class where oid = 'public.tool_results'::regclass), 'tool results use RLS');
 select ok((select relrowsecurity from pg_class where oid = 'public.run_events'::regclass), 'run events use RLS');
 select ok((select relrowsecurity from pg_class where oid = 'public.browser_profile_origins'::regclass), 'browser origins use RLS');
+select ok((select relrowsecurity from pg_class where oid = 'public.browser_executions'::regclass), 'browser executions use RLS');
+select ok((select relrowsecurity from pg_class where oid = 'public.browser_handoffs'::regclass), 'browser handoffs use RLS');
+select ok((select relrowsecurity from pg_class where oid = 'public.artifacts'::regclass), 'artifacts use RLS');
+select ok((select relrowsecurity from pg_class where oid = 'public.site_support'::regclass), 'site support uses RLS');
 select is(
   (
     select count(*)::integer
@@ -54,10 +70,14 @@ select is(
       'public.workflow_steps'::regclass,
       'public.tool_results'::regclass,
       'public.run_events'::regclass
-      ,'public.browser_profile_origins'::regclass
+      ,'public.browser_profile_origins'::regclass,
+      'public.browser_executions'::regclass,
+      'public.browser_handoffs'::regclass,
+      'public.artifacts'::regclass,
+      'public.site_support'::regclass
     ) and relrowsecurity
   ),
-  17,
+  21,
   'every Data API table has RLS enabled'
 );
 select ok(
@@ -80,6 +100,48 @@ select ok(
 select ok(
   not has_table_privilege('authenticated', 'app_private.browser_control_sessions', 'SELECT'),
   'browser control sessions are unavailable to authenticated clients'
+);
+select ok(
+  not has_table_privilege('authenticated', 'app_private.browser_execution_handles', 'SELECT')
+    and not has_table_privilege('authenticated', 'app_private.browser_execution_slices', 'SELECT')
+    and not has_table_privilege('authenticated', 'app_private.browser_handoff_handles', 'SELECT')
+    and not has_table_privilege('anon', 'app_private.browser_handoff_handles', 'SELECT')
+    and not has_table_privilege('service_role', 'app_private.browser_handoff_handles', 'SELECT')
+    and not has_table_privilege('authenticated', 'app_private.artifact_locations', 'SELECT')
+    and not has_table_privilege('authenticated', 'app_private.artifact_ingest_leases', 'SELECT')
+    and not has_table_privilege('service_role', 'app_private.browser_execution_handles', 'SELECT'),
+  'provider handles, leases, observations, decisions, and storage paths have no Data API grants'
+);
+select ok(
+  not has_table_privilege('authenticated', 'app_private.worker_heartbeats', 'SELECT')
+    and not has_table_privilege('service_role', 'app_private.worker_heartbeats', 'SELECT'),
+  'worker heartbeat and queue latency diagnostics have no Data API grants'
+);
+select ok(
+  not has_table_privilege('authenticated', 'public.browser_executions', 'INSERT')
+    and not has_table_privilege('authenticated', 'public.browser_handoffs', 'UPDATE')
+    and not has_table_privilege('authenticated', 'public.artifacts', 'UPDATE')
+    and not has_table_privilege('authenticated', 'public.site_support', 'DELETE'),
+  'adaptive browser and artifact truth is server-written'
+);
+select ok(
+  exists (select 1 from pg_indexes where indexname='browser_executions_one_profile_owner_idx')
+    and exists (select 1 from pg_indexes where indexname='browser_executions_one_active_run_idx')
+    and exists (select 1 from pg_indexes where indexname='browser_execution_handles_lease_idx')
+    and exists (select 1 from pg_indexes where indexname='browser_execution_slices_claim_idx'),
+  'browser sessions enforce exclusive ownership and indexed fenced recovery'
+);
+select ok(
+  (select not public and file_size_limit = 25000000 from storage.buckets where id='openinstinct-quarantine')
+    and (select not public and file_size_limit = 25000000 from storage.buckets where id='openinstinct-artifacts'),
+  'artifact and quarantine buckets are private and size bounded'
+);
+select ok(
+  not exists (
+    select 1 from pg_policies where schemaname='storage' and tablename='objects'
+      and (coalesce(qual,'') || coalesce(with_check,'')) ~ 'openinstinct-(quarantine|artifacts)'
+  ),
+  'artifact buckets have no authenticated direct-object policy'
 );
 select ok(
   not has_column_privilege('authenticated', 'public.browser_profiles', 'provider_capabilities', 'SELECT')
@@ -371,6 +433,100 @@ insert into public.workflow_steps (
   '10000000-0000-4000-8000-000000000006',
   0, 'action', 'fixture.write', 'running', '{}', repeat('e', 64)
 );
+insert into public.browser_executions (
+  id,workspace_id,run_id,step_id,profile_id,profile_configuration_version,
+  mode,status,goal_hash,
+  policy_hash,max_steps,max_duration_seconds,max_cost_units
+) values (
+  '10000000-0000-4000-8000-000000000030',
+  '10000000-0000-4000-8000-000000000002',
+  '10000000-0000-4000-8000-000000000003',
+  '10000000-0000-4000-8000-000000000008',
+  '10000000-0000-4000-8000-000000000020',
+  (select configuration_version from public.browser_profiles
+    where id='10000000-0000-4000-8000-000000000020'),
+  'persistent_read_only','queued',repeat('a',64),repeat('b',64),3,300,3
+);
+insert into app_private.browser_execution_handles (
+  execution_id,workspace_id,provider,correlation_id,allowed_origins,start_url,goal
+) values (
+  '10000000-0000-4000-8000-000000000030',
+  '10000000-0000-4000-8000-000000000002','kernel',
+  '10000000-0000-4000-8000-000000000031','["https://example.test"]',
+  'https://example.test/','Read the public page'
+);
+insert into app_private.browser_execution_slices (
+  id,execution_id,workspace_id,ordinal,status
+) values (
+  '10000000-0000-4000-8000-000000000032',
+  '10000000-0000-4000-8000-000000000030',
+  '10000000-0000-4000-8000-000000000002',0,'queued'
+);
+insert into public.browser_handoffs (
+  id,workspace_id,execution_id,status,reason_code,expires_at
+) values (
+  '10000000-0000-4000-8000-000000000037',
+  '10000000-0000-4000-8000-000000000002',
+  '10000000-0000-4000-8000-000000000030','requested','fixture_owner_required',
+  now()+interval '10 minutes'
+);
+insert into app_private.browser_handoff_handles (
+  handoff_id,workspace_id,provider_session_id
+) values (
+  '10000000-0000-4000-8000-000000000037',
+  '10000000-0000-4000-8000-000000000002','fixture-provider-session'
+);
+select throws_ok(
+  $$update app_private.browser_execution_handles
+    set lease_token_hash=repeat('f',64)
+    where execution_id='10000000-0000-4000-8000-000000000030'$$,
+  '23514', null, 'browser leases require both a token hash and expiry'
+);
+insert into public.artifacts (
+  id,workspace_id,browser_execution_id,step_id,kind,sensitivity,state,
+  display_name,declared_mime_type
+) values (
+  '10000000-0000-4000-8000-000000000036',
+  '10000000-0000-4000-8000-000000000002',
+  '10000000-0000-4000-8000-000000000030',
+  '10000000-0000-4000-8000-000000000008',
+  'screenshot','sensitive','pending_upload','masked.png','image/png'
+);
+select throws_ok(
+  $$update public.artifacts set state='available'
+    where id='10000000-0000-4000-8000-000000000036'$$,
+  '23514', null, 'available artifacts require scan metadata and availability time'
+);
+insert into public.agent_runs (id,workspace_id,status)
+values (
+  '10000000-0000-4000-8000-000000000033',
+  '10000000-0000-4000-8000-000000000002','queued'
+);
+insert into public.workflow_steps (
+  id,workspace_id,run_id,position,kind,tool_name,status,input,input_hash
+) values (
+  '10000000-0000-4000-8000-000000000034',
+  '10000000-0000-4000-8000-000000000002',
+  '10000000-0000-4000-8000-000000000033',0,'tool','browser.research',
+  'running','{}',repeat('c',64)
+);
+select throws_ok(
+  $$insert into public.browser_executions (
+      id,workspace_id,run_id,step_id,profile_id,profile_configuration_version,
+      mode,status,goal_hash,
+      policy_hash,max_steps,max_duration_seconds,max_cost_units
+    ) values (
+      '10000000-0000-4000-8000-000000000035',
+      '10000000-0000-4000-8000-000000000002',
+      '10000000-0000-4000-8000-000000000033',
+      '10000000-0000-4000-8000-000000000034',
+      '10000000-0000-4000-8000-000000000020',
+      (select configuration_version from public.browser_profiles
+        where id='10000000-0000-4000-8000-000000000020'),
+      'persistent_read_only','queued',repeat('d',64),repeat('e',64),3,300,3
+    )$$,
+  '23505', null, 'a persistent profile has one exclusive execution owner'
+);
 select throws_ok(
   $$insert into public.tool_results (
       workspace_id, run_id, step_id, tool_name, certainty, attempt,
@@ -431,6 +587,16 @@ select is(
   1,
   'the owner can read safe browser profile summaries'
 );
+select is(
+  (select count(*)::integer from public.browser_executions),
+  1,
+  'the owner can read safe browser execution summaries'
+);
+select is(
+  (select count(*)::integer from public.browser_handoffs),
+  1,
+  'the owner can read safe browser handoff state'
+);
 select set_config(
   'request.jwt.claim.sub',
   '10000000-0000-4000-8000-000000000099',
@@ -446,6 +612,16 @@ select is(
   0,
   'another identity cannot read browser profile summaries'
 );
+select is(
+  (select count(*)::integer from public.browser_executions),
+  0,
+  'another identity cannot read browser execution summaries'
+);
+select is(
+  (select count(*)::integer from public.browser_handoffs),
+  0,
+  'another identity cannot read browser handoff state'
+);
 reset role;
 
 set local role service_role;
@@ -459,11 +635,52 @@ select throws_ok(
 );
 reset role;
 
+update public.browser_executions set status='failed',completed_at=now(),
+  last_error_code='fixture_profile_released'
+where id='10000000-0000-4000-8000-000000000030';
 update public.browser_profiles set status='revoked',revoked_at=now(),
   deletion_requested_at=now(),deletion_verified_at=now()
 where id='10000000-0000-4000-8000-000000000020';
 delete from public.browser_profiles
 where id='10000000-0000-4000-8000-000000000020';
+
+insert into public.browser_executions (
+  id,workspace_id,run_id,step_id,mode,status,goal_hash,policy_hash,
+  max_steps,max_duration_seconds,max_cost_units
+) values (
+  '10000000-0000-4000-8000-000000000035',
+  '10000000-0000-4000-8000-000000000002',
+  '10000000-0000-4000-8000-000000000033',
+  '10000000-0000-4000-8000-000000000034',
+  'ephemeral_read_only','queued',repeat('d',64),repeat('e',64),3,300,3
+);
+
+set local role service_role;
+select throws_ok(
+  $$select app_private.purge_workspace_execution_history(
+      '10000000-0000-4000-8000-000000000002'
+    )$$,
+  '55000',
+  'browser executions must reach a verified terminal state before workspace purge',
+  'workspace purge refuses a nonterminal browser execution'
+);
+reset role;
+update public.browser_executions set status='failed',completed_at=now(),
+  last_error_code='fixture_terminal'
+where id='10000000-0000-4000-8000-000000000035';
+set local role service_role;
+select throws_ok(
+  $$select app_private.purge_workspace_execution_history(
+      '10000000-0000-4000-8000-000000000002'
+    )$$,
+  '55000',
+  'artifact bytes and late-write tombstones must be verifiably cleared before workspace purge',
+  'workspace purge refuses artifact metadata until byte deletion is verified'
+);
+reset role;
+update public.artifacts set state='deleted',deletion_requested_at=now(),
+  deletion_verified_at=now()
+where id='10000000-0000-4000-8000-000000000036';
 
 update public.action_requests set status = 'unknown'
 where id = '10000000-0000-4000-8000-000000000006';

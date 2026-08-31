@@ -18,6 +18,7 @@
     "@ai-sdk/openai": "4.0.50",
     "@ai-sdk/openai-compatible": "3.0.39",
     "@openinstinct/connectors": "workspace:*",
+    "@openinstinct/artifacts": "workspace:*",
     "@openinstinct/browser": "workspace:*",
     "@openinstinct/core": "workspace:*",
     "@openinstinct/db": "workspace:*",

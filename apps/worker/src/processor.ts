@@ -1,9 +1,11 @@
 import { BlooioClient } from "@openinstinct/messaging";
+import { BoundedArtifactScanner } from "@openinstinct/artifacts";
 import { randomUUID } from "node:crypto";
 import {
   decryptCredential,
   encryptCredential,
   OpenInstinctStore,
+  SupabaseArtifactByteStore,
   type AgentJob,
 } from "@openinstinct/db";
 import {
@@ -32,6 +34,12 @@ import {
 import { executeApprovedGoogleAction, runAssistantAgent } from "./agent";
 import { PermanentJobError } from "./consumer";
 import { createAssistantModel } from "./models";
+import {
+  AiBrowserReadPlanner,
+  type BrowserReadPlanner,
+} from "./browser-planner";
+import { BrowserResearchRuntime } from "./browser-runtime";
+import { ArtifactLifecycleService } from "./artifacts";
 
 export interface OutboundMessenger {
   sendMessage(input: {
@@ -84,6 +92,8 @@ export class JobProcessor {
   readonly #browser?: BrowserProvider;
   readonly #runAgent: typeof runAssistantAgent;
   readonly #failureInjector?: ExecutionFailureInjector;
+  readonly #browserRuntime?: BrowserResearchRuntime;
+  readonly #artifacts?: ArtifactLifecycleService;
 
   constructor(input: {
     store: OpenInstinctStore;
@@ -94,6 +104,7 @@ export class JobProcessor {
     browser?: BrowserProvider;
     runAgent?: typeof runAssistantAgent;
     failureInjector?: ExecutionFailureInjector;
+    browserPlanner?: BrowserReadPlanner;
   }) {
     this.#store = input.store;
     this.#env = input.env;
@@ -115,6 +126,23 @@ export class JobProcessor {
         : undefined);
     this.#runAgent = input.runAgent ?? runAssistantAgent;
     this.#failureInjector = input.failureInjector;
+    this.#artifacts = new ArtifactLifecycleService(
+      this.#store,
+      new SupabaseArtifactByteStore({
+        supabaseUrl:
+          input.env.SUPABASE_URL ?? input.env.NEXT_PUBLIC_SUPABASE_URL,
+        serviceRoleKey: input.env.SUPABASE_SECRET_KEY,
+      }),
+      new BoundedArtifactScanner(),
+    );
+    this.#browserRuntime = this.#browser
+      ? new BrowserResearchRuntime(
+          this.#store,
+          this.#browser,
+          input.browserPlanner ?? new AiBrowserReadPlanner(this.#model),
+          this.#artifacts,
+        )
+      : undefined;
   }
 
   async cleanupExpiredBrowserSessions(): Promise<void> {
@@ -132,8 +160,76 @@ export class JobProcessor {
     }
   }
 
+  async cleanupExpiredArtifacts(): Promise<void> {
+    for (const artifact of await this.#store.listArtifactsPendingCleanup()) {
+      try {
+        await this.#artifacts?.delete({
+          artifactId: artifact.id,
+          workspaceId: artifact.workspaceId,
+        });
+      } catch {
+        await this.#store
+          .completeArtifactDeletion({
+            id: artifact.id,
+            workspaceId: artifact.workspaceId,
+            verified: false,
+          })
+          .catch(() => undefined);
+      }
+    }
+  }
+
+  async notifyPendingBrowserHandoffs(): Promise<void> {
+    if (!this.#env.BLOOIO_OWNER_PHONE) return;
+    for (const handoff of await this.#store.listPendingBrowserHandoffNotifications()) {
+      try {
+        await this.#sendMessage({
+          to: this.#env.BLOOIO_OWNER_PHONE,
+          text: `Owner browser takeover is required: ${new URL(
+            `/api/browser/handoffs/${handoff.id}`,
+            this.#env.NEXT_PUBLIC_APP_URL,
+          ).toString()}`,
+          channelId: this.#env.BLOOIO_CHANNEL_ID,
+          idempotencyKey: `browser-handoff:${handoff.id}:requested`,
+        });
+        await this.#store.markBrowserHandoffNotificationSent({
+          handoffId: handoff.id,
+          workspaceId: handoff.workspaceId,
+        });
+      } catch {
+        await this.#store
+          .recordBrowserHandoffNotificationFailure({
+            handoffId: handoff.id,
+            workspaceId: handoff.workspaceId,
+          })
+          .catch(() => undefined);
+      }
+    }
+  }
+
   async process(job: AgentJob, claimToken = randomUUID()): Promise<void> {
     let resumeActionId: string | undefined;
+    if (job.type === "browser_slice") {
+      if (!this.#browserRuntime)
+        throw new PermanentJobError("Cloud browser is not configured.");
+      const result = await this.#browserRuntime.processSlice({
+        executionId: job.executionId,
+        workspaceId: job.workspaceId,
+        claimToken,
+      });
+      if (result.handoffId) await this.notifyPendingBrowserHandoffs();
+      return;
+    }
+    if (job.type === "browser_cleanup") {
+      if (!this.#browserRuntime)
+        throw new PermanentJobError("Cloud browser is not configured.");
+      await this.#browserRuntime.processCleanup({
+        executionId: job.executionId,
+        workspaceId: job.workspaceId,
+        claimToken,
+      });
+      return;
+    }
     if (job.type === "dispatch_schedules") {
       await this.#store.dispatchDueSchedules();
       return;
@@ -324,7 +420,7 @@ export class JobProcessor {
       providerMessageId: sent.message_id,
       status: sent.status,
     });
-    if (!result.pendingAction) {
+    if (!result.pendingAction && !result.pendingBrowserExecutionId) {
       await this.#store.completeRun({
         runId: job.runId,
         claimToken: context.claimToken,

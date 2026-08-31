@@ -1,4 +1,5 @@
 import { createServer } from "node:http";
+import { randomUUID } from "node:crypto";
 import { OpenInstinctStore } from "@openinstinct/db";
 import { readServerEnvironment } from "@openinstinct/runtime";
 import { JobProcessor } from "./processor";
@@ -8,6 +9,38 @@ const env = readServerEnvironment();
 const store = new OpenInstinctStore(env.DATABASE_URL);
 const processor = new JobProcessor({ store, env });
 const port = Number(process.env.PORT ?? 3001);
+const workerId = randomUUID();
+let stopping = false;
+let pollTimer: NodeJS.Timeout | undefined;
+let lastPollAt: string | undefined;
+let lastQueueLatencyMs = 0;
+
+async function pollContinuously(): Promise<void> {
+  if (stopping) return;
+  try {
+    const results = await consumeJobs({ store, processor });
+    lastPollAt = new Date().toISOString();
+    lastQueueLatencyMs = Math.max(
+      0,
+      ...results.map((result) => result.queueLatencyMs),
+    );
+    await store.recordWorkerHeartbeat({
+      workerId,
+      jobsProcessed: results.length,
+      oldestQueueLatencyMs: lastQueueLatencyMs,
+    });
+  } catch (error) {
+    process.stderr.write(
+      `Worker poll failed: ${error instanceof Error ? error.message : "unknown"}\n`,
+    );
+  } finally {
+    if (!stopping)
+      pollTimer = setTimeout(
+        () => void pollContinuously(),
+        env.WORKER_POLL_INTERVAL_MS,
+      );
+  }
+}
 
 const server = createServer(async (request, response) => {
   try {
@@ -17,7 +50,14 @@ const server = createServer(async (request, response) => {
         "content-type": "application/json",
       });
       response.end(
-        JSON.stringify({ ok: database, service: "openinstinct-worker" }),
+        JSON.stringify({
+          ok: database,
+          service: "openinstinct-worker",
+          mode: env.WORKER_MODE,
+          lastPollAt,
+          lastQueueLatencyMs,
+          interactiveLatencyBudgetMs: env.INTERACTIVE_MAX_QUEUE_LATENCY_MS,
+        }),
       );
       return;
     }
@@ -46,10 +86,13 @@ const server = createServer(async (request, response) => {
 
 server.listen(port, "0.0.0.0", () => {
   process.stdout.write(`OpenInstinct worker listening on ${port}\n`);
+  if (env.WORKER_MODE === "continuous") void pollContinuously();
 });
 
 for (const signal of ["SIGINT", "SIGTERM"] as const) {
   process.on(signal, () => {
+    stopping = true;
+    if (pollTimer) clearTimeout(pollTimer);
     server.close(() => void store.close().finally(() => process.exit(0)));
   });
 }

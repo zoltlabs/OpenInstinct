@@ -121,6 +121,9 @@ importers:
       "@ai-sdk/openai-compatible":
         specifier: 3.0.39
         version: 3.0.39(zod@4.4.3)
+      "@openinstinct/artifacts":
+        specifier: workspace:*
+        version: link:../../packages/artifacts
       "@openinstinct/browser":
         specifier: workspace:*
         version: link:../../packages/browser
@@ -158,8 +161,17 @@ importers:
         specifier: 4.127.0
         version: 4.127.0
 
+  packages/artifacts:
+    dependencies:
+      zod:
+        specifier: 4.4.3
+        version: 4.4.3
+
   packages/browser:
     dependencies:
+      "@openinstinct/core":
+        specifier: workspace:*
+        version: link:../core
       "@onkernel/sdk":
         specifier: 0.96.0
         version: 0.96.0
@@ -196,6 +208,9 @@ importers:
 
   packages/db:
     dependencies:
+      "@openinstinct/artifacts":
+        specifier: workspace:*
+        version: link:../artifacts
       "@openinstinct/core":
         specifier: workspace:*
         version: link:../core
