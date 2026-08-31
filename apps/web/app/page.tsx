@@ -180,6 +180,9 @@ export default async function Home({
         The dashboard is only a control plane. Talk to your assistant through
         iMessage. Times are shown in {timeZone}.
       </p>
+      <p>
+        <Link href="/authority">Manage bounded authority grants</Link>
+      </p>
       <Feedback code={feedback} />
       <div className="grid">
         <section className="card wide connector-hub">

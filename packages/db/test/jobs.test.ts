@@ -25,4 +25,18 @@ describe("scheduled jobs", () => {
       }),
     ).not.toHaveProperty("output");
   });
+
+  it("validates read-only reconciliation jobs without executable payloads", () => {
+    expect(
+      agentJobSchema.parse({
+        type: "reconcile_action",
+        caseId: "7e5e8b22-8e72-4ec1-a81f-e804d8c1fc01",
+        workspaceId: "7e5e8b22-8e72-4ec1-a81f-e804d8c1fc02",
+      }),
+    ).toEqual({
+      type: "reconcile_action",
+      caseId: "7e5e8b22-8e72-4ec1-a81f-e804d8c1fc01",
+      workspaceId: "7e5e8b22-8e72-4ec1-a81f-e804d8c1fc02",
+    });
+  });
 });

@@ -47,10 +47,11 @@ flowchart LR
 1. `apps/web` verifies the Blooio signature against the exact, size-bounded raw request body before parsing it.
 2. `packages/db` deduplicates the provider event and atomically creates the message, agent run, and `process_event` queue job.
 3. `apps/worker` claims the durable job, loads bounded context, and runs the agent for a bounded number of steps.
-4. Safe reads may execute inline. A write, communication, browser interaction, or destructive operation becomes an immutable `action_request`; the run moves to `waiting_approval`.
-5. The authenticated owner approves or denies the exact canonical input hash.
-6. Approval queues `resume_run`. The worker revalidates the connector identity, configuration version, and tool allowlist before executing the stored input.
-7. The outcome and audit trail are persisted, and a deterministic outbound message is sent through Blooio.
+4. Safe reads may execute inline. A consequential operation becomes an immutable `action_request` containing a structured semantic intent, exact executable-input hash, and guard-condition hash.
+5. Deterministic policy either denies the action, requires exact owner approval, or atomically reserves a matching bounded authority grant. Destructive actions always require fresh typed confirmation; financial and security commits remain denied.
+6. Approval or a valid grant queues `resume_run`. The worker reacquires the run lease, revalidates origin/account/recipient/configuration guards immediately before the invocation fence, and executes only the stored payload.
+7. A successful semantic action requires read-only postcondition evidence. An ambiguous outcome becomes `unknown`, is never replayed, and creates a durable read-only reconciliation case.
+8. The result, evidence metadata, audit trail, and continuation outbox are persisted, and a deterministic outbound message is sent through Blooio.
 
 HTTP requests are triggers, not the source of truth. Durable state and the queue live in Postgres.
 
@@ -99,6 +100,8 @@ The important durable records are:
 - `conversations`, `messages`, and `inbound_events`: messaging history and deduplication
 - `agent_runs`: durable orchestration state
 - `action_requests` and `approvals`: immutable proposed intent and owner decision
+- `authority_grants` and `authority_usages`: versioned owner authority and atomic per-action reservations
+- `action_evidence` and `reconciliation_cases`: bounded postcondition proof and no-replay unknown-outcome recovery
 - `connections`: encrypted provider configuration and credentials
 - `scheduled_triggers`: one-time reminders and fixed-interval recurring agent routines
 - `memories`: owner-approved long-term context with explicit save/forget operations and vector-ready storage
@@ -135,10 +138,11 @@ Use a direct connector when scopes, data types, and risk are stable enough to mo
 2. Keep OAuth and token refresh inside the connector package. Store encrypted credentials only through `packages/db`.
 3. Add read tools in `apps/worker/src/agent.ts` with narrow Zod inputs and bounded outputs.
 4. For a write, make the tool create an `ActionRequest`; do not call the provider from the model tool.
-5. Put all actual write execution in `apps/worker/src/processor.ts`. Revalidate connector id, account identity, configuration version, allowed operation, and payload hash there.
-6. Use a deterministic provider id or idempotency key where the API supports it. Map ambiguous failures to `unknown`.
-7. Add OAuth/control-plane routes in `apps/web`, environment validation in `packages/runtime`, and setup/doctor support in `apps/cli`.
-8. Add unit tests, database tests if storage changes, and an end-to-end smoke path that does not expose credentials.
+5. Build the provider-neutral semantic intent and guard snapshot from trusted adapter facts, not model-supplied risk labels or tool-name keywords.
+6. Put all actual write execution in `apps/worker/src/processor.ts`. Revalidate connector id, exact origin, account/recipient identity, configuration version, semantic hashes, and grant reservation immediately before the invocation fence.
+7. Use a deterministic provider id or idempotency marker where the API supports it, then perform a bounded read-back and persist evidence. Map ambiguous failures to `unknown` and provide a read-only reconciliation contract.
+8. Add OAuth/control-plane routes in `apps/web`, environment validation in `packages/runtime`, and setup/doctor support in `apps/cli`.
+9. Add unit tests, database tests if storage changes, and an end-to-end smoke path that does not expose credentials.
 
 ## How to extend generic MCP
 
@@ -150,7 +154,7 @@ MCP is the long-tail integration path. Keep the existing network protections in 
 - Discover and expose only explicitly allowed tools.
 - Treat tool descriptions and results as untrusted data, not instructions.
 - Bound argument and response sizes.
-- Persist every invocation as an action request, even if the remote tool claims to be read-only.
+- Persist every invocation as an action request, even if the remote tool claims to be read-only. Generic MCP commits fail closed unless a reviewed adapter supplies a trusted semantic effect, idempotency, and read-back contract.
 - Recheck the server and `configVersion` during execution.
 
 ## How to add another messaging channel

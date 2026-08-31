@@ -1,5 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
 import type { OpenInstinctStore } from "@openinstinct/db";
+import {
+  deriveSemanticGuards,
+  payloadHash,
+  semanticGuardHash,
+  semanticIntentHash,
+} from "@openinstinct/core";
 import type { ServerEnvironment } from "@openinstinct/runtime";
 import { JobProcessor, normalizeToolOutput } from "../src/processor";
 import type { ResolvedLanguageModel } from "../src/models";
@@ -19,6 +25,46 @@ const env = {
   OPENAI_API_KEY: "openai",
   INTERNAL_API_SECRET: "a".repeat(32),
 } as ServerEnvironment;
+
+function memoryAction(status: "executing" | "unknown") {
+  const input = {
+    kind: "preference",
+    content: "Prefers tea",
+    sensitivity: "personal",
+  };
+  const semanticIntent = {
+    version: 1 as const,
+    effect: "create" as const,
+    resource: { class: "memory" },
+    provider: "openinstinct",
+    exactOrigin: null,
+    recipients: [],
+    reversibility: "reversible" as const,
+    commitPoint: true,
+    credentialUse: "none" as const,
+    postconditions: [{ subject: "memory.exists", operator: "exists" as const }],
+  };
+  const guardConditions = deriveSemanticGuards({
+    intent: semanticIntent,
+    payload: input,
+  });
+  return {
+    id: "44444444-4444-4444-8444-444444444444",
+    workspaceId: "22222222-2222-4222-8222-222222222222",
+    runId: "11111111-1111-4111-8111-111111111111",
+    toolName: "memory.save",
+    risk: "write" as const,
+    summary: "Remember a preference",
+    input,
+    inputHash: payloadHash(input),
+    semanticIntent,
+    semanticIntentHash: semanticIntentHash(semanticIntent),
+    guardConditions,
+    guardConditionsHash: semanticGuardHash(guardConditions),
+    status,
+    expiresAt: "2026-09-01T12:00:00.000Z",
+  };
+}
 
 describe("durable job processing", () => {
   it("retains only a hash and safe metadata for hostile provider output", () => {
@@ -108,22 +154,7 @@ describe("durable job processing", () => {
   });
 
   it("persists an approved action result and enqueues model continuation", async () => {
-    const action = {
-      id: "44444444-4444-4444-8444-444444444444",
-      workspaceId: "22222222-2222-4222-8222-222222222222",
-      runId: "11111111-1111-4111-8111-111111111111",
-      toolName: "memory.save",
-      risk: "write" as const,
-      summary: "Remember a preference",
-      input: {
-        kind: "preference",
-        content: "Prefers tea",
-        sensitivity: "personal",
-      },
-      inputHash: "a".repeat(64),
-      status: "executing" as const,
-      expiresAt: "2026-09-01T12:00:00.000Z",
-    };
+    const action = memoryAction("executing");
     const store = {
       enqueuePendingContinuations: vi
         .fn()
@@ -153,6 +184,12 @@ describe("durable job processing", () => {
       markActionResultReceived: vi.fn(async () => undefined),
       persistToolResult: vi.fn(async () => true),
       saveMemory: vi.fn(async () => ({ id: action.id })),
+      getMemory: vi.fn(async () => ({
+        id: action.id,
+        kind: "preference",
+        content: "Prefers tea",
+        sensitivity: "personal",
+      })),
     } as unknown as OpenInstinctStore;
     const messenger = { sendMessage: vi.fn() };
     const processor = new JobProcessor({
@@ -188,9 +225,14 @@ describe("durable job processing", () => {
         actionRequestId: action.id,
         certainty: "succeeded",
         retryEligible: false,
-        output: { id: action.id },
+        output: { id: action.id, status: "saved" },
       }),
       "99999999-9999-4999-8999-999999999999",
+      expect.objectContaining({
+        phase: "postcondition",
+        outcome: "observed",
+        verifier: "openinstinct.memory.readback",
+      }),
     );
     expect(store.enqueuePendingContinuations).toHaveBeenCalledTimes(2);
     expect(messenger.sendMessage).not.toHaveBeenCalled();
@@ -205,22 +247,7 @@ describe("durable job processing", () => {
   ] as const)(
     "leaves durable recovery state at %s without a second effect",
     async (point, expectedEffects, expectedPersist, expectedContinuation) => {
-      const action = {
-        id: "44444444-4444-4444-8444-444444444444",
-        workspaceId: "22222222-2222-4222-8222-222222222222",
-        runId: "11111111-1111-4111-8111-111111111111",
-        toolName: "memory.save",
-        risk: "write" as const,
-        summary: "Remember a preference",
-        input: {
-          kind: "preference",
-          content: "Prefers tea",
-          sensitivity: "personal",
-        },
-        inputHash: "a".repeat(64),
-        status: "executing" as const,
-        expiresAt: "2026-09-01T12:00:00.000Z",
-      };
+      const action = memoryAction("executing");
       let effects = 0;
       const store = {
         enqueuePendingContinuations: vi.fn(async () => 0),
@@ -251,6 +278,12 @@ describe("durable job processing", () => {
           effects += 1;
           return { id: action.id };
         }),
+        getMemory: vi.fn(async () => ({
+          id: action.id,
+          kind: "preference",
+          content: "Prefers tea",
+          sensitivity: "personal",
+        })),
       } as unknown as OpenInstinctStore;
       const processor = new JobProcessor({
         store,
@@ -320,5 +353,48 @@ describe("durable job processing", () => {
     expect(store.getRunContext).not.toHaveBeenCalled();
     expect(store.claimApprovedAction).not.toHaveBeenCalled();
     expect(store.saveMemory).not.toHaveBeenCalled();
+  });
+
+  it("reconciles an unknown internal write read-only without replaying it", async () => {
+    const action = memoryAction("unknown");
+    const store = {
+      claimReconciliationCase: vi.fn(async () => ({
+        caseId: "66666666-6666-4666-8666-666666666666",
+        unknownResultId: "77777777-7777-4777-8777-777777777777",
+        attempt: 1,
+        action,
+      })),
+      getMemory: vi.fn(async () => ({
+        id: action.id,
+        kind: "preference",
+        content: "Prefers tea",
+        sensitivity: "personal",
+      })),
+      renewReconciliationLease: vi.fn(async () => undefined),
+      reconcileUnknownResult: vi.fn(async () => ({})),
+      markReconciliationInconclusive: vi.fn(async () => undefined),
+      saveMemory: vi.fn(),
+    } as unknown as OpenInstinctStore;
+    const processor = new JobProcessor({
+      store,
+      env,
+      messenger: { sendMessage: vi.fn() },
+      model: {} as ResolvedLanguageModel,
+    });
+
+    await processor.process({
+      type: "reconcile_action",
+      caseId: "66666666-6666-4666-8666-666666666666",
+      workspaceId: action.workspaceId,
+    });
+
+    expect(store.saveMemory).not.toHaveBeenCalled();
+    expect(store.reconcileUnknownResult).toHaveBeenCalledWith(
+      expect.objectContaining({
+        unknownResultId: "77777777-7777-4777-8777-777777777777",
+        certainty: "reconciled_succeeded",
+      }),
+    );
+    expect(store.markReconciliationInconclusive).not.toHaveBeenCalled();
   });
 });

@@ -9,13 +9,20 @@ import {
 } from "@openinstinct/artifacts";
 import {
   actionRequestSchema,
+  actionEvidenceSchema,
+  authorityGrantSchema,
+  authorityGrantConfigurationVersion,
   browserReadDecisionSchema,
   browserReadObservationSchema,
   canonicalBrowserReadUrl,
+  decideSemanticAction,
   normalizeJsonValue,
   payloadHash,
   structuredToolResultSchema,
   type ActionRequest,
+  type ActionEvidence,
+  type AuthorityGrant,
+  type AuthorityGrantUsage,
   type BrowserReadDecision,
   type BrowserReadObservation,
   type RunEventType,
@@ -57,6 +64,58 @@ function durableToolResultHash(result: StructuredToolResult): string {
     retryEligible: result.retryEligible,
     startedAt: result.startedAt,
     completedAt: result.completedAt,
+  });
+}
+
+interface AuthorityGrantRow {
+  id: string;
+  workspace_id: string;
+  version: number;
+  name: string;
+  effects: string[];
+  resource_classes: string[];
+  providers: string[];
+  origins: string[];
+  account_ids: string[];
+  counterparty_ids: string[];
+  recipient_ids: string[];
+  per_action_limit: unknown | null;
+  rolling_limit: unknown | null;
+  max_uses: number | null;
+  minimum_interval_seconds: number;
+  quiet_hours: unknown | null;
+  starts_at: Date;
+  expires_at: Date;
+  revoked_at: Date | null;
+  always_require_fresh_approval: boolean;
+  always_require_human_takeover: boolean;
+  configuration_version: string;
+}
+
+function parseAuthorityGrantRow(row: AuthorityGrantRow): AuthorityGrant {
+  return authorityGrantSchema.parse({
+    id: row.id,
+    workspaceId: row.workspace_id,
+    version: row.version,
+    name: row.name,
+    effects: row.effects,
+    resourceClasses: row.resource_classes,
+    providers: row.providers,
+    origins: row.origins,
+    accountIds: row.account_ids,
+    counterpartyIds: row.counterparty_ids,
+    recipientIds: row.recipient_ids,
+    perActionLimit: row.per_action_limit,
+    rollingLimit: row.rolling_limit,
+    maxUses: row.max_uses,
+    minimumIntervalSeconds: row.minimum_interval_seconds,
+    quietHours: row.quiet_hours,
+    startsAt: row.starts_at.toISOString(),
+    expiresAt: row.expires_at.toISOString(),
+    revokedAt: row.revoked_at?.toISOString() ?? null,
+    alwaysRequireFreshApproval: row.always_require_fresh_approval,
+    alwaysRequireHumanTakeover: row.always_require_human_takeover,
+    configurationVersion: row.configuration_version,
   });
 }
 
@@ -261,8 +320,58 @@ export class OpenInstinctStore {
     sql: Sql | postgres.TransactionSql,
     rawResult: StructuredToolResult,
     claimToken?: string,
+    rawEvidence?: ActionEvidence,
   ): Promise<boolean> {
     const result = structuredToolResultSchema.parse(rawResult);
+    let evidence = rawEvidence
+      ? actionEvidenceSchema.parse(rawEvidence)
+      : undefined;
+    if (
+      evidence &&
+      (evidence.workspaceId !== result.workspaceId ||
+        evidence.runId !== result.runId ||
+        evidence.workflowStepId !== result.stepId ||
+        evidence.actionRequestId !== result.actionRequestId ||
+        (evidence.toolResultId && evidence.toolResultId !== result.id))
+    )
+      throw new Error("Action evidence lineage does not match its result.");
+    if (result.actionRequestId) {
+      const [semantic] = await sql<{ semantic_intent_hash: string | null }[]>`
+        select semantic_intent_hash from public.action_requests
+        where id = ${result.actionRequestId} and workspace_id = ${result.workspaceId}
+      `;
+      if (
+        semantic?.semantic_intent_hash &&
+        result.certainty === "succeeded" &&
+        (!evidence ||
+          evidence.phase !== "postcondition" ||
+          evidence.outcome !== "observed")
+      )
+        throw new Error(
+          "Successful semantic actions require observed postcondition evidence.",
+        );
+      if (
+        semantic?.semantic_intent_hash &&
+        result.certainty === "unknown" &&
+        !evidence
+      )
+        evidence = actionEvidenceSchema.parse({
+          id: randomUUID(),
+          workspaceId: result.workspaceId,
+          runId: result.runId,
+          actionRequestId: result.actionRequestId,
+          workflowStepId: result.stepId,
+          toolResultId: result.id,
+          phase: "commit_response",
+          outcome: "inconclusive",
+          verifier: "execution.invocation-fence",
+          verifierVersion: 1,
+          safeSummary:
+            "Provider outcome is unknown; the action was not replayed.",
+          facts: { errorCode: result.errorCode ?? "provider_outcome_unknown" },
+          capturedAt: result.completedAt,
+        });
+    }
     const resultHash = durableToolResultHash(result);
     const inserted = await sql`
       insert into public.tool_results (
@@ -298,6 +407,55 @@ export class OpenInstinctStore {
         throw new Error("Conflicting result already exists for this action.");
       return false;
     }
+    if (evidence) {
+      const facts = normalizeJsonValue(evidence.facts);
+      const evidenceHash = payloadHash(facts);
+      await sql`
+        insert into public.action_evidence (
+          id, workspace_id, run_id, action_request_id, workflow_step_id,
+          tool_result_id, phase, outcome, verifier, verifier_version,
+          evidence_hash, safe_summary, captured_at
+        ) values (
+          ${evidence.id}, ${evidence.workspaceId}, ${evidence.runId},
+          ${evidence.actionRequestId}, ${evidence.workflowStepId}, ${result.id},
+          ${evidence.phase}, ${evidence.outcome}, ${evidence.verifier},
+          ${evidence.verifierVersion}, ${evidenceHash},
+          ${evidence.safeSummary ?? null}, ${new Date(evidence.capturedAt)}
+        )
+      `;
+      await sql`
+        insert into app_private.action_evidence_payloads (
+          evidence_id, workspace_id, redacted_facts, payload_hash, redaction_version
+        ) values (
+          ${evidence.id}, ${evidence.workspaceId}, ${sql.json(toJson(facts))},
+          ${evidenceHash}, 1
+        )
+      `;
+    }
+    if (result.actionRequestId && result.certainty === "unknown") {
+      const caseId = randomUUID();
+      const automated =
+        result.toolName.startsWith("google.") ||
+        result.toolName.startsWith("memory.") ||
+        result.toolName.startsWith("schedule.");
+      const created = await sql`
+        insert into public.reconciliation_cases (
+          id, workspace_id, run_id, action_request_id, unknown_result_id,
+          method, status, next_attempt_at
+        ) values (
+          ${caseId}, ${result.workspaceId}, ${result.runId},
+          ${result.actionRequestId}, ${result.id},
+          ${automated ? "postcondition_read" : "owner_confirmation"},
+          ${automated ? "pending" : "manual_required"}, now()
+        ) on conflict (unknown_result_id) do nothing returning id
+      `;
+      if (created.length === 1 && automated)
+        await sql`select pgmq.send('agent_jobs', ${sql.json({
+          type: "reconcile_action",
+          caseId,
+          workspaceId: result.workspaceId,
+        })}::jsonb)`;
+    }
 
     const actionStatus = ["succeeded", "reconciled_succeeded"].includes(
       result.certainty,
@@ -325,6 +483,18 @@ export class OpenInstinctStore {
         throw new Error(
           "Action execution state changed before result persistence.",
         );
+      await sql`
+        update public.authority_usages
+        set status = ${
+          result.certainty === "succeeded"
+            ? "committed"
+            : result.certainty === "unknown"
+              ? "unknown"
+              : "released"
+        }, terminal_at = now()
+        where action_request_id = ${result.actionRequestId}
+          and workspace_id = ${result.workspaceId} and status = 'reserved'
+      `;
     }
     const stepUpdate = await sql`
       update public.workflow_steps
@@ -837,12 +1007,178 @@ export class OpenInstinctStore {
       );
   }
 
+  async listAuthorityGrantCandidates(
+    workspaceId: string,
+  ): Promise<readonly { grant: AuthorityGrant; usage: AuthorityGrantUsage }[]> {
+    const rows = await this.#sql<
+      (AuthorityGrantRow & { database_now: Date })[]
+    >`
+      select id, workspace_id, version, name, effects, resource_classes,
+        providers, origins, account_ids, counterparty_ids, recipient_ids,
+        per_action_limit, rolling_limit, max_uses, minimum_interval_seconds,
+        quiet_hours, starts_at, expires_at, revoked_at,
+        always_require_fresh_approval, always_require_human_takeover,
+        configuration_version, now() as database_now
+      from public.authority_grants
+      where workspace_id = ${workspaceId} and revoked_at is null and expires_at > now()
+      order by created_at asc limit 100
+    `;
+    return Promise.all(
+      rows.map(async (row) => ({
+        grant: parseAuthorityGrantRow(row),
+        usage: await this.#authorityGrantUsage(
+          this.#sql,
+          row,
+          row.database_now,
+        ),
+      })),
+    );
+  }
+
+  async createAuthorityGrant(grantInput: AuthorityGrant): Promise<void> {
+    const grant = authorityGrantSchema.parse(grantInput);
+    const { configurationVersion, ...configuration } = grant;
+    if (
+      configurationVersion !== authorityGrantConfigurationVersion(configuration)
+    )
+      throw new Error("Authority grant configuration hash mismatch.");
+    await this.#sql.begin(async (tx) => {
+      await tx`
+        insert into public.authority_grants (
+          id, workspace_id, version, name, effects, resource_classes,
+          providers, origins, account_ids, counterparty_ids, recipient_ids,
+          per_action_limit, rolling_limit, max_uses, minimum_interval_seconds,
+          quiet_hours, starts_at, expires_at, revoked_at,
+          always_require_fresh_approval, always_require_human_takeover,
+          configuration_version
+        ) values (
+          ${grant.id}, ${grant.workspaceId}, ${grant.version}, ${grant.name},
+          ${grant.effects}, ${grant.resourceClasses}, ${grant.providers},
+          ${grant.origins}, ${grant.accountIds}, ${grant.counterpartyIds},
+          ${grant.recipientIds},
+          ${grant.perActionLimit ? tx.json(toJson(grant.perActionLimit)) : null},
+          ${grant.rollingLimit ? tx.json(toJson(grant.rollingLimit)) : null},
+          ${grant.maxUses}, ${grant.minimumIntervalSeconds},
+          ${grant.quietHours ? tx.json(toJson(grant.quietHours)) : null},
+          ${new Date(grant.startsAt)}, ${new Date(grant.expiresAt)},
+          ${grant.revokedAt ? new Date(grant.revokedAt) : null},
+          ${grant.alwaysRequireFreshApproval},
+          ${grant.alwaysRequireHumanTakeover}, ${configurationVersion}
+        )
+      `;
+      await this.#writeAuditEvent(tx, {
+        workspaceId: grant.workspaceId,
+        actor: "owner",
+        action: "authority.grant_created",
+        eventKey: `authority_grant:${grant.id}:created`,
+        targetType: "authority_grant",
+        targetId: grant.id,
+        detail: { configurationVersion, effects: grant.effects },
+      });
+    });
+  }
+
+  async revokeAuthorityGrant(input: {
+    workspaceId: string;
+    grantId: string;
+  }): Promise<void> {
+    await this.#sql.begin(async (tx) => {
+      const updated = await tx`
+        update public.authority_grants set revoked_at = now()
+        where id = ${input.grantId} and workspace_id = ${input.workspaceId}
+          and revoked_at is null returning id
+      `;
+      if (updated.length !== 1)
+        throw new Error("Active authority grant was not found.");
+      await this.#writeAuditEvent(tx, {
+        workspaceId: input.workspaceId,
+        actor: "owner",
+        action: "authority.grant_revoked",
+        eventKey: `authority_grant:${input.grantId}:revoked`,
+        targetType: "authority_grant",
+        targetId: input.grantId,
+        detail: {},
+      });
+    });
+  }
+
+  async #authorityGrantUsage(
+    sql: Sql | postgres.TransactionSql,
+    row: AuthorityGrantRow,
+    now: Date,
+  ): Promise<AuthorityGrantUsage> {
+    const usages = await sql<
+      {
+        reserved_at: Date;
+        amount: { currency?: unknown; minorUnits?: unknown } | null;
+      }[]
+    >`
+      select reserved_at, amount from public.authority_usages
+      where grant_id = ${row.id} and workspace_id = ${row.workspace_id}
+        and status in ('reserved','committed','unknown')
+      order by reserved_at desc
+    `;
+    const grant = parseAuthorityGrantRow(row);
+    const rollingStart = grant.rollingLimit
+      ? now.getTime() - grant.rollingLimit.windowSeconds * 1_000
+      : Number.NEGATIVE_INFINITY;
+    let rollingMinorUnits = 0n;
+    for (const usage of usages) {
+      if (usage.reserved_at.getTime() < rollingStart || !usage.amount) continue;
+      if (
+        usage.amount.currency === grant.rollingLimit?.amount.currency &&
+        typeof usage.amount.minorUnits === "string" &&
+        /^(0|[1-9][0-9]*)$/u.test(usage.amount.minorUnits)
+      )
+        rollingMinorUnits += BigInt(usage.amount.minorUnits);
+    }
+    return {
+      uses: usages.length,
+      lastUsedAt: usages[0]?.reserved_at.toISOString(),
+      rollingMinorUnits: rollingMinorUnits.toString(),
+    };
+  }
+
+  async assertAuthorityGrantReservation(
+    actionInput: ActionRequest,
+  ): Promise<void> {
+    const action = actionRequestSchema.parse(actionInput);
+    if (!action.authorityGrantId) return;
+    const [valid] = await this.#sql`
+      select u.id
+      from public.authority_usages u
+      join public.authority_grants g on g.id = u.grant_id
+        and g.workspace_id = u.workspace_id
+      where u.action_request_id = ${action.id}
+        and u.workspace_id = ${action.workspaceId}
+        and u.grant_id = ${action.authorityGrantId}
+        and u.status = 'reserved'
+        and u.semantic_intent_hash = ${action.semanticIntentHash ?? null}
+        and u.guard_conditions_hash = ${action.guardConditionsHash ?? null}
+        and u.grant_configuration_version = g.configuration_version
+        and g.revoked_at is null and g.starts_at <= now() and g.expires_at > now()
+    `;
+    if (!valid)
+      throw new Error("Authority grant changed before the commit point.");
+  }
+
   async saveActionRequest(
     action: ActionRequest,
     claimToken?: string,
-  ): Promise<void> {
+  ): Promise<"approval_required" | "authorized"> {
     const value = actionRequestSchema.parse(action);
-    await this.#sql.begin(async (tx) => {
+    if (
+      !value.semanticIntent ||
+      !value.semanticIntentHash ||
+      !value.guardConditions ||
+      !value.guardConditionsHash
+    )
+      throw new Error("New action requests require semantic authorization.");
+    const semanticIntent = value.semanticIntent;
+    const semanticIntentHash = value.semanticIntentHash;
+    const guardConditions = value.guardConditions;
+    const guardConditionsHash = value.guardConditionsHash;
+    return this.#sql.begin(async (tx) => {
       const [run] = await tx<{ status: string }[]>`
         select status from public.agent_runs
         where id = ${value.runId} and workspace_id = ${value.workspaceId}
@@ -851,12 +1187,56 @@ export class OpenInstinctStore {
       `;
       if (!run || run.status !== "running")
         throw new Error("Run cannot wait for this action.");
+      let authorized = false;
+      let grant: AuthorityGrant | undefined;
+      if (value.authorityGrantId) {
+        const [databaseClock] = await tx<{ now: Date }[]>`select now() as now`;
+        if (!databaseClock) throw new Error("Database clock is unavailable.");
+        const [grantRow] = await tx<AuthorityGrantRow[]>`
+          select id, workspace_id, version, name, effects, resource_classes,
+            providers, origins, account_ids, counterparty_ids, recipient_ids,
+            per_action_limit, rolling_limit, max_uses, minimum_interval_seconds,
+            quiet_hours, starts_at, expires_at, revoked_at,
+            always_require_fresh_approval, always_require_human_takeover,
+            configuration_version
+          from public.authority_grants
+          where id = ${value.authorityGrantId} and workspace_id = ${value.workspaceId}
+          for update
+        `;
+        if (!grantRow) throw new Error("Authority grant is unavailable.");
+        grant = parseAuthorityGrantRow(grantRow);
+        const decision = decideSemanticAction({
+          intent: semanticIntent,
+          grants: [
+            {
+              grant,
+              usage: await this.#authorityGrantUsage(
+                tx,
+                grantRow,
+                databaseClock.now,
+              ),
+            },
+          ],
+          now: databaseClock.now,
+        });
+        if (
+          decision.type !== "allow" ||
+          decision.authorityGrantId !== value.authorityGrantId
+        )
+          throw new Error("Authority grant no longer authorizes this action.");
+        authorized = true;
+      }
       await tx`
         insert into public.action_requests (
-          id, workspace_id, run_id, tool_name, risk, summary, input, input_hash, status, expires_at
+          id, workspace_id, run_id, tool_name, risk, summary, input, input_hash,
+          semantic_intent, semantic_intent_hash, guard_conditions,
+          guard_conditions_hash, authority_grant_id, status, expires_at
         ) values (
           ${value.id}, ${value.workspaceId}, ${value.runId}, ${value.toolName}, ${value.risk},
-          ${value.summary}, ${tx.json(toJson(value.input))}, ${value.inputHash}, ${value.status},
+          ${value.summary}, ${tx.json(toJson(value.input))}, ${value.inputHash},
+          ${tx.json(toJson(semanticIntent))}, ${semanticIntentHash},
+          ${tx.json(toJson(guardConditions))}, ${guardConditionsHash},
+          ${value.authorityGrantId ?? null}, ${authorized ? "approved" : value.status},
           ${new Date(value.expiresAt)}
         )
       `;
@@ -872,8 +1252,22 @@ export class OpenInstinctStore {
         returning id, position
       `;
       if (!step) throw new Error("Could not create workflow step.");
+      if (authorized && grant)
+        await tx`
+          insert into public.authority_usages (
+            workspace_id, grant_id, action_request_id,
+            grant_configuration_version, semantic_intent_hash,
+            guard_conditions_hash, status, amount
+          ) values (
+            ${value.workspaceId}, ${grant.id}, ${value.id},
+            ${grant.configurationVersion}, ${semanticIntentHash},
+            ${guardConditionsHash}, 'reserved',
+            ${semanticIntent.amount ? tx.json(toJson(semanticIntent.amount)) : null}
+          )
+        `;
       const updated = await tx`
-        update public.agent_runs set status = 'waiting_approval', waiting_for = ${value.id},
+        update public.agent_runs set status = ${authorized ? "queued" : "waiting_approval"},
+          waiting_for = ${authorized ? null : value.id},
           claim_token = null, lease_expires_at = null
         where id = ${value.runId} and workspace_id = ${value.workspaceId}
           and status = 'running'
@@ -882,6 +1276,13 @@ export class OpenInstinctStore {
       `;
       if (updated.length !== 1)
         throw new Error("Run cannot wait for this action.");
+      if (authorized)
+        await tx`select pgmq.send('agent_jobs', ${tx.json({
+          type: "resume_run",
+          runId: value.runId,
+          workspaceId: value.workspaceId,
+          actionId: value.id,
+        })}::jsonb)`;
       await this.#appendRunEvent(tx, {
         workspaceId: value.workspaceId,
         runId: value.runId,
@@ -893,6 +1294,9 @@ export class OpenInstinctStore {
           toolName: value.toolName,
           risk: value.risk,
           inputHash: value.inputHash,
+          semanticIntentHash,
+          guardConditionsHash,
+          authorityGrantId: value.authorityGrantId,
           position: step.position,
         },
       });
@@ -910,8 +1314,29 @@ export class OpenInstinctStore {
           toolName: value.toolName,
           risk: value.risk,
           inputHash: value.inputHash,
+          semanticIntentHash,
+          guardConditionsHash,
+          authorityGrantId: value.authorityGrantId,
         },
       });
+      await this.#writeAuditEvent(tx, {
+        workspaceId: value.workspaceId,
+        actor: "system",
+        action: "policy.decided",
+        eventKey: `action:${value.id}:policy`,
+        targetType: "action_request",
+        targetId: value.id,
+        runId: value.runId,
+        stepId: step.id,
+        actionRequestId: value.id,
+        detail: {
+          decision: authorized ? "grant" : "exact_approval",
+          semanticIntentHash,
+          guardConditionsHash,
+          authorityGrantId: value.authorityGrantId,
+        },
+      });
+      return authorized ? "authorized" : "approval_required";
     });
   }
 
@@ -1098,17 +1523,24 @@ export class OpenInstinctStore {
     inputHash: string;
     channel: string;
     reason?: string;
+    semanticIntentHash?: string;
+    guardConditionsHash?: string;
+    typedConfirmation?: boolean;
   }): Promise<{ runId: string }> {
     const result = await this.#sql.begin(async (tx) => {
       const [action] = await tx<
         {
           run_id: string;
           input_hash: string;
+          semantic_intent_hash: string | null;
+          guard_conditions_hash: string | null;
+          authority_grant_id: string | null;
           status: string;
           expires_at: Date;
         }[]
       >`
-        select run_id, input_hash, status, expires_at from public.action_requests
+        select run_id, input_hash, semantic_intent_hash, guard_conditions_hash,
+          authority_grant_id, status, expires_at from public.action_requests
         where id = ${input.actionId} and workspace_id = ${input.workspaceId}
         for update
       `;
@@ -1160,12 +1592,22 @@ export class OpenInstinctStore {
       }
       if (action.input_hash !== input.inputHash)
         throw new Error("Approval payload hash mismatch.");
+      if (
+        action.semantic_intent_hash &&
+        (action.semantic_intent_hash !== input.semanticIntentHash ||
+          action.guard_conditions_hash !== input.guardConditionsHash)
+      )
+        throw new Error("Approval semantic binding mismatch.");
       await tx`
         insert into public.approvals (
-          workspace_id, action_request_id, approved, input_hash, channel, reason
+          workspace_id, action_request_id, approved, input_hash, channel, reason,
+          semantic_intent_hash, guard_conditions_hash, authority_grant_id,
+          typed_confirmation
         ) values (
           ${input.workspaceId}, ${input.actionId}, ${input.approved}, ${input.inputHash},
-          ${input.channel}, ${input.reason ?? null}
+          ${input.channel}, ${input.reason ?? null},
+          ${action.semantic_intent_hash}, ${action.guard_conditions_hash},
+          ${action.authority_grant_id}, ${input.typedConfirmation ?? false}
         )
       `;
       await tx`
@@ -1215,6 +1657,8 @@ export class OpenInstinctStore {
           approved: input.approved,
           channel: input.channel,
           inputHash: input.inputHash,
+          semanticIntentHash: action.semantic_intent_hash,
+          guardConditionsHash: action.guard_conditions_hash,
         },
       });
       await this.#writeAuditEvent(tx, {
@@ -1227,7 +1671,12 @@ export class OpenInstinctStore {
         runId: action.run_id,
         stepId: step?.id,
         actionRequestId: input.actionId,
-        detail: { channel: input.channel, inputHash: input.inputHash },
+        detail: {
+          channel: input.channel,
+          inputHash: input.inputHash,
+          semanticIntentHash: action.semantic_intent_hash,
+          guardConditionsHash: action.guard_conditions_hash,
+        },
       });
       if (!input.approved)
         await this.#appendRunEvent(tx, {
@@ -1264,6 +1713,11 @@ export class OpenInstinctStore {
         returning id, workspace_id
       `;
       if (!action) return false;
+      await tx`
+        update public.authority_usages set status = 'released', terminal_at = now()
+        where action_request_id = ${action.id}
+          and workspace_id = ${action.workspace_id} and status = 'reserved'
+      `;
       const [step] = await tx<{ id: string }[]>`
         update public.workflow_steps set status = 'cancelled', completed_at = now()
         where action_request_id = ${action.id}
@@ -1311,6 +1765,11 @@ export class OpenInstinctStore {
           summary: string;
           input: Record<string, unknown>;
           input_hash: string;
+          semantic_intent: Record<string, unknown> | null;
+          semantic_intent_hash: string | null;
+          guard_conditions: Record<string, unknown> | null;
+          guard_conditions_hash: string | null;
+          authority_grant_id: string | null;
           status: ActionRequest["status"];
           expires_at: Date;
         }[]
@@ -1321,6 +1780,29 @@ export class OpenInstinctStore {
           where run_id = ${runId}
             and id = ${actionId}
             and status = 'approved' and expires_at > now()
+            and (
+              exists (
+                select 1 from public.approvals p
+                where p.action_request_id = public.action_requests.id
+                  and p.workspace_id = public.action_requests.workspace_id
+                  and p.approved
+                  and p.input_hash = public.action_requests.input_hash
+                  and p.semantic_intent_hash is not distinct from public.action_requests.semantic_intent_hash
+                  and p.guard_conditions_hash is not distinct from public.action_requests.guard_conditions_hash
+                  and p.authority_grant_id is not distinct from public.action_requests.authority_grant_id
+              )
+              or exists (
+                select 1 from public.authority_usages u
+                join public.authority_grants g on g.id = u.grant_id
+                  and g.workspace_id = u.workspace_id
+                where u.action_request_id = public.action_requests.id
+                  and u.workspace_id = public.action_requests.workspace_id
+                  and u.status = 'reserved'
+                  and u.semantic_intent_hash = public.action_requests.semantic_intent_hash
+                  and u.guard_conditions_hash = public.action_requests.guard_conditions_hash
+                  and u.grant_configuration_version = g.configuration_version
+              )
+            )
             and exists (
               select 1 from public.agent_runs r where r.id = ${runId}
                 and r.status = 'running'
@@ -1330,7 +1812,8 @@ export class OpenInstinctStore {
           for update skip locked
         )
         returning id, workspace_id, run_id, tool_name, risk, summary, input, input_hash,
-          status, expires_at
+          semantic_intent, semantic_intent_hash, guard_conditions,
+          guard_conditions_hash, authority_grant_id, status, expires_at
       `;
       if (!row) return;
       if (payloadHash(row.input) !== row.input_hash) {
@@ -1451,6 +1934,11 @@ export class OpenInstinctStore {
         summary: row.summary,
         input: row.input,
         inputHash: row.input_hash,
+        semanticIntent: row.semantic_intent ?? undefined,
+        semanticIntentHash: row.semantic_intent_hash ?? undefined,
+        guardConditions: row.guard_conditions ?? undefined,
+        guardConditionsHash: row.guard_conditions_hash ?? undefined,
+        authorityGrantId: row.authority_grant_id ?? undefined,
         status: row.status,
         expiresAt: row.expires_at.toISOString(),
       }),
@@ -1469,6 +1957,71 @@ export class OpenInstinctStore {
     claimToken: string;
   }): Promise<void> {
     await this.#sql.begin(async (tx) => {
+      const lockedRun = await tx`
+        select id from public.agent_runs
+        where id = ${input.runId} and workspace_id = ${input.workspaceId}
+          and status = 'running' and claim_token = ${input.claimToken}
+          and lease_expires_at > now()
+        for update
+      `;
+      if (lockedRun.length !== 1)
+        throw new Error("Run lease changed before the commit point.");
+      const [authority] = await tx<
+        {
+          authority_grant_id: string | null;
+          connection_id: string | null;
+          connection_config_version: string | null;
+          account_id: string | null;
+        }[]
+      >`
+        select a.authority_grant_id,
+          a.guard_conditions->>'connectionId' as connection_id,
+          a.guard_conditions->>'connectionConfigVersion' as connection_config_version,
+          a.guard_conditions->>'accountId' as account_id
+        from public.action_requests a
+        where a.id = ${input.actionId} and a.workspace_id = ${input.workspaceId}
+          and a.run_id = ${input.runId} and a.status = 'executing'
+          and a.expires_at > now()
+        for update of a
+      `;
+      if (!authority)
+        throw new Error("Action authority snapshot changed unexpectedly.");
+      if (authority.authority_grant_id) {
+        const lockedGrant = await tx`
+          select u.id
+          from public.authority_usages u
+          join public.authority_grants g on g.id = u.grant_id
+            and g.workspace_id = u.workspace_id
+          join public.action_requests a on a.id = u.action_request_id
+            and a.workspace_id = u.workspace_id
+          where a.id = ${input.actionId} and a.workspace_id = ${input.workspaceId}
+            and u.grant_id = ${authority.authority_grant_id}
+            and u.status = 'reserved'
+            and u.semantic_intent_hash = a.semantic_intent_hash
+            and u.guard_conditions_hash = a.guard_conditions_hash
+            and u.grant_configuration_version = g.configuration_version
+            and g.revoked_at is null
+            and g.starts_at <= now() and g.expires_at > now()
+          for update of u, g
+        `;
+        if (lockedGrant.length !== 1)
+          throw new Error("Authority grant changed before the commit point.");
+      }
+      if (authority.connection_id) {
+        const lockedConnection = await tx`
+          select c.id from public.connections c
+          where c.id = ${authority.connection_id}::uuid
+            and c.workspace_id = ${input.workspaceId} and c.status = 'active'
+            and c.metadata->>'configVersion' = ${authority.connection_config_version}
+            and coalesce(c.metadata->>'accountId', c.account_id)
+              is not distinct from ${authority.account_id}
+          for update of c
+        `;
+        if (lockedConnection.length !== 1)
+          throw new Error(
+            "Guarded connection changed before the commit point.",
+          );
+      }
       const updated = await tx`
         update public.workflow_steps set execution_phase = 'invocation_started'
         where id = ${input.stepId} and workspace_id = ${input.workspaceId}
@@ -1479,6 +2032,52 @@ export class OpenInstinctStore {
             select 1 from public.agent_runs r where r.id = ${input.runId}
               and r.workspace_id = ${input.workspaceId} and r.status = 'running'
               and r.claim_token = ${input.claimToken}
+              and r.lease_expires_at > now()
+          )
+          and exists (
+            select 1 from public.action_requests a
+            where a.id = ${input.actionId}
+              and a.workspace_id = ${input.workspaceId}
+              and a.run_id = ${input.runId}
+              and a.status = 'executing'
+              and a.expires_at > now()
+              and (
+                (a.authority_grant_id is null and exists (
+                  select 1 from public.approvals p
+                  where p.action_request_id = a.id
+                    and p.workspace_id = a.workspace_id and p.approved
+                    and p.input_hash = a.input_hash
+                    and p.semantic_intent_hash is not distinct from a.semantic_intent_hash
+                    and p.guard_conditions_hash is not distinct from a.guard_conditions_hash
+                    and p.authority_grant_id is null
+                ))
+                or exists (
+                  select 1 from public.authority_usages u
+                  join public.authority_grants g on g.id = u.grant_id
+                    and g.workspace_id = u.workspace_id
+                  where u.action_request_id = a.id
+                    and u.workspace_id = a.workspace_id
+                    and u.grant_id = a.authority_grant_id
+                    and u.status = 'reserved'
+                    and u.semantic_intent_hash = a.semantic_intent_hash
+                    and u.guard_conditions_hash = a.guard_conditions_hash
+                    and u.grant_configuration_version = g.configuration_version
+                    and g.revoked_at is null
+                    and g.starts_at <= now() and g.expires_at > now()
+                )
+              )
+              and (
+                a.guard_conditions->>'connectionId' is null
+                or exists (
+                  select 1 from public.connections c
+                  where c.id = (a.guard_conditions->>'connectionId')::uuid
+                    and c.workspace_id = a.workspace_id and c.status = 'active'
+                    and c.metadata->>'configVersion' =
+                      a.guard_conditions->>'connectionConfigVersion'
+                    and coalesce(c.metadata->>'accountId', c.account_id)
+                      is not distinct from a.guard_conditions->>'accountId'
+                )
+              )
           )
         returning id
       `;
@@ -1546,10 +2145,200 @@ export class OpenInstinctStore {
   async persistToolResult(
     result: StructuredToolResult,
     claimToken: string,
+    evidence?: ActionEvidence,
   ): Promise<boolean> {
     return this.#sql.begin((tx) =>
-      this.#persistToolResultProjection(tx, result, claimToken),
+      this.#persistToolResultProjection(tx, result, claimToken, evidence),
     );
+  }
+
+  async claimReconciliationCase(input: {
+    caseId: string;
+    workspaceId: string;
+    claimToken: string;
+  }): Promise<
+    | {
+        caseId: string;
+        unknownResultId: string;
+        attempt: number;
+        action: ActionRequest;
+      }
+    | undefined
+  > {
+    return this.#sql.begin(async (tx) => {
+      const [claimed] = await tx<
+        {
+          id: string;
+          run_id: string;
+          action_request_id: string;
+          unknown_result_id: string;
+          attempt: number;
+        }[]
+      >`
+        update public.reconciliation_cases set status = 'running',
+          attempt = attempt + 1
+        where id = ${input.caseId} and workspace_id = ${input.workspaceId}
+          and (
+            (status in ('pending','inconclusive') and next_attempt_at <= now())
+            or (status = 'running' and not exists (
+              select 1 from app_private.reconciliation_claims l
+              where l.case_id = public.reconciliation_cases.id
+                and l.workspace_id = public.reconciliation_cases.workspace_id
+                and l.lease_expires_at > now()
+            ))
+          )
+          and attempt < max_attempts
+        returning id, run_id, action_request_id, unknown_result_id, attempt
+      `;
+      if (!claimed) {
+        await tx`
+          update public.reconciliation_cases c
+          set status = 'manual_required',
+            last_error_code = coalesce(last_error_code, 'reconciliation_attempts_exhausted')
+          where c.id = ${input.caseId} and c.workspace_id = ${input.workspaceId}
+            and c.status = 'running' and c.attempt >= c.max_attempts
+            and not exists (
+              select 1 from app_private.reconciliation_claims l
+              where l.case_id = c.id and l.workspace_id = c.workspace_id
+                and l.lease_expires_at > now()
+            )
+        `;
+        const [nonterminal] = await tx`
+          select id from public.reconciliation_cases
+          where id = ${input.caseId} and workspace_id = ${input.workspaceId}
+            and status in ('pending','running','inconclusive')
+            and attempt < max_attempts
+        `;
+        if (nonterminal)
+          await tx`select pgmq.send('agent_jobs', ${tx.json({
+            type: "reconcile_action",
+            caseId: input.caseId,
+            workspaceId: input.workspaceId,
+          })}::jsonb, 30)`;
+        return;
+      }
+      await tx`
+        insert into app_private.reconciliation_claims (
+          case_id, workspace_id, lease_epoch, claim_token_hash, lease_expires_at
+        ) values (
+          ${claimed.id}, ${input.workspaceId}, ${claimed.attempt},
+          ${payloadHash(input.claimToken)}, now() + interval '5 minutes'
+        ) on conflict (case_id, workspace_id) do update set
+          lease_epoch = excluded.lease_epoch,
+          claim_token_hash = excluded.claim_token_hash,
+          lease_expires_at = excluded.lease_expires_at
+      `;
+      const [row] = await tx<
+        {
+          id: string;
+          workspace_id: string;
+          run_id: string;
+          tool_name: string;
+          risk: ActionRequest["risk"];
+          summary: string;
+          input: Record<string, unknown>;
+          input_hash: string;
+          semantic_intent: Record<string, unknown> | null;
+          semantic_intent_hash: string | null;
+          guard_conditions: Record<string, unknown> | null;
+          guard_conditions_hash: string | null;
+          authority_grant_id: string | null;
+          status: ActionRequest["status"];
+          expires_at: Date;
+        }[]
+      >`
+        select id, workspace_id, run_id, tool_name, risk, summary, input,
+          input_hash, semantic_intent, semantic_intent_hash, guard_conditions,
+          guard_conditions_hash, authority_grant_id, status, expires_at
+        from public.action_requests
+        where id = ${claimed.action_request_id}
+          and workspace_id = ${input.workspaceId} and status = 'unknown'
+      `;
+      if (!row)
+        throw new Error("Unknown action is unavailable for reconciliation.");
+      return {
+        caseId: claimed.id,
+        unknownResultId: claimed.unknown_result_id,
+        attempt: claimed.attempt,
+        action: actionRequestSchema.parse({
+          id: row.id,
+          workspaceId: row.workspace_id,
+          runId: row.run_id,
+          toolName: row.tool_name,
+          risk: row.risk,
+          summary: row.summary,
+          input: row.input,
+          inputHash: row.input_hash,
+          semanticIntent: row.semantic_intent ?? undefined,
+          semanticIntentHash: row.semantic_intent_hash ?? undefined,
+          guardConditions: row.guard_conditions ?? undefined,
+          guardConditionsHash: row.guard_conditions_hash ?? undefined,
+          authorityGrantId: row.authority_grant_id ?? undefined,
+          status: row.status,
+          expiresAt: row.expires_at.toISOString(),
+        }),
+      };
+    });
+  }
+
+  async renewReconciliationLease(input: {
+    caseId: string;
+    workspaceId: string;
+    claimToken: string;
+    attempt: number;
+  }): Promise<void> {
+    const renewed = await this.#sql`
+      update app_private.reconciliation_claims l
+      set lease_expires_at = now() + interval '5 minutes'
+      where l.case_id = ${input.caseId} and l.workspace_id = ${input.workspaceId}
+        and l.lease_epoch = ${input.attempt}
+        and l.claim_token_hash = ${payloadHash(input.claimToken)}
+        and exists (
+          select 1 from public.reconciliation_cases c
+          where c.id = l.case_id and c.workspace_id = l.workspace_id
+            and c.status = 'running' and c.attempt = l.lease_epoch
+        )
+      returning case_id
+    `;
+    if (renewed.length !== 1)
+      throw new Error("Reconciliation lease changed unexpectedly.");
+  }
+
+  async markReconciliationInconclusive(input: {
+    caseId: string;
+    workspaceId: string;
+    claimToken: string;
+    errorCode: string;
+  }): Promise<void> {
+    await this.#sql.begin(async (tx) => {
+      const [updated] = await tx<{ status: string }[]>`
+        update public.reconciliation_cases c
+        set status = case when c.attempt >= c.max_attempts
+            then 'manual_required' else 'inconclusive' end,
+          next_attempt_at = now() + interval '30 seconds',
+          last_error_code = ${input.errorCode}
+        where c.id = ${input.caseId} and c.workspace_id = ${input.workspaceId}
+          and c.status = 'running'
+          and exists (
+            select 1 from app_private.reconciliation_claims l
+            where l.case_id = c.id and l.workspace_id = c.workspace_id
+              and l.claim_token_hash = ${payloadHash(input.claimToken)}
+              and l.lease_expires_at > now()
+          ) returning status
+      `;
+      if (!updated)
+        throw new Error("Reconciliation lease changed unexpectedly.");
+      await tx`
+        delete from app_private.reconciliation_claims
+        where case_id = ${input.caseId} and workspace_id = ${input.workspaceId}
+      `;
+      if (updated.status === "inconclusive")
+        await tx`select pgmq.send('agent_jobs', ${tx.json({
+          type: "reconcile_action",
+          caseId: input.caseId,
+          workspaceId: input.workspaceId,
+        })}::jsonb, 30)`;
+    });
   }
 
   async reconcileUnknownResult(input: {
@@ -1557,8 +2346,23 @@ export class OpenInstinctStore {
     workspaceId: string;
     certainty: "reconciled_succeeded" | "reconciled_failed";
     evidence: Record<string, unknown>;
+    caseId: string;
+    claimToken: string;
   }): Promise<StructuredToolResult> {
     const result = await this.#sql.begin(async (tx) => {
+      const leased = await tx`
+        select c.id from public.reconciliation_cases c
+        join app_private.reconciliation_claims l on l.case_id = c.id
+          and l.workspace_id = c.workspace_id
+        where c.id = ${input.caseId} and c.workspace_id = ${input.workspaceId}
+          and c.unknown_result_id = ${input.unknownResultId}
+          and c.status = 'running' and c.attempt = l.lease_epoch
+          and l.claim_token_hash = ${payloadHash(input.claimToken)}
+          and l.lease_expires_at > now()
+        for update of c, l
+      `;
+      if (leased.length !== 1)
+        throw new Error("Reconciliation lease changed unexpectedly.");
       const [unknown] = await tx<
         {
           run_id: string;
@@ -1586,6 +2390,13 @@ export class OpenInstinctStore {
       `;
       const stepId = randomUUID();
       const evidence = normalizeJsonValue(input.evidence);
+      const evidenceHash = payloadHash(evidence);
+      const safeReconciliationInput = {
+        caseId: input.caseId,
+        unknownResultId: input.unknownResultId,
+        evidenceHash,
+        safeSummary: "Bounded read-only reconciliation observation.",
+      };
       await tx`
         insert into public.workflow_steps (
           id, workspace_id, run_id, position, kind, tool_name, status,
@@ -1594,7 +2405,8 @@ export class OpenInstinctStore {
           ${stepId}, ${input.workspaceId}, ${unknown.run_id},
           ${position?.next_position ?? 0}, 'reconciliation',
           'reconciliation.read', 'running', 'result_received',
-          ${tx.json(toJson(evidence))}, ${payloadHash(evidence)}, 1, now()
+          ${tx.json(safeReconciliationInput)},
+          ${payloadHash(safeReconciliationInput)}, 1, now()
         )
       `;
       const now = new Date().toISOString();
@@ -1623,6 +2435,51 @@ export class OpenInstinctStore {
       `;
       if (resolved.length !== 1)
         throw new Error("Unknown action changed during reconciliation.");
+      const evidenceId = randomUUID();
+      await tx`
+        insert into public.action_evidence (
+          id, workspace_id, run_id, action_request_id, workflow_step_id,
+          tool_result_id, phase, outcome, verifier, verifier_version,
+          evidence_hash, safe_summary, captured_at
+        ) values (
+          ${evidenceId}, ${input.workspaceId}, ${unknown.run_id},
+          ${unknown.action_request_id}, ${stepId}, ${reconciled.id},
+          'reconciliation',
+          ${input.certainty === "reconciled_succeeded" ? "observed" : "not_observed"},
+          'reconciliation.read', 1, ${evidenceHash},
+          'Unknown outcome was resolved by a bounded read-only check.', now()
+        )
+      `;
+      await tx`
+        insert into app_private.action_evidence_payloads (
+          evidence_id, workspace_id, redacted_facts, payload_hash, redaction_version
+        ) values (
+          ${evidenceId}, ${input.workspaceId}, ${tx.json(toJson(evidence))},
+          ${evidenceHash}, 1
+        )
+      `;
+      await tx`
+        update public.authority_usages
+        set status = ${input.certainty === "reconciled_succeeded" ? "committed" : "released"},
+          terminal_at = now()
+        where action_request_id = ${unknown.action_request_id}
+          and workspace_id = ${input.workspaceId} and status = 'unknown'
+      `;
+      const completedCase = await tx`
+        update public.reconciliation_cases
+        set status = ${input.certainty}, last_error_code = null
+        where id = ${input.caseId}
+          and unknown_result_id = ${input.unknownResultId}
+          and workspace_id = ${input.workspaceId}
+          and status = 'running'
+        returning id
+      `;
+      if (completedCase.length !== 1)
+        throw new Error("Reconciliation case changed unexpectedly.");
+      await tx`
+        delete from app_private.reconciliation_claims
+        where case_id = ${input.caseId} and workspace_id = ${input.workspaceId}
+      `;
       await this.#writeAuditEvent(tx, {
         workspaceId: input.workspaceId,
         actor: "worker",
@@ -1930,6 +2787,29 @@ export class OpenInstinctStore {
         'owner_approved', ${input.sourceId}, 1, ${input.sensitivity}, now()
       ) on conflict (id) do nothing
     `;
+  }
+
+  async getMemory(input: { workspaceId: string; memoryId: string }): Promise<
+    | {
+        id: string;
+        kind: string;
+        content: string;
+        sensitivity: string;
+      }
+    | undefined
+  > {
+    const [row] = await this.#sql<
+      {
+        id: string;
+        kind: string;
+        content: string;
+        sensitivity: string;
+      }[]
+    >`
+      select id, kind, content, sensitivity from public.memories
+      where id = ${input.memoryId} and workspace_id = ${input.workspaceId}
+    `;
+    return row;
   }
 
   async deleteMemory(input: {
@@ -4139,6 +5019,49 @@ export class OpenInstinctStore {
     `;
   }
 
+  async getScheduledTrigger(input: {
+    workspaceId: string;
+    triggerId: string;
+  }): Promise<
+    | {
+        id: string;
+        kind: string;
+        payload: Record<string, unknown>;
+        runAt: string;
+        recurrenceSeconds?: number;
+        status: string;
+      }
+    | undefined
+  > {
+    const [row] = await this.#sql<
+      {
+        id: string;
+        kind: string;
+        payload: Record<string, unknown>;
+        run_at: Date;
+        recurrence_seconds: string | number | null;
+        status: string;
+      }[]
+    >`
+      select id, kind, payload, run_at, recurrence_seconds, status
+      from public.scheduled_triggers
+      where id = ${input.triggerId} and workspace_id = ${input.workspaceId}
+    `;
+    return row
+      ? {
+          id: row.id,
+          kind: row.kind,
+          payload: row.payload,
+          runAt: row.run_at.toISOString(),
+          recurrenceSeconds:
+            row.recurrence_seconds === null
+              ? undefined
+              : Number(row.recurrence_seconds),
+          status: row.status,
+        }
+      : undefined;
+  }
+
   async cancelScheduledTrigger(input: {
     workspaceId: string;
     triggerId: string;
@@ -4146,6 +5069,22 @@ export class OpenInstinctStore {
     const updated = await this.#sql`
       update public.scheduled_triggers
       set status = 'cancelled', completed_at = now()
+      where id = ${input.triggerId} and workspace_id = ${input.workspaceId}
+        and status in ('scheduled', 'queued')
+      returning id
+    `;
+    if (updated.length !== 1) throw new Error("Active schedule was not found.");
+  }
+
+  async rescheduleScheduledTrigger(input: {
+    workspaceId: string;
+    triggerId: string;
+    runAt: string;
+  }): Promise<void> {
+    const updated = await this.#sql`
+      update public.scheduled_triggers
+      set run_at = ${new Date(input.runAt)}, status = 'scheduled',
+        completed_at = null
       where id = ${input.triggerId} and workspace_id = ${input.workspaceId}
         and status in ('scheduled', 'queued')
       returning id

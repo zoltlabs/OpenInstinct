@@ -143,11 +143,15 @@ export class GoogleConnector {
     to: string;
     subject: string;
     body: string;
+    idempotencyMarker?: string;
   }): Promise<unknown> {
     const raw = Buffer.from(
       [
         `To: ${input.to}`,
         `Subject: ${input.subject}`,
+        ...(input.idempotencyMarker
+          ? [`Message-ID: <${input.idempotencyMarker}@openinstinct.local>`]
+          : []),
         "Content-Type: text/plain; charset=utf-8",
         "",
         input.body,
@@ -156,6 +160,25 @@ export class GoogleConnector {
     return this.#request(
       new URL("https://gmail.googleapis.com/gmail/v1/users/me/drafts"),
       { method: "POST", body: JSON.stringify({ message: { raw } }) },
+    );
+  }
+
+  async searchGmailDrafts(query: string, maxResults = 10): Promise<unknown> {
+    const url = new URL(
+      "https://gmail.googleapis.com/gmail/v1/users/me/drafts",
+    );
+    url.search = new URLSearchParams({
+      q: query,
+      maxResults: String(maxResults),
+    }).toString();
+    return this.#request(url);
+  }
+
+  async getGmailDraft(draftId: string): Promise<unknown> {
+    return this.#request(
+      new URL(
+        `https://gmail.googleapis.com/gmail/v1/users/me/drafts/${encodeURIComponent(draftId)}?format=raw`,
+      ),
     );
   }
 
@@ -203,6 +226,14 @@ export class GoogleConnector {
     );
   }
 
+  async getCalendarEvent(eventId: string): Promise<unknown> {
+    return this.#request(
+      new URL(
+        `https://www.googleapis.com/calendar/v3/calendars/primary/events/${encodeURIComponent(eventId)}`,
+      ),
+    );
+  }
+
   async #request(url: URL, init: RequestInit = {}): Promise<unknown> {
     const response = await this.#fetch(url, {
       ...init,
@@ -213,10 +244,14 @@ export class GoogleConnector {
       },
     });
     const body: unknown = await response.json().catch(() => ({}));
-    if (!response.ok)
-      throw new Error(
-        `Google API request failed with HTTP ${response.status}.`,
-      );
+    if (!response.ok) throw new GoogleApiError(response.status);
     return body;
+  }
+}
+
+export class GoogleApiError extends Error {
+  constructor(readonly status: number) {
+    super(`Google API request failed with HTTP ${status}.`);
+    this.name = "GoogleApiError";
   }
 }

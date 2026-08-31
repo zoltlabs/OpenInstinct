@@ -33,15 +33,24 @@ export async function POST(
   const form = await request.formData();
   const approved = form.get("decision") === "approve";
   const inputHash = String(form.get("inputHash") ?? "");
+  const semanticIntentHash = String(form.get("semanticIntentHash") ?? "");
+  const guardConditionsHash = String(form.get("guardConditionsHash") ?? "");
+  let typedConfirmation = false;
   if (approved) {
     const { data: action } = await supabase
       .from("action_requests")
-      .select("risk")
+      .select("risk,semantic_intent")
       .eq("id", id)
       .eq("workspace_id", workspace.id)
       .maybeSingle();
     if (
-      action?.risk === "destructive" &&
+      (action?.risk === "destructive" ||
+        ["delete", "cancel"].includes(
+          String(
+            (action?.semantic_intent as Record<string, unknown> | null)
+              ?.effect ?? "",
+          ),
+        )) &&
       form.get("destructiveConfirmation") !== "CONFIRM DESTRUCTIVE ACTION"
     )
       return NextResponse.redirect(
@@ -51,6 +60,14 @@ export async function POST(
           `/approvals/${id}`,
         ),
         303,
+      );
+    typedConfirmation =
+      action?.risk === "destructive" ||
+      ["delete", "cancel"].includes(
+        String(
+          (action?.semantic_intent as Record<string, unknown> | null)?.effect ??
+            "",
+        ),
       );
   }
   const databaseUrl = process.env.DATABASE_URL;
@@ -66,6 +83,9 @@ export async function POST(
       workspaceId: workspace.id,
       approved,
       inputHash,
+      semanticIntentHash: semanticIntentHash || undefined,
+      guardConditionsHash: guardConditionsHash || undefined,
+      typedConfirmation,
       channel: "web",
     });
   } catch {

@@ -1,5 +1,5 @@
 begin;
-select plan(105);
+select plan(147);
 
 select has_table('public', 'workspaces', 'workspaces table exists');
 select has_table('public', 'action_requests', 'action requests table exists');
@@ -12,6 +12,26 @@ select has_table('public', 'browser_executions', 'durable browser executions exi
 select has_table('public', 'browser_handoffs', 'durable owner browser handoffs exist');
 select has_table('public', 'artifacts', 'provider-neutral artifact metadata exists');
 select has_table('public', 'site_support', 'site support registry exists');
+select has_table('public', 'authority_grants', 'versioned authority grants exist');
+select has_table('public', 'authority_usages', 'authority usage reservations exist');
+select has_table('public', 'action_evidence', 'action evidence metadata exists');
+select has_table('public', 'reconciliation_cases', 'durable reconciliation cases exist');
+select has_table('app_private', 'action_evidence_payloads', 'redacted evidence facts are private');
+select has_table('app_private', 'reconciliation_claims', 'reconciliation leases are private');
+select ok(
+  (select convalidated from pg_constraint
+    where conname = 'workflow_steps_reconciliation_input_is_safe'),
+  'reconciliation input privacy constraint is validated after legacy backfill'
+);
+select ok(
+  not exists (
+    select 1 from public.workflow_steps
+    where kind = 'reconciliation' and
+      (input ?| array['evidence','facts','payload','redactedFacts'] or
+       input - array['caseId','unknownResultId','evidenceHash','safeSummary'] <> '{}'::jsonb)
+  ),
+  'migrated reconciliation steps expose only bounded public metadata'
+);
 select has_table('app_private', 'browser_execution_handles', 'browser provider handles are private');
 select has_table('app_private', 'browser_execution_slices', 'browser observations and decisions are private');
 select has_table('app_private', 'browser_handoff_handles', 'browser handoff provider state is private');
@@ -39,6 +59,9 @@ select has_column('public', 'browser_profiles', 'configuration_version', 'browse
 select has_column('public', 'browser_executions', 'max_cost_units', 'browser executions have a provider cost budget');
 select has_column('public', 'browser_executions', 'cost_units_used', 'browser executions persist cost-budget use');
 select has_column('public', 'artifacts', 'retention_expires_at', 'artifacts have bounded retention');
+select has_column('public', 'action_requests', 'semantic_intent', 'actions persist semantic intent');
+select has_column('public', 'action_requests', 'guard_conditions_hash', 'actions bind guard conditions');
+select has_column('public', 'approvals', 'semantic_intent_hash', 'approvals bind semantic intent');
 select ok((select relrowsecurity from pg_class where oid = 'public.scheduled_triggers'::regclass), 'schedules use RLS');
 select ok((select relrowsecurity from pg_class where oid = 'public.memories'::regclass), 'memories use RLS');
 select ok((select relrowsecurity from pg_class where oid = 'public.workflow_steps'::regclass), 'workflow steps use RLS');
@@ -49,6 +72,10 @@ select ok((select relrowsecurity from pg_class where oid = 'public.browser_execu
 select ok((select relrowsecurity from pg_class where oid = 'public.browser_handoffs'::regclass), 'browser handoffs use RLS');
 select ok((select relrowsecurity from pg_class where oid = 'public.artifacts'::regclass), 'artifacts use RLS');
 select ok((select relrowsecurity from pg_class where oid = 'public.site_support'::regclass), 'site support uses RLS');
+select ok((select relrowsecurity from pg_class where oid = 'public.authority_grants'::regclass), 'authority grants use RLS');
+select ok((select relrowsecurity from pg_class where oid = 'public.authority_usages'::regclass), 'authority usages use RLS');
+select ok((select relrowsecurity from pg_class where oid = 'public.action_evidence'::regclass), 'action evidence uses RLS');
+select ok((select relrowsecurity from pg_class where oid = 'public.reconciliation_cases'::regclass), 'reconciliation cases use RLS');
 select is(
   (
     select count(*)::integer
@@ -74,10 +101,14 @@ select is(
       'public.browser_executions'::regclass,
       'public.browser_handoffs'::regclass,
       'public.artifacts'::regclass,
-      'public.site_support'::regclass
+      'public.site_support'::regclass,
+      'public.authority_grants'::regclass,
+      'public.authority_usages'::regclass,
+      'public.action_evidence'::regclass,
+      'public.reconciliation_cases'::regclass
     ) and relrowsecurity
   ),
-  21,
+  25,
   'every Data API table has RLS enabled'
 );
 select ok(
@@ -116,6 +147,21 @@ select ok(
   not has_table_privilege('authenticated', 'app_private.worker_heartbeats', 'SELECT')
     and not has_table_privilege('service_role', 'app_private.worker_heartbeats', 'SELECT'),
   'worker heartbeat and queue latency diagnostics have no Data API grants'
+);
+select ok(
+  not has_table_privilege('authenticated', 'public.authority_grants', 'INSERT')
+    and not has_table_privilege('authenticated', 'public.authority_grants', 'UPDATE')
+    and not has_table_privilege('authenticated', 'public.authority_usages', 'INSERT')
+    and not has_table_privilege('authenticated', 'public.action_evidence', 'INSERT')
+    and not has_table_privilege('authenticated', 'public.reconciliation_cases', 'UPDATE'),
+  'semantic authority and evidence tables are server-written'
+);
+select ok(
+  not has_table_privilege('authenticated', 'app_private.action_evidence_payloads', 'SELECT')
+    and not has_table_privilege('service_role', 'app_private.action_evidence_payloads', 'SELECT')
+    and not has_table_privilege('authenticated', 'app_private.reconciliation_claims', 'SELECT')
+    and not has_table_privilege('service_role', 'app_private.reconciliation_claims', 'SELECT'),
+  'evidence payloads and reconciliation leases have no Data API grants'
 );
 select ok(
   not has_table_privilege('authenticated', 'public.browser_executions', 'INSERT')
@@ -423,6 +469,132 @@ update public.action_requests
 set status = 'executed'
 where id = '10000000-0000-4000-8000-000000000007';
 
+insert into public.action_requests (
+  id, workspace_id, run_id, tool_name, risk, summary, input, input_hash,
+  semantic_intent, semantic_intent_hash, guard_conditions,
+  guard_conditions_hash, status, expires_at
+) values (
+  '10000000-0000-4000-8000-000000000041',
+  '10000000-0000-4000-8000-000000000002',
+  '10000000-0000-4000-8000-000000000003',
+  'fixture.semantic', 'write', 'semantic fixture', '{}', repeat('9', 64),
+  '{"version":1,"effect":"create","resource":{"class":"fixture"},"provider":"openinstinct","exactOrigin":null,"recipients":[],"reversibility":"reversible","commitPoint":true,"credentialUse":"none","postconditions":[]}',
+  repeat('a', 64),
+  '{"version":1,"payloadHash":"9999999999999999999999999999999999999999999999999999999999999999","exactOrigin":null,"accountId":null,"counterpartyId":null,"recipientIds":[],"amount":null,"connectionId":null,"connectionConfigVersion":null,"browserProfileId":null,"browserProfileConfigVersion":null,"observationHash":null}',
+  repeat('b', 64), 'pending', now() + interval '1 hour'
+);
+select throws_ok(
+  $$insert into public.approvals (
+      workspace_id, action_request_id, approved, input_hash, channel,
+      semantic_intent_hash, guard_conditions_hash
+    ) values (
+      '10000000-0000-4000-8000-000000000002',
+      '10000000-0000-4000-8000-000000000041', true, repeat('9', 64),
+      'fixture', repeat('a', 64), repeat('c', 64)
+    )$$,
+  '23514', 'approval semantic binding mismatch',
+  'altered semantic guards invalidate approval'
+);
+select throws_ok(
+  $$insert into public.approvals (
+      workspace_id, action_request_id, approved, input_hash, channel,
+      semantic_intent_hash, guard_conditions_hash
+    ) values (
+      '10000000-0000-4000-8000-000000000002',
+      '10000000-0000-4000-8000-000000000041', true, repeat('9', 64),
+      'fixture', null, repeat('b', 64)
+    )$$,
+  '23514', null,
+  'approval semantic hash bundles cannot be partially null'
+);
+select lives_ok(
+  $$insert into public.approvals (
+      workspace_id, action_request_id, approved, input_hash, channel,
+      semantic_intent_hash, guard_conditions_hash
+    ) values (
+      '10000000-0000-4000-8000-000000000002',
+      '10000000-0000-4000-8000-000000000041', true, repeat('9', 64),
+      'fixture', repeat('a', 64), repeat('b', 64)
+    )$$,
+  'matching semantic intent and guards can be approved'
+);
+select throws_ok(
+  $$update public.action_requests set semantic_intent = '{"changed":true}'
+    where id = '10000000-0000-4000-8000-000000000041'$$,
+  '55000', 'action authority snapshot is immutable',
+  'semantic approval snapshots are immutable'
+);
+update public.action_requests set status = 'executed'
+where id = '10000000-0000-4000-8000-000000000041';
+select throws_ok(
+  $$insert into public.action_requests (
+      id, workspace_id, run_id, tool_name, risk, summary, input, input_hash,
+      semantic_intent, semantic_intent_hash, guard_conditions,
+      guard_conditions_hash, status, expires_at
+    ) values (
+      '10000000-0000-4000-8000-000000000046',
+      '10000000-0000-4000-8000-000000000002',
+      '10000000-0000-4000-8000-000000000003',
+      'fixture.semantic', 'write', 'partial semantic fixture', '{}', repeat('9', 64),
+      '{"version":1}', null, '{"version":1}', repeat('b', 64),
+      'pending', now() + interval '1 hour'
+    )$$,
+  '23514', null,
+  'action semantic bundles cannot be partially null'
+);
+
+select throws_ok(
+  $$insert into public.authority_grants (
+      workspace_id,name,effects,resource_classes,providers,starts_at,expires_at,
+      configuration_version
+    ) values (
+      '10000000-0000-4000-8000-000000000002','purchase grant',
+      array['purchase'],array['order'],array['test'],now(),now()+interval '1 day',repeat('1',64)
+    )$$,
+  '23514', null,
+  'phase three cannot grant financial authority'
+);
+select throws_ok(
+  $$insert into public.authority_grants (
+      workspace_id,name,effects,resource_classes,providers,starts_at,expires_at,
+      configuration_version
+    ) values (
+      '10000000-0000-4000-8000-000000000002','unscoped send',
+      array['send'],array['message'],array['test'],now(),now()+interval '1 day',repeat('2',64)
+    )$$,
+  '23514', null,
+  'communication grants require exact recipient scope'
+);
+select lives_ok(
+  $$insert into public.authority_grants (
+      id,workspace_id,name,effects,resource_classes,providers,origins,
+      max_uses,starts_at,expires_at,configuration_version
+    ) values (
+      '10000000-0000-4000-8000-000000000043',
+      '10000000-0000-4000-8000-000000000002','bounded create',
+      array['create'],array['fixture'],array['test'],array['https://example.test'],
+      1,now(),now()+interval '1 day',repeat('3',64)
+    )$$,
+  'bounded reversible authority can be created'
+);
+select throws_ok(
+  $$update public.authority_grants set name='mutated'
+    where id='10000000-0000-4000-8000-000000000043'$$,
+  '55000', 'authority grant versions are immutable',
+  'grant scope is immutable after creation'
+);
+select throws_ok(
+  $$insert into public.authority_grants (
+      workspace_id,name,effects,resource_classes,providers,starts_at,expires_at,
+      configuration_version
+    ) values (
+      '10000000-0000-4000-8000-000000000002','delete grant',
+      array['delete'],array['fixture'],array['test'],now(),now()+interval '1 day',repeat('5',64)
+    )$$,
+  '23514', null,
+  'destructive effects cannot be delegated by a grant'
+);
+
 insert into public.workflow_steps (
   id, workspace_id, run_id, action_request_id, position, kind, tool_name,
   status, input, input_hash
@@ -432,6 +604,71 @@ insert into public.workflow_steps (
   '10000000-0000-4000-8000-000000000003',
   '10000000-0000-4000-8000-000000000006',
   0, 'action', 'fixture.write', 'running', '{}', repeat('e', 64)
+);
+insert into public.workflow_steps (
+  id, workspace_id, run_id, action_request_id, position, kind, tool_name,
+  status, execution_phase, input, input_hash, attempt, started_at, completed_at
+) values (
+  '10000000-0000-4000-8000-000000000042',
+  '10000000-0000-4000-8000-000000000002',
+  '10000000-0000-4000-8000-000000000003',
+  '10000000-0000-4000-8000-000000000041',
+  10, 'action', 'fixture.semantic', 'succeeded', 'result_persisted', '{}',
+  repeat('9', 64), 1, now(), now()
+);
+insert into public.action_evidence (
+  id, workspace_id, run_id, action_request_id, workflow_step_id,
+  phase, outcome, verifier, verifier_version, evidence_hash, captured_at
+) values (
+  '10000000-0000-4000-8000-000000000044',
+  '10000000-0000-4000-8000-000000000002',
+  '10000000-0000-4000-8000-000000000003',
+  '10000000-0000-4000-8000-000000000041',
+  '10000000-0000-4000-8000-000000000042',
+  'postcondition','observed','fixture.readback',1,repeat('4',64),now()
+);
+select throws_ok(
+  $$insert into app_private.action_evidence_payloads (
+      evidence_id, workspace_id, redacted_facts, payload_hash, redaction_version
+    ) values (
+      '10000000-0000-4000-8000-000000000044',
+      '10000000-0000-4000-8000-000000000002', '{}', repeat('5',64), 1
+    )$$,
+  '23514', 'private evidence payload hash mismatch',
+  'private evidence payload must bind to public evidence hash'
+);
+select lives_ok(
+  $$insert into app_private.action_evidence_payloads (
+      evidence_id, workspace_id, redacted_facts, payload_hash, redaction_version
+    ) values (
+      '10000000-0000-4000-8000-000000000044',
+      '10000000-0000-4000-8000-000000000002', '{}', repeat('4',64), 1
+    )$$,
+  'matching private evidence payload is accepted'
+);
+select throws_ok(
+  $$update app_private.action_evidence_payloads set redacted_facts='{"changed":true}'
+    where evidence_id='10000000-0000-4000-8000-000000000044'$$,
+  '55000', 'action_evidence_payloads is append-only',
+  'private evidence payload rejects updates'
+);
+select throws_ok(
+  $$delete from app_private.action_evidence_payloads
+    where evidence_id='10000000-0000-4000-8000-000000000044'$$,
+  '55000', 'action_evidence_payloads is append-only',
+  'private evidence payload rejects deletes'
+);
+select throws_ok(
+  $$update public.action_evidence set outcome='inconclusive'
+    where id='10000000-0000-4000-8000-000000000044'$$,
+  '55000', 'action_evidence is append-only',
+  'action evidence rejects updates'
+);
+select throws_ok(
+  $$delete from public.action_evidence
+    where id='10000000-0000-4000-8000-000000000044'$$,
+  '55000', 'action_evidence is append-only',
+  'action evidence rejects deletes'
 );
 insert into public.browser_executions (
   id,workspace_id,run_id,step_id,profile_id,profile_configuration_version,
@@ -697,6 +934,91 @@ insert into public.tool_results (
   'fixture.write', 'unknown', 1, 'fixture_unknown', repeat('5', 64),
   'enqueued', now(), now(), now()
 );
+select throws_ok(
+  $$insert into public.reconciliation_cases (
+      workspace_id,run_id,action_request_id,unknown_result_id,method
+    ) values (
+      '10000000-0000-4000-8000-000000000002',
+      '10000000-0000-4000-8000-000000000003',
+      '10000000-0000-4000-8000-000000000041',
+      '10000000-0000-4000-8000-000000000018','postcondition_read'
+    )$$,
+  '23514', 'reconciliation case must reference the matching unknown result',
+  'reconciliation cases cannot cross action lineage'
+);
+select throws_ok(
+  $$insert into public.workflow_steps (
+      workspace_id,run_id,position,kind,tool_name,status,input,input_hash
+    ) values (
+      '10000000-0000-4000-8000-000000000002',
+      '10000000-0000-4000-8000-000000000003',20,'reconciliation',
+      'reconciliation.read','running','{"evidence":{"secret":"no"}}',repeat('1',64)
+    )$$,
+  '23514', null,
+  'reconciliation workflow input cannot expose private evidence facts'
+);
+select throws_ok(
+  $$insert into public.action_evidence (
+      workspace_id,run_id,action_request_id,workflow_step_id,tool_result_id,
+      phase,outcome,verifier,verifier_version,evidence_hash,captured_at
+    ) values (
+      '10000000-0000-4000-8000-000000000002',
+      '10000000-0000-4000-8000-000000000003',
+      '10000000-0000-4000-8000-000000000041',
+      '10000000-0000-4000-8000-000000000042',
+      '10000000-0000-4000-8000-000000000018',
+      'postcondition','observed','fixture.readback',1,repeat('2',64),now()
+    )$$,
+  '23514', 'action evidence result lineage mismatch',
+  'action evidence cannot attach a result from another action'
+);
+select lives_ok(
+  $$insert into public.reconciliation_cases (
+      id,workspace_id,run_id,action_request_id,unknown_result_id,method
+    ) values (
+      '10000000-0000-4000-8000-000000000045',
+      '10000000-0000-4000-8000-000000000002',
+      '10000000-0000-4000-8000-000000000003',
+      '10000000-0000-4000-8000-000000000006',
+      '10000000-0000-4000-8000-000000000018','postcondition_read'
+    )$$,
+  'a matching unknown result can create one reconciliation case'
+);
+select throws_ok(
+  $$update public.reconciliation_cases
+    set action_request_id='10000000-0000-4000-8000-000000000041'
+    where id='10000000-0000-4000-8000-000000000045'$$,
+  '55000', 'reconciliation identity is immutable',
+  'reconciliation cases cannot be repointed'
+);
+select throws_ok(
+  $$delete from public.reconciliation_cases
+    where id='10000000-0000-4000-8000-000000000045'$$,
+  '55000', 'reconciliation cases are durable execution history',
+  'reconciliation cases reject ordinary deletion'
+);
+select throws_ok(
+  $$update public.reconciliation_cases set status='reconciled_succeeded'
+    where id='10000000-0000-4000-8000-000000000045'$$,
+  '55000', 'invalid reconciliation transition',
+  'reconciliation cases reject illegal terminal jumps'
+);
+select lives_ok(
+  $$update public.reconciliation_cases set status='running',attempt=1
+    where id='10000000-0000-4000-8000-000000000045'$$,
+  'a pending reconciliation case can be claimed'
+);
+insert into app_private.reconciliation_claims (
+  case_id,workspace_id,lease_epoch,claim_token_hash,lease_expires_at
+) values (
+  '10000000-0000-4000-8000-000000000045',
+  '10000000-0000-4000-8000-000000000002',1,repeat('3',64),now()-interval '1 second'
+);
+select lives_ok(
+  $$update public.reconciliation_cases set status='running',attempt=2
+    where id='10000000-0000-4000-8000-000000000045'$$,
+  'an expired reconciliation claimant can be fenced and reclaimed'
+);
 insert into public.workflow_steps (
   id, workspace_id, run_id, position, kind, tool_name, status,
   execution_phase, input, input_hash, attempt, started_at, completed_at
@@ -705,7 +1027,9 @@ insert into public.workflow_steps (
   '10000000-0000-4000-8000-000000000002',
   '10000000-0000-4000-8000-000000000003',
   1, 'reconciliation', 'reconciliation.read', 'succeeded',
-  'result_persisted', '{}', repeat('6', 64), 1, now(), now()
+  'result_persisted',
+  '{"caseId":"10000000-0000-4000-8000-000000000045","unknownResultId":"10000000-0000-4000-8000-000000000018","evidenceHash":"6666666666666666666666666666666666666666666666666666666666666666","safeSummary":"Fixture reconciliation observation."}',
+  repeat('6', 64), 1, now(), now()
 );
 insert into public.tool_results (
   workspace_id, run_id, step_id, reconciles_result_id, tool_name, certainty,

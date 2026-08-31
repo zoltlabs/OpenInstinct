@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { payloadHash } from "./domain";
+import { payloadHash } from "./canonical-json";
 
 export const browserReadActionSchema = z.discriminatedUnion("type", [
   z.object({

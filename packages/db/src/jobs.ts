@@ -20,6 +20,11 @@ export const agentJobSchema = z.discriminatedUnion("type", [
     toolResultId: z.string().uuid(),
   }),
   z.object({
+    type: z.literal("reconcile_action"),
+    caseId: z.string().uuid(),
+    workspaceId: z.string().uuid(),
+  }),
+  z.object({
     type: z.literal("dispatch_schedules"),
     requestedAt: z.string().datetime(),
   }),

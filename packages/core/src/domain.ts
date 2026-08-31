@@ -1,5 +1,14 @@
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { z } from "zod";
+import { normalizeJsonValue, payloadHash, stableJson } from "./canonical-json";
+import {
+  semanticActionIntentSchema,
+  semanticGuardConditionsSchema,
+  semanticGuardHash,
+  semanticIntentHash,
+  type SemanticActionIntent,
+  type SemanticGuardConditions,
+} from "./semantic-authority";
 
 export const eventSourceSchema = z.enum([
   "blooio",
@@ -38,27 +47,116 @@ export const actionRiskSchema = z.enum([
   "security",
 ]);
 
-export const actionRequestSchema = z.object({
-  id: z.string().uuid(),
-  workspaceId: z.string().uuid(),
-  runId: z.string().uuid(),
-  toolName: z.string().min(1),
-  risk: actionRiskSchema,
-  summary: z.string().min(1),
-  input: z.record(z.string(), z.unknown()),
-  inputHash: z.string().length(64),
-  status: z.enum([
-    "pending",
-    "approved",
-    "executing",
-    "executed",
-    "denied",
-    "expired",
-    "failed",
-    "unknown",
-  ]),
-  expiresAt: z.string().datetime(),
-});
+export const actionRequestSchema = z
+  .object({
+    id: z.string().uuid(),
+    workspaceId: z.string().uuid(),
+    runId: z.string().uuid(),
+    toolName: z.string().min(1),
+    risk: actionRiskSchema,
+    summary: z.string().min(1),
+    input: z.record(z.string(), z.unknown()),
+    inputHash: z.string().length(64),
+    semanticIntent: semanticActionIntentSchema.optional(),
+    semanticIntentHash: z.string().length(64).optional(),
+    guardConditions: semanticGuardConditionsSchema.optional(),
+    guardConditionsHash: z.string().length(64).optional(),
+    authorityGrantId: z.string().uuid().optional(),
+    status: z.enum([
+      "pending",
+      "approved",
+      "executing",
+      "executed",
+      "denied",
+      "expired",
+      "failed",
+      "unknown",
+    ]),
+    expiresAt: z.string().datetime(),
+  })
+  .superRefine((action, context) => {
+    if (payloadHash(action.input) !== action.inputHash)
+      context.addIssue({
+        code: "custom",
+        path: ["inputHash"],
+        message: "Action input hash does not match its executable payload.",
+      });
+    const semanticValues = [
+      action.semanticIntent,
+      action.semanticIntentHash,
+      action.guardConditions,
+      action.guardConditionsHash,
+    ];
+    if (
+      semanticValues.some((value) => value !== undefined) &&
+      semanticValues.some((value) => value === undefined)
+    )
+      context.addIssue({
+        code: "custom",
+        path: ["semanticIntent"],
+        message:
+          "Semantic intent, guards, and both hashes must be present together.",
+      });
+    if (
+      action.semanticIntent &&
+      action.semanticIntentHash !== semanticIntentHash(action.semanticIntent)
+    )
+      context.addIssue({
+        code: "custom",
+        path: ["semanticIntentHash"],
+        message: "Semantic intent hash does not match the intent.",
+      });
+    if (
+      action.semanticIntent &&
+      ((["delete", "cancel"].includes(action.semanticIntent.effect) &&
+        action.risk !== "destructive") ||
+        (action.semanticIntent.effect === "purchase" &&
+          action.risk !== "financial") ||
+        (action.semanticIntent.effect === "security_change" &&
+          action.risk !== "security") ||
+        (action.semanticIntent.effect === "send" &&
+          action.risk !== "communicate"))
+    )
+      context.addIssue({
+        code: "custom",
+        path: ["risk"],
+        message: "Legacy risk label conflicts with the semantic effect.",
+      });
+    if (
+      action.guardConditions &&
+      action.guardConditionsHash !== semanticGuardHash(action.guardConditions)
+    )
+      context.addIssue({
+        code: "custom",
+        path: ["guardConditionsHash"],
+        message: "Guard conditions hash does not match the guards.",
+      });
+    if (action.guardConditions?.payloadHash !== action.inputHash)
+      context.addIssue({
+        code: "custom",
+        path: ["guardConditions", "payloadHash"],
+        message: "Semantic guards must bind the executable payload hash.",
+      });
+    if (
+      action.semanticIntent &&
+      action.guardConditions &&
+      (action.guardConditions.exactOrigin !==
+        action.semanticIntent.exactOrigin ||
+        action.guardConditions.accountId !==
+          (action.semanticIntent.account?.id ?? null) ||
+        action.guardConditions.counterpartyId !==
+          (action.semanticIntent.counterparty?.id ?? null) ||
+        stableJson(action.guardConditions.recipientIds) !==
+          stableJson(action.semanticIntent.recipients.map((item) => item.id)) ||
+        stableJson(action.guardConditions.amount) !==
+          stableJson(action.semanticIntent.amount ?? null))
+    )
+      context.addIssue({
+        code: "custom",
+        path: ["guardConditions"],
+        message: "Semantic guards do not match the approved intent facts.",
+      });
+  });
 
 export const resultCertaintySchema = z.enum([
   "succeeded",
@@ -185,70 +283,6 @@ export type WorkflowExecutionPhase = z.infer<
 export type RunEventType = z.infer<typeof runEventTypeSchema>;
 export type StructuredToolResult = z.infer<typeof structuredToolResultSchema>;
 
-export type CanonicalJsonValue =
-  | null
-  | string
-  | number
-  | boolean
-  | CanonicalJsonValue[]
-  | { [key: string]: CanonicalJsonValue };
-
-export function normalizeJsonValue(value: unknown): CanonicalJsonValue {
-  const active = new WeakSet<object>();
-  const visit = (entry: unknown): CanonicalJsonValue => {
-    if (
-      entry === null ||
-      typeof entry === "string" ||
-      typeof entry === "boolean"
-    )
-      return entry;
-    if (typeof entry === "number") {
-      if (!Number.isFinite(entry))
-        throw new Error("JSON numbers must be finite.");
-      return entry;
-    }
-    if (!entry || typeof entry !== "object")
-      throw new Error("Value is not JSON serializable.");
-    if (active.has(entry)) throw new Error("JSON values cannot be cyclic.");
-    active.add(entry);
-    try {
-      if (Array.isArray(entry)) return entry.map(visit);
-      const prototype = Object.getPrototypeOf(entry);
-      if (prototype !== Object.prototype && prototype !== null)
-        throw new Error("JSON objects must be plain objects.");
-      return Object.fromEntries(
-        Object.entries(entry).map(([key, item]) => [key, visit(item)]),
-      );
-    } finally {
-      active.delete(entry);
-    }
-  };
-  return visit(value);
-}
-
-function stableNormalizedJson(value: CanonicalJsonValue): string {
-  if (Array.isArray(value))
-    return `[${value.map(stableNormalizedJson).join(",")}]`;
-  if (value && typeof value === "object") {
-    return `{${Object.entries(value)
-      .sort(([left], [right]) => left.localeCompare(right))
-      .map(
-        ([key, entry]) =>
-          `${JSON.stringify(key)}:${stableNormalizedJson(entry)}`,
-      )
-      .join(",")}}`;
-  }
-  return JSON.stringify(value);
-}
-
-export function stableJson(value: unknown): string {
-  return stableNormalizedJson(normalizeJsonValue(value));
-}
-
-export function payloadHash(value: unknown): string {
-  return createHash("sha256").update(stableJson(value)).digest("hex");
-}
-
 export function isResultRetryable(certainty: ResultCertainty): boolean {
   return certainty === "failed_before_effect";
 }
@@ -260,6 +294,9 @@ export function createActionRequest(input: {
   risk: ActionRisk;
   summary: string;
   payload: Record<string, unknown>;
+  semanticIntent: SemanticActionIntent;
+  guardConditions: SemanticGuardConditions;
+  authorityGrantId?: string;
   expiresInMs?: number;
 }): ActionRequest {
   const expiresInMs = input.expiresInMs ?? 24 * 60 * 60 * 1000;
@@ -275,6 +312,11 @@ export function createActionRequest(input: {
     summary: input.summary,
     input: payload,
     inputHash: payloadHash(payload),
+    semanticIntent: input.semanticIntent,
+    semanticIntentHash: semanticIntentHash(input.semanticIntent),
+    guardConditions: input.guardConditions,
+    guardConditionsHash: semanticGuardHash(input.guardConditions),
+    authorityGrantId: input.authorityGrantId,
     status: "pending",
     expiresAt: new Date(Date.now() + expiresInMs).toISOString(),
   });
