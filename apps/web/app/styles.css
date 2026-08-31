@@ -26,6 +26,10 @@ h2 {
   margin: 0 0 8px;
   font-size: 1.1rem;
 }
+h3 {
+  margin: 0 0 6px;
+  font-size: 1rem;
+}
 p {
   color: #aeb6c2;
   line-height: 1.6;
@@ -45,6 +49,99 @@ p {
   border-radius: 18px;
   padding: 22px;
   background: rgba(17, 21, 27, 0.78);
+}
+.connector-hub {
+  display: grid;
+  gap: 22px;
+}
+.section-heading {
+  display: grid;
+  grid-template-columns: minmax(180px, 0.7fr) minmax(280px, 1.3fr);
+  gap: 24px;
+  align-items: end;
+}
+.section-heading h2 {
+  font-size: clamp(1.35rem, 3vw, 1.8rem);
+}
+.section-copy,
+.eyebrow {
+  margin: 0;
+}
+.eyebrow {
+  color: #8ce8b0;
+  font-size: 0.75rem;
+  font-weight: 750;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+.connector-options {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+  gap: 12px;
+}
+.connector-option {
+  display: grid;
+  grid-template-rows: 1fr auto auto;
+  gap: 12px;
+  min-height: 220px;
+  border: 1px solid #303944;
+  border-radius: 14px;
+  padding: 18px;
+  background: rgba(8, 11, 15, 0.5);
+}
+.connector-option p {
+  margin: 0;
+}
+.connector-status {
+  display: flex;
+  gap: 7px;
+  align-items: center;
+  color: #8f99a7;
+  font-size: 0.84rem;
+}
+.status-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  flex: 0 0 auto;
+  border-radius: 999px;
+  background: #657080;
+}
+.status-dot.active {
+  background: #4ade80;
+}
+.status-dot.pending {
+  background: #fbbf24;
+}
+.status-dot.error {
+  background: #fb7185;
+}
+.custom-connector {
+  border-top: 1px solid #29303a;
+  padding-top: 18px;
+}
+.custom-connector summary {
+  cursor: pointer;
+  color: #e7ebf0;
+  font-weight: 650;
+}
+.custom-connector > p,
+.custom-connector form {
+  max-width: 580px;
+}
+.custom-connector form {
+  margin-top: 14px;
+}
+.configured-connectors {
+  border-top: 1px solid #29303a;
+  padding-top: 18px;
+}
+.configured-connectors p {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin: 7px 0 0;
+  font-size: 0.9rem;
 }
 .wide {
   grid-column: 1 / -1;
@@ -129,4 +226,10 @@ button,
 }
 code {
   color: #c8d7ef;
+}
+@media (max-width: 620px) {
+  .section-heading {
+    grid-template-columns: 1fr;
+    gap: 10px;
+  }
 }

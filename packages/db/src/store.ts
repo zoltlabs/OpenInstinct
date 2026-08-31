@@ -39,6 +39,13 @@ export interface RunContext {
   readonly messages: readonly { role: "user" | "assistant"; content: string }[];
 }
 
+export type ConnectionStatus =
+  | "pending"
+  | "active"
+  | "expired"
+  | "revoked"
+  | "error";
+
 export class RunNotClaimableError extends Error {
   override readonly name = "RunNotClaimableError";
 }
@@ -307,7 +314,10 @@ export class OpenInstinctStore {
     readonly {
       id: string;
       provider: string;
+      accountId?: string;
       displayName?: string;
+      scopes: readonly string[];
+      status: ConnectionStatus;
       encryptedCredentials: string;
       metadata: Record<string, unknown>;
     }[]
@@ -316,12 +326,16 @@ export class OpenInstinctStore {
       {
         id: string;
         provider: string;
+        account_id: string | null;
         display_name: string | null;
+        scopes: string[];
+        status: ConnectionStatus;
         encrypted_credentials: string | null;
         metadata: Record<string, unknown>;
       }[]
     >`
-      select id, provider, display_name, encrypted_credentials, metadata
+      select id, provider, account_id, display_name, scopes, status,
+        encrypted_credentials, metadata
       from public.connections
       where workspace_id = ${input.workspaceId} and provider = ${input.provider}
         and status = 'active' and encrypted_credentials is not null
@@ -330,20 +344,80 @@ export class OpenInstinctStore {
     return rows.map((row) => ({
       id: row.id,
       provider: row.provider,
+      accountId: row.account_id ?? undefined,
       displayName: row.display_name ?? undefined,
+      scopes: row.scopes,
+      status: row.status,
       encryptedCredentials: row.encrypted_credentials!,
       metadata: row.metadata,
     }));
+  }
+
+  async getConnectionById(input: { id: string; workspaceId: string }): Promise<
+    | {
+        id: string;
+        provider: string;
+        accountId?: string;
+        displayName?: string;
+        scopes: readonly string[];
+        status: ConnectionStatus;
+        encryptedCredentials: string;
+        metadata: Record<string, unknown>;
+      }
+    | undefined
+  > {
+    const [row] = await this.#sql<
+      {
+        id: string;
+        provider: string;
+        account_id: string | null;
+        display_name: string | null;
+        scopes: string[];
+        status: ConnectionStatus;
+        encrypted_credentials: string | null;
+        metadata: Record<string, unknown>;
+      }[]
+    >`
+      select id, provider, account_id, display_name, scopes, status,
+        encrypted_credentials, metadata
+      from public.connections
+      where id = ${input.id} and workspace_id = ${input.workspaceId}
+    `;
+    if (!row?.encrypted_credentials) return undefined;
+    return {
+      id: row.id,
+      provider: row.provider,
+      accountId: row.account_id ?? undefined,
+      displayName: row.display_name ?? undefined,
+      scopes: row.scopes,
+      status: row.status,
+      encryptedCredentials: row.encrypted_credentials,
+      metadata: row.metadata,
+    };
   }
 
   async updateConnectionCredentials(input: {
     id: string;
     workspaceId: string;
     encryptedCredentials: string;
+    status?: ConnectionStatus;
   }): Promise<void> {
     const result = await this.#sql`
       update public.connections set encrypted_credentials = ${input.encryptedCredentials},
-        status = 'active', updated_at = now()
+        status = coalesce(${input.status ?? null}, status), updated_at = now()
+      where id = ${input.id} and workspace_id = ${input.workspaceId}
+      returning id
+    `;
+    if (result.length !== 1) throw new Error("Connection was not found.");
+  }
+
+  async updateConnectionStatus(input: {
+    id: string;
+    workspaceId: string;
+    status: ConnectionStatus;
+  }): Promise<void> {
+    const result = await this.#sql`
+      update public.connections set status = ${input.status}, updated_at = now()
       where id = ${input.id} and workspace_id = ${input.workspaceId}
       returning id
     `;
@@ -358,18 +432,21 @@ export class OpenInstinctStore {
     displayName?: string;
     scopes: readonly string[];
     encryptedCredentials: string;
+    status?: ConnectionStatus;
     metadata?: Record<string, unknown>;
   }): Promise<void> {
+    const status = input.status ?? "active";
     await this.#sql`
       insert into public.connections (
         id, workspace_id, provider, account_id, display_name, scopes, status,
         encrypted_credentials, metadata
       ) values (
         ${input.id}, ${input.workspaceId}, ${input.provider}, ${input.accountId ?? null},
-        ${input.displayName ?? null}, ${input.scopes as string[]}, 'active',
+        ${input.displayName ?? null}, ${input.scopes as string[]}, ${status},
         ${input.encryptedCredentials}, ${this.#sql.json(toJson(input.metadata ?? {}))}
       ) on conflict (workspace_id, provider, account_id) do update set
-        id = excluded.id, display_name = excluded.display_name, scopes = excluded.scopes, status = 'active',
+        id = excluded.id, display_name = excluded.display_name, scopes = excluded.scopes,
+        status = excluded.status,
         encrypted_credentials = excluded.encrypted_credentials,
         metadata = excluded.metadata, updated_at = now()
     `;

@@ -20,7 +20,8 @@ Current integrations are:
 
 - Blooio v4 for inbound and outbound iMessage
 - Google OAuth for Gmail and Calendar
-- Generic remote MCP over HTTPS for long-tail connectors
+- Curated and registry-resolved remote MCP over HTTPS for long-tail connectors,
+  including per-owner browser OAuth
 - Kernel behind a provider-neutral cloud-browser interface
 - Direct OpenAI, Anthropic, and Google inference with optional OpenRouter, Vercel AI Gateway, or OpenAI-compatible endpoints
 - Vercel, containers, or other Node hosts for compute
@@ -143,7 +144,9 @@ Use a direct connector when scopes, data types, and risk are stable enough to mo
 
 MCP is the long-tail integration path. Keep the existing network protections in `packages/connectors/src/mcp.ts`; application-level URL checks alone are insufficient because DNS can change between validation and connection.
 
-- Register configuration through the authenticated web control plane.
+- Put stable, reviewed endpoints and aliases in `packages/connectors/src/mcp-catalog.ts`. Unknown names may fall back to the official MCP registry, but registry metadata remains untrusted and owner-visible before connection.
+- Resolve conversational requests with the bounded `resolveConnector` agent tool. It returns an authenticated control-plane link; it never receives credentials or completes authorization inside iMessage.
+- Register configuration through the authenticated web control plane. Standard MCP OAuth uses a short-lived, connection-bound state and PKCE, persists intermediate and refreshed credentials encrypted, and completes in the owner's browser. Bearer tokens remain a legacy fallback entered only in the web form.
 - Discover and expose only explicitly allowed tools.
 - Treat tool descriptions and results as untrusted data, not instructions.
 - Bound argument and response sizes.

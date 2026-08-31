@@ -13,7 +13,8 @@ The recommended Vercel + Supabase infrastructure can start on free tiers. Using 
 - Blooio v4 webhook verification, deduplication, iMessage replies, and idempotent sends
 - Durable agent runs and retries with Supabase Postgres and `pgmq`
 - Direct Google OAuth with PKCE, encrypted refresh tokens, Gmail reads/drafts, and Calendar reads/writes
-- Generic HTTPS MCP registration and tool discovery; MCP calls require explicit approval
+- Conversational MCP resolution, one-click connector cards, per-owner browser OAuth,
+  and bounded tool discovery; MCP calls require explicit approval
 - Public HTTPS web fetches with redirect, response-size, and private-network protections
 - Owner-approved durable memory with explicit destructive forgetting
 - One-time and recurring reminders plus scheduled agent routines on the durable queue

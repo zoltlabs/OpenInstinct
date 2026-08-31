@@ -1,4 +1,5 @@
 import Link from "next/link";
+import { listMcpConnectorCatalog } from "@openinstinct/connectors";
 import { createSupabaseServerClient } from "../src/lib/supabase/server";
 import { feedbackForCode } from "../src/lib/feedback";
 import { isValidTimeZone } from "../src/lib/validation";
@@ -125,6 +126,7 @@ export default async function Home({
   const timeZone = isValidTimeZone(workspace.timezone)
     ? workspace.timezone
     : "UTC";
+  const connectorCatalog = listMcpConnectorCatalog();
   const formatDate = (value: string) =>
     new Intl.DateTimeFormat("en", {
       dateStyle: "medium",
@@ -141,7 +143,7 @@ export default async function Home({
   ] = await Promise.all([
     supabase
       .from("connection_summaries")
-      .select("id,provider,display_name,status,scopes,updated_at")
+      .select("id,provider,account_id,display_name,status,scopes,updated_at")
       .order("updated_at", { ascending: false }),
     supabase
       .from("action_requests")
@@ -175,66 +177,165 @@ export default async function Home({
       </p>
       <Feedback code={feedback} />
       <div className="grid">
-        <section className="card">
-          <h2>Google</h2>
-          <p>
-            Direct OAuth for Gmail and Calendar. Writes always require approval.
-          </p>
-          <Link className="button" href="/api/connectors/google/start">
-            Connect Google
-          </Link>
-          <p className="status">
-            {connections?.some(
-              (c) => c.provider === "google" && c.status === "active",
-            )
-              ? "Connected"
-              : "Not connected"}
-          </p>
-        </section>
-        <section className="card">
-          <h2>Remote MCP</h2>
-          <p>
-            Add any trusted HTTPS MCP server. Unknown tools default to
-            approval-required.
-          </p>
-          <form action="/api/connectors/mcp" method="post">
-            <label className="field" htmlFor="mcp-name">
-              <span>Connector name</span>
-              <input id="mcp-name" name="name" required />
-            </label>
-            <label className="field" htmlFor="mcp-url">
-              <span>Server URL</span>
-              <small>
-                Public HTTPS only; redirects and private networks are blocked.
-              </small>
-              <input
-                id="mcp-url"
-                name="url"
-                type="url"
-                placeholder="https://mcp.example.com"
-                required
-              />
-            </label>
-            <label className="field" htmlFor="mcp-token">
-              <span>Bearer token</span>
-              <small>Optional. Stored encrypted and never shown again.</small>
-              <input
-                id="mcp-token"
-                name="bearerToken"
-                type="password"
-                placeholder="Bearer token (optional)"
-              />
-            </label>
-            <button type="submit">Connect MCP</button>
-          </form>
-          {connections
-            ?.filter((connection) => connection.provider === "mcp")
-            .map((connection) => (
-              <p className="status" key={connection.id}>
-                {connection.display_name ?? "MCP"}:{" "}
-                {connection.scopes.join(", ")}
+        <section className="card wide connector-hub">
+          <div className="section-heading">
+            <div>
+              <p className="eyebrow">Connectors</p>
+              <h2>Connect the apps you use</h2>
+            </div>
+            <p className="section-copy">
+              Choose an app here, or text your assistant “connect Granola.” If
+              the service uses OAuth, you’ll finish securely in your browser.
+            </p>
+          </div>
+
+          <div className="connector-options">
+            <article className="connector-option">
+              <div>
+                <h3>Google</h3>
+                <p>Gmail and Calendar through Google OAuth.</p>
+              </div>
+              <Link className="button" href="/api/connectors/google/start">
+                {connections?.some(
+                  (connection) =>
+                    connection.provider === "google" &&
+                    connection.status === "active",
+                )
+                  ? "Reconnect"
+                  : "Connect"}
+              </Link>
+              <p className="connector-status">
+                <span
+                  className={`status-dot ${
+                    connections?.some(
+                      (connection) =>
+                        connection.provider === "google" &&
+                        connection.status === "active",
+                    )
+                      ? "active"
+                      : ""
+                  }`}
+                />
+                {connections?.some(
+                  (connection) =>
+                    connection.provider === "google" &&
+                    connection.status === "active",
+                )
+                  ? "Connected"
+                  : "Not connected"}
               </p>
-            ))}
+            </article>
+
+            {connectorCatalog.map((connector) => {
+              const connection = connections?.find(
+                (candidate) =>
+                  candidate.provider === "mcp" &&
+                  candidate.account_id === connector.url,
+              );
+              return (
+                <article className="connector-option" key={connector.id}>
+                  <div>
+                    <h3>{connector.name}</h3>
+                    <p>{connector.description}</p>
+                  </div>
+                  <Link
+                    className="button"
+                    href={`/api/connectors/mcp/start?catalog=${encodeURIComponent(connector.id)}`}
+                  >
+                    {connection?.status === "active" ? "Reconnect" : "Connect"}
+                  </Link>
+                  <p className="connector-status">
+                    <span
+                      className={`status-dot ${
+                        connection?.status === "active"
+                          ? "active"
+                          : connection?.status === "pending"
+                            ? "pending"
+                            : connection?.status === "error"
+                              ? "error"
+                              : ""
+                      }`}
+                    />
+                    {connection?.status === "active"
+                      ? "Connected"
+                      : connection?.status === "pending"
+                        ? "Authorization pending"
+                        : connection?.status === "error"
+                          ? "Needs attention"
+                          : "Not connected"}
+                  </p>
+                </article>
+              );
+            })}
+          </div>
+
+          <details className="custom-connector">
+            <summary>Add a custom MCP server</summary>
+            <p>
+              For a server not listed above, enter its public HTTPS endpoint.
+              OpenInstinct will discover OAuth automatically when supported.
+            </p>
+            <form action="/api/connectors/mcp" method="post">
+              <label className="field" htmlFor="mcp-name">
+                <span>Connector name</span>
+                <input id="mcp-name" name="name" required />
+              </label>
+              <label className="field" htmlFor="mcp-url">
+                <span>Server URL</span>
+                <small>
+                  Public HTTPS only; redirects and private networks are blocked.
+                </small>
+                <input
+                  id="mcp-url"
+                  name="url"
+                  type="url"
+                  placeholder="https://mcp.example.com/mcp"
+                  required
+                />
+              </label>
+              <label className="field" htmlFor="mcp-token">
+                <span>Bearer token</span>
+                <small>
+                  Optional for legacy servers. Prefer browser OAuth when the
+                  server supports it.
+                </small>
+                <input
+                  id="mcp-token"
+                  name="bearerToken"
+                  type="password"
+                  placeholder="Bearer token (optional)"
+                />
+              </label>
+              <button type="submit">Connect custom MCP</button>
+            </form>
+          </details>
+
+          {connections?.some((connection) => connection.provider === "mcp") ? (
+            <div className="configured-connectors">
+              <h3>Configured MCP servers</h3>
+              {connections
+                .filter((connection) => connection.provider === "mcp")
+                .map((connection) => (
+                  <p key={connection.id}>
+                    <span
+                      className={`status-dot ${
+                        connection.status === "active"
+                          ? "active"
+                          : connection.status === "pending"
+                            ? "pending"
+                            : connection.status === "error"
+                              ? "error"
+                              : ""
+                      }`}
+                    />
+                    {connection.display_name ?? "MCP"} · {connection.status}
+                    {connection.scopes.length
+                      ? ` · ${connection.scopes.length} tools`
+                      : ""}
+                  </p>
+                ))}
+            </div>
+          ) : null}
         </section>
         <section className="card wide">
           <h2>Pending approvals</h2>

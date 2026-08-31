@@ -61,6 +61,11 @@ const feedbackMessages: Record<
     tone: "error",
     message: "The MCP server could not be verified or connected.",
   },
+  "mcp-oauth-failed": {
+    tone: "error",
+    message:
+      "MCP authorization could not be completed. Start the connection again and finish it within ten minutes.",
+  },
   "mcp-connected": {
     tone: "success",
     message:

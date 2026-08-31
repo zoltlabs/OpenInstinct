@@ -8,7 +8,10 @@ import {
 import {
   connectRemoteMcp,
   GoogleConnector,
+  mcpToolManifestSchema,
+  OpenInstinctMcpOAuthProvider,
   oauthTokenSetSchema,
+  parseMcpCredential,
   refreshGoogleToken,
 } from "@openinstinct/connectors";
 import type { ServerEnvironment } from "@openinstinct/runtime";
@@ -204,11 +207,7 @@ export class JobProcessor {
       mcpConnections: mcpConnections.map((connection) => ({
         id: connection.id,
         name: connection.displayName ?? "MCP",
-        toolNames: Array.isArray(connection.metadata.toolNames)
-          ? connection.metadata.toolNames.filter(
-              (value): value is string => typeof value === "string",
-            )
-          : [],
+        tools: manifestForConnection(connection.metadata),
         configVersion:
           typeof connection.metadata.configVersion === "string"
             ? connection.metadata.configVersion
@@ -407,18 +406,43 @@ export class JobProcessor {
     const url = connection.metadata.url;
     if (typeof url !== "string")
       throw new Error("MCP connection URL is missing.");
-    const secret = JSON.parse(
-      decryptCredential({
-        encrypted: connection.encryptedCredentials,
-        encodedKey: this.#env.SECRET_ENCRYPTION_KEY,
+    let credential = parseMcpCredential(
+      JSON.parse(
+        decryptCredential({
+          encrypted: connection.encryptedCredentials,
+          encodedKey: this.#env.SECRET_ENCRYPTION_KEY,
+          workspaceId,
+          connectionId: connection.id,
+        }),
+      ),
+    );
+    const persistOAuth = async (
+      value: import("@openinstinct/connectors").McpOAuthCredential,
+    ) => {
+      credential = value;
+      await this.#store.updateConnectionCredentials({
+        id: connection.id,
         workspaceId,
-        connectionId: connection.id,
-      }),
-    ) as { bearerToken?: unknown };
+        encryptedCredentials: encryptCredential({
+          plaintext: JSON.stringify(value),
+          encodedKey: this.#env.SECRET_ENCRYPTION_KEY,
+          workspaceId,
+          connectionId: connection.id,
+        }),
+      });
+    };
+    const authProvider =
+      credential.kind === "oauth"
+        ? new OpenInstinctMcpOAuthProvider({
+            credential,
+            persist: persistOAuth,
+          })
+        : undefined;
     const client = await connectRemoteMcp({
       url,
       bearerToken:
-        typeof secret.bearerToken === "string" ? secret.bearerToken : undefined,
+        credential.kind === "bearer" ? credential.bearerToken : undefined,
+      authProvider,
     });
     try {
       return await client.callTool({
@@ -500,4 +524,21 @@ export class JobProcessor {
       configVersion,
     };
   }
+}
+
+function manifestForConnection(
+  metadata: Record<string, unknown>,
+): readonly import("@openinstinct/connectors").McpToolManifestEntry[] {
+  const manifest = mcpToolManifestSchema.safeParse(metadata.toolManifest);
+  if (manifest.success) return manifest.data;
+  const names = Array.isArray(metadata.toolNames)
+    ? metadata.toolNames.filter(
+        (value): value is string =>
+          typeof value === "string" && value.length > 0 && value.length <= 256,
+      )
+    : [];
+  return names.slice(0, 100).map((name) => ({
+    name,
+    inputSchema: { type: "object" },
+  }));
 }

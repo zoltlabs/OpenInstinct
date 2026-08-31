@@ -2,8 +2,13 @@ import { describe, expect, it } from "vitest";
 import {
   assertSafeMcpUrl,
   assertSafeWebUrl,
+  connectionIdFromMcpOAuthState,
+  createPendingMcpOAuthCredential,
   createGoogleAuthorization,
   isPrivateNetworkAddress,
+  OpenInstinctMcpOAuthProvider,
+  parseMcpCredential,
+  resolveMcpConnectorCandidates,
 } from "../src/index";
 
 describe("Google OAuth", () => {
@@ -52,5 +57,104 @@ describe("MCP URL policy", () => {
     expect(() =>
       assertSafeMcpUrl("https://token@mcp.example.com/mcp"),
     ).toThrow();
+  });
+});
+
+describe("MCP connector resolution", () => {
+  it("resolves conversational Granola requests from the curated catalog", async () => {
+    const candidates = await resolveMcpConnectorCandidates(
+      "please connect my Granola meeting notes",
+    );
+
+    expect(candidates).toEqual([
+      expect.objectContaining({
+        id: "granola",
+        name: "Granola",
+        url: "https://mcp.granola.ai/mcp",
+        source: "catalog",
+        verified: true,
+      }),
+    ]);
+  });
+
+  it("accepts an owner-supplied public MCP URL without claiming verification", async () => {
+    const [candidate] = await resolveMcpConnectorCandidates(
+      "https://mcp.example.com/mcp",
+    );
+
+    expect(candidate).toEqual(
+      expect.objectContaining({
+        url: "https://mcp.example.com/mcp",
+        source: "owner_url",
+        verified: false,
+      }),
+    );
+  });
+});
+
+describe("MCP OAuth credentials", () => {
+  const connectionId = "88e8807f-0fc8-43ea-877f-63e87db91fcb";
+  const redirectUrl = "https://assistant.example/api/connectors/mcp/callback";
+
+  it("binds a short-lived OAuth state to the pending connection", () => {
+    const credential = createPendingMcpOAuthCredential({
+      connectionId,
+      redirectUrl,
+    });
+
+    expect(connectionIdFromMcpOAuthState(credential.state ?? "")).toBe(
+      connectionId,
+    );
+    expect(new Date(credential.flowExpiresAt ?? 0).getTime()).toBeGreaterThan(
+      Date.now(),
+    );
+    expect(connectionIdFromMcpOAuthState("not-a-valid-state")).toBeUndefined();
+  });
+
+  it("keeps legacy bearer credentials readable", () => {
+    expect(parseMcpCredential({ bearerToken: "legacy-token" })).toEqual({
+      kind: "bearer",
+      bearerToken: "legacy-token",
+    });
+  });
+
+  it("retains refresh tokens when an OAuth server rotates only access tokens", async () => {
+    const provider = new OpenInstinctMcpOAuthProvider({
+      credential: {
+        ...createPendingMcpOAuthCredential({ connectionId, redirectUrl }),
+        tokens: {
+          access_token: "old-access",
+          refresh_token: "refresh-token",
+          token_type: "Bearer",
+        },
+      },
+    });
+
+    await provider.saveTokens({
+      access_token: "new-access",
+      token_type: "Bearer",
+    });
+
+    expect(provider.credential.tokens).toEqual({
+      access_token: "new-access",
+      refresh_token: "refresh-token",
+      token_type: "Bearer",
+    });
+  });
+
+  it("creates a fresh bounded flow after full credential invalidation", async () => {
+    const provider = new OpenInstinctMcpOAuthProvider({
+      credential: createPendingMcpOAuthCredential({
+        connectionId,
+        redirectUrl,
+      }),
+    });
+
+    await provider.invalidateCredentials("all");
+
+    expect(connectionIdFromMcpOAuthState(provider.credential.state ?? "")).toBe(
+      connectionId,
+    );
+    expect(provider.credential.flowExpiresAt).toBeTruthy();
   });
 });
