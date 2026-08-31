@@ -424,11 +424,14 @@ describe("agent-friendly setup checks", () => {
     try {
       const page = await (await fetch(ui.url)).text();
       expect(page).not.toContain("never-render-this");
-      expect(page).toContain("Configured — leave blank to keep it");
+      expect(page).toContain(
+        "Saved. Leave blank to keep it, or paste a new value to replace it.",
+      );
       expect(page).toContain("Scheduling is handled inside Supabase");
       expect(page).toContain("Advanced deployment options");
-      expect(page).toContain("Finish Blooio");
-      expect(page).toContain("Setup plan");
+      expect(page).toContain("iMessage (Blooio)");
+      expect(page).toContain("Save iMessage settings");
+      expect(page).toContain("Technical setup plan");
       expect(page).toContain("AI provider");
       expect(page).toContain("OpenAI API key");
       expect(page).toContain("Public app URL");
@@ -451,6 +454,37 @@ describe("agent-friendly setup checks", () => {
       expect(
         envFileValues(await readFile(envPath, "utf8")).OWNER_EMAIL,
       ).toBeUndefined();
+      const opaqueWithoutFetchMetadata = await fetch(`${ui.url}/save`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+          Origin: "null",
+        },
+        body: new URLSearchParams({
+          csrf: csrf ?? "",
+          OWNER_EMAIL: "untrusted@example.com",
+        }),
+      });
+      expect(opaqueWithoutFetchMetadata.status).toBe(403);
+      expect(
+        envFileValues(await readFile(envPath, "utf8")).OWNER_EMAIL,
+      ).toBeUndefined();
+      const inAppSaved = await fetch(`${ui.url}/save`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+          Origin: "null",
+          "Sec-Fetch-Site": "same-origin",
+        },
+        body: new URLSearchParams({
+          csrf: csrf ?? "",
+          OWNER_EMAIL: "in-app@example.com",
+        }),
+      });
+      expect(inAppSaved.status).toBe(200);
+      expect(envFileValues(await readFile(envPath, "utf8")).OWNER_EMAIL).toBe(
+        "in-app@example.com",
+      );
       const saved = await fetch(`${ui.url}/save`, {
         method: "POST",
         headers: {
@@ -469,6 +503,75 @@ describe("agent-friendly setup checks", () => {
         BLOOIO_API_KEY: "never-render-this",
       });
       expect(await saved.text()).not.toContain("never-render-this");
+    } finally {
+      await ui.close();
+    }
+  });
+
+  it("makes Blooio directly discoverable and preserves non-secret input on errors", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "openinstinct-ux-"));
+    const envPath = join(directory, ".env.local");
+    const ui = await startSetupUi({ envPath, port: 0 });
+    try {
+      const page = await (await fetch(`${ui.url}/?step=imessage`)).text();
+      expect(page).toMatch(
+        /id="imessage"[^>]*>\s*<details open>[\s\S]*Blooio API key/u,
+      );
+      expect(page).toContain("Open Blooio ↗");
+      expect(page).toContain("Save iMessage settings");
+      expect(page).toContain('action="/save#imessage-settings"');
+      expect(page).toContain('action="/verify-blooio#imessage-actions"');
+      expect(page).toContain(
+        'action="/register-blooio-webhook#imessage-actions"',
+      );
+      expect(page).not.toContain("scroll-behavior:smooth");
+      expect(page).toContain("Do not enter the Blooio assistant number.");
+      expect(page).not.toContain(
+        "save that key and your personal owner phone above",
+      );
+      const csrf = page.match(/name="csrf" value="([^"]+)"/u)?.[1];
+      expect(csrf).toBeTruthy();
+
+      const invalid = await fetch(`${ui.url}/save`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+          Origin: ui.url,
+        },
+        body: new URLSearchParams({
+          csrf: csrf ?? "",
+          step: "imessage",
+          OWNER_EMAIL: "owner@example.com",
+          BLOOIO_OWNER_PHONE: "555",
+          BLOOIO_API_KEY: "submitted-secret-must-not-render",
+        }),
+      });
+      expect(invalid.status).toBe(400);
+      const invalidPage = await invalid.text();
+      expect(invalidPage).toContain('value="owner@example.com"');
+      expect(invalidPage).toMatch(
+        /name="BLOOIO_OWNER_PHONE"[^>]*aria-invalid="true"/u,
+      );
+      expect(invalidPage).toContain("Use E.164, like +15551234567.");
+      expect(invalidPage).not.toContain("submitted-secret-must-not-render");
+      expect(invalidPage).toMatch(/id="imessage"[^>]*>\s*<details open>/u);
+      expect(await readFile(envPath, "utf8").catch(() => "")).toBe("");
+
+      const verify = await fetch(`${ui.url}/verify-blooio`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+          Origin: ui.url,
+        },
+        body: new URLSearchParams({
+          csrf: csrf ?? "",
+          step: "imessage",
+        }),
+      });
+      expect(verify.status).toBe(400);
+      const verifyPage = await verify.text();
+      expect(verifyPage).toContain("That step didn't complete.");
+      expect(verifyPage).not.toContain("We couldn't save that yet.");
     } finally {
       await ui.close();
     }

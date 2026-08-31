@@ -1,7 +1,8 @@
 import type { NextConfig } from "next";
 
 const config: NextConfig = {
-  output: "standalone",
+  // Vercel packages functions through its adapter; standalone remains for containers.
+  output: process.env.VERCEL ? undefined : "standalone",
   serverExternalPackages: ["postgres"],
   transpilePackages: [
     "@openinstinct/connectors",
