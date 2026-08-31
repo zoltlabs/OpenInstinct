@@ -30,7 +30,7 @@ export async function POST(request: Request) {
       httpOnly: true,
       secure: new URL(request.url).protocol === "https:",
       sameSite: "strict",
-      path: "/api/browser",
+      path: "/api",
       maxAge: 15 * 60,
     });
     return response;

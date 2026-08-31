@@ -28,6 +28,16 @@ import {
   type RunEventType,
   type StructuredToolResult,
 } from "@openinstinct/core";
+import {
+  credentialConfigurationVersion,
+  credentialEnvelopeSchema,
+  credentialItemSchema,
+  credentialUseContextSchema,
+  validateCredentialUse,
+  type CredentialEnvelope,
+  type CredentialItem,
+  type CredentialUseContext,
+} from "@openinstinct/credentials";
 import { z } from "zod";
 import { agentJobSchema, type AgentJob, type ClaimedJob } from "./jobs";
 
@@ -116,6 +126,40 @@ function parseAuthorityGrantRow(row: AuthorityGrantRow): AuthorityGrant {
     alwaysRequireFreshApproval: row.always_require_fresh_approval,
     alwaysRequireHumanTakeover: row.always_require_human_takeover,
     configurationVersion: row.configuration_version,
+  });
+}
+
+interface CredentialItemRow {
+  id: string;
+  workspace_id: string;
+  kind: "website_password";
+  label: string;
+  username_hint: string | null;
+  allowed_origins: string[];
+  status: CredentialItem["status"];
+  record_version: number;
+  configuration_version: string;
+  encryption_key_version: number;
+  last_verified_at: Date | null;
+  rotation_due_at: Date | null;
+  revoked_at: Date | null;
+}
+
+function parseCredentialItemRow(row: CredentialItemRow): CredentialItem {
+  return credentialItemSchema.parse({
+    id: row.id,
+    workspaceId: row.workspace_id,
+    kind: row.kind,
+    label: row.label,
+    usernameHint: row.username_hint,
+    allowedOrigins: row.allowed_origins,
+    status: row.status,
+    recordVersion: row.record_version,
+    configurationVersion: row.configuration_version,
+    encryptionKeyVersion: row.encryption_key_version,
+    lastVerifiedAt: row.last_verified_at?.toISOString() ?? null,
+    rotationDueAt: row.rotation_due_at?.toISOString() ?? null,
+    revokedAt: row.revoked_at?.toISOString() ?? null,
   });
 }
 
@@ -314,6 +358,50 @@ export class OpenInstinctStore {
       )
         throw new Error("Conflicting audit event idempotency key.");
     }
+  }
+
+  async #writeCredentialAccessEvent(
+    sql: Sql | postgres.TransactionSql,
+    input: {
+      workspaceId: string;
+      credentialItemId: string;
+      executor: "owner" | "worker" | "system";
+      exactOrigin?: string;
+      browserProfileId?: string;
+      browserExecutionId?: string | null;
+      browserControlSessionId?: string;
+      runId?: string | null;
+      actionRequestId?: string | null;
+      reasonCode: string;
+      result:
+        | "requested"
+        | "injected"
+        | "denied"
+        | "failed"
+        | "revealed"
+        | "exported"
+        | "rotated"
+        | "revoked"
+        | "deleted"
+        | "unknown";
+      detail?: Record<string, unknown>;
+    },
+  ): Promise<void> {
+    await sql`
+      insert into public.credential_access_events (
+        workspace_id,credential_item_id,executor,exact_origin,
+        browser_profile_id,browser_execution_id,browser_control_session_id,
+        run_id,action_request_id,reason_code,result,detail
+      ) values (
+        ${input.workspaceId},${input.credentialItemId},${input.executor},
+        ${input.exactOrigin ?? null},${input.browserProfileId ?? null},
+        ${input.browserExecutionId ?? null},${
+          input.browserControlSessionId ?? null
+        },${input.runId ?? null},${input.actionRequestId ?? null},
+        ${input.reasonCode},${input.result},
+        ${sql.json(toJson(input.detail ?? {}))}
+      )
+    `;
   }
 
   async #persistToolResultProjection(
@@ -2901,6 +2989,701 @@ export class OpenInstinctStore {
       configurationVersion: Number(row.configuration_version),
       allowedOrigins: row.allowed_origins,
     }));
+  }
+
+  async listCredentialItems(
+    workspaceId: string,
+  ): Promise<readonly CredentialItem[]> {
+    const rows = await this.#sql<CredentialItemRow[]>`
+      select id,workspace_id,kind,label,username_hint,allowed_origins,status,
+        record_version,configuration_version,encryption_key_version,
+        last_verified_at,rotation_due_at,revoked_at
+      from public.credential_items where workspace_id=${workspaceId}
+      order by label asc limit 100
+    `;
+    return rows.map(parseCredentialItemRow);
+  }
+
+  async createCredentialItem(input: {
+    item: CredentialItem;
+    envelope: CredentialEnvelope;
+  }): Promise<void> {
+    const item = credentialItemSchema.parse(input.item);
+    const envelope = credentialEnvelopeSchema.parse(input.envelope);
+    if (
+      item.configurationVersion !==
+      credentialConfigurationVersion({
+        kind: item.kind,
+        allowedOrigins: item.allowedOrigins,
+        recordVersion: item.recordVersion,
+      })
+    )
+      throw new Error("Credential configuration hash mismatch.");
+    if (envelope.keyVersion !== item.encryptionKeyVersion)
+      throw new Error("Credential envelope key version mismatch.");
+    await this.#sql.begin(async (tx) => {
+      await tx`
+        insert into public.credential_items (
+          id,workspace_id,kind,label,username_hint,allowed_origins,status,
+          record_version,configuration_version,encryption_key_version,
+          last_verified_at,rotation_due_at,revoked_at
+        ) values (
+          ${item.id},${item.workspaceId},${item.kind},${item.label},
+          ${item.usernameHint},${item.allowedOrigins},${item.status},
+          ${item.recordVersion},${item.configurationVersion},
+          ${item.encryptionKeyVersion},
+          ${item.lastVerifiedAt ? new Date(item.lastVerifiedAt) : null},
+          ${item.rotationDueAt ? new Date(item.rotationDueAt) : null},
+          ${item.revokedAt ? new Date(item.revokedAt) : null}
+        )
+      `;
+      await tx`
+        insert into app_private.credential_item_versions (
+          credential_item_id,workspace_id,configuration_version,record_version,
+          allowed_origins
+        ) values (
+          ${item.id},${item.workspaceId},${item.configurationVersion},
+          ${item.recordVersion},${item.allowedOrigins}
+        )
+      `;
+      await tx`
+        insert into app_private.credential_secrets (
+          credential_item_id,workspace_id,record_version,envelope
+        ) values (
+          ${item.id},${item.workspaceId},${item.recordVersion},
+          ${tx.json(toJson(envelope))}
+        )
+      `;
+      await this.#writeCredentialAccessEvent(tx, {
+        workspaceId: item.workspaceId,
+        credentialItemId: item.id,
+        executor: "owner",
+        reasonCode: "credential_created",
+        result: "requested",
+      });
+    });
+  }
+
+  async replaceCredentialItem(input: {
+    item: CredentialItem;
+    envelope: CredentialEnvelope;
+  }): Promise<readonly { id: string; providerSessionId: string }[]> {
+    const item = credentialItemSchema.parse(input.item);
+    const envelope = credentialEnvelopeSchema.parse(input.envelope);
+    if (
+      item.configurationVersion !==
+        credentialConfigurationVersion({
+          kind: item.kind,
+          allowedOrigins: item.allowedOrigins,
+          recordVersion: item.recordVersion,
+        }) ||
+      envelope.keyVersion !== item.encryptionKeyVersion
+    )
+      throw new Error("Replacement credential binding is invalid.");
+    return this.#sql.begin(async (tx) => {
+      const updated = await tx`
+        update public.credential_items set
+          label=${item.label},username_hint=${item.usernameHint},
+          allowed_origins=${item.allowedOrigins},status='needs_verification',
+          record_version=${item.recordVersion},
+          configuration_version=${item.configurationVersion},
+          encryption_key_version=${item.encryptionKeyVersion},
+          last_verified_at=null,rotation_due_at=${
+            item.rotationDueAt ? new Date(item.rotationDueAt) : null
+          }
+        where id=${item.id} and workspace_id=${item.workspaceId}
+          and status in ('active','needs_verification')
+          and record_version=${item.recordVersion - 1}
+        returning id
+      `;
+      if (updated.length !== 1)
+        throw new Error("Credential changed before replacement.");
+      await tx`
+        insert into app_private.credential_item_versions (
+          credential_item_id,workspace_id,configuration_version,record_version,
+          allowed_origins
+        ) values (
+          ${item.id},${item.workspaceId},${item.configurationVersion},
+          ${item.recordVersion},${item.allowedOrigins}
+        )
+      `;
+      const secret = await tx`
+        update app_private.credential_secrets set
+          record_version=${item.recordVersion},envelope=${tx.json(toJson(envelope))},
+          reencrypted_at=now()
+        where credential_item_id=${item.id} and workspace_id=${item.workspaceId}
+        returning credential_item_id
+      `;
+      if (secret.length !== 1)
+        throw new Error("Credential ciphertext is unavailable.");
+      await tx`
+        update app_private.credential_injection_leases
+        set status=case when status='prepared' then 'expired' else 'unknown' end,
+          completed_at=now()
+        where credential_item_id=${item.id} and workspace_id=${item.workspaceId}
+          and status in ('prepared','invocation_started')
+      `;
+      await tx`
+        update public.credential_profile_bindings
+        set status='invalidated',invalidated_at=now()
+        where credential_item_id=${item.id} and workspace_id=${item.workspaceId}
+          and status='active'
+      `;
+      await tx`
+        update public.browser_profiles p set status='needs_reauth',
+          configuration_version=configuration_version+1,
+          last_error_code='credential_replaced'
+        where p.workspace_id=${item.workspaceId} and p.status='active'
+          and exists (
+            select 1 from public.credential_profile_bindings b
+            where b.credential_item_id=${item.id} and b.workspace_id=p.workspace_id
+              and b.browser_profile_id=p.id
+          )
+      `;
+      const sessions = await tx<{ id: string; provider_session_id: string }[]>`
+        update app_private.browser_control_sessions c set status='cleanup_pending'
+        where c.workspace_id=${item.workspaceId} and c.status='active'
+          and (
+            exists (
+              select 1 from public.credential_profile_bindings b
+              where b.credential_item_id=${item.id} and b.workspace_id=c.workspace_id
+                and b.browser_profile_id=c.profile_id
+            ) or exists (
+              select 1 from app_private.credential_injection_leases l
+              where l.credential_item_id=${item.id} and l.workspace_id=c.workspace_id
+                and l.control_session_id=c.id
+            )
+          ) returning id,provider_session_id
+      `;
+      await this.#writeCredentialAccessEvent(tx, {
+        workspaceId: item.workspaceId,
+        credentialItemId: item.id,
+        executor: "owner",
+        reasonCode: "credential_replaced",
+        result: "rotated",
+      });
+      return sessions.map((row) => ({
+        id: row.id,
+        providerSessionId: row.provider_session_id,
+      }));
+    });
+  }
+
+  async rotateCredentialWrappingKey(input: {
+    workspaceId: string;
+    credentialItemId: string;
+    expectedKeyVersion: number;
+    envelope: CredentialEnvelope;
+  }): Promise<void> {
+    const envelope = credentialEnvelopeSchema.parse(input.envelope);
+    await this.#sql.begin(async (tx) => {
+      const item = await tx`
+        update public.credential_items
+        set encryption_key_version=${envelope.keyVersion}
+        where id=${input.credentialItemId} and workspace_id=${input.workspaceId}
+          and encryption_key_version=${input.expectedKeyVersion}
+          and status in ('active','needs_verification')
+        returning id
+      `;
+      if (item.length !== 1)
+        throw new Error("Credential key version changed during rotation.");
+      const secret = await tx`
+        update app_private.credential_secrets
+        set envelope=${tx.json(toJson(envelope))},reencrypted_at=now()
+        where credential_item_id=${input.credentialItemId}
+          and workspace_id=${input.workspaceId}
+          and (envelope->>'keyVersion')::integer=${input.expectedKeyVersion}
+        returning credential_item_id
+      `;
+      if (secret.length !== 1)
+        throw new Error("Credential envelope changed during rotation.");
+      await this.#writeCredentialAccessEvent(tx, {
+        workspaceId: input.workspaceId,
+        credentialItemId: input.credentialItemId,
+        executor: "system",
+        reasonCode: "wrapping_key_rotated",
+        result: "rotated",
+        detail: { keyVersion: envelope.keyVersion },
+      });
+    });
+  }
+
+  async getCredentialForOwnerRecovery(input: {
+    workspaceId: string;
+    credentialItemId: string;
+    purpose: "reveal" | "export";
+  }): Promise<{ item: CredentialItem; envelope: CredentialEnvelope }> {
+    return this.#sql.begin(async (tx) => {
+      const [row] = await tx<
+        (CredentialItemRow & { envelope: Record<string, unknown> })[]
+      >`
+        select i.id,i.workspace_id,i.kind,i.label,i.username_hint,
+          i.allowed_origins,i.status,i.record_version,i.configuration_version,
+          i.encryption_key_version,i.last_verified_at,i.rotation_due_at,i.revoked_at,
+          s.envelope
+        from public.credential_items i
+        join app_private.credential_secrets s on s.credential_item_id=i.id
+          and s.workspace_id=i.workspace_id and s.record_version=i.record_version
+        where i.id=${input.credentialItemId} and i.workspace_id=${input.workspaceId}
+          and i.status in ('active','needs_verification')
+        for update of i,s
+      `;
+      if (!row)
+        throw new Error("Credential is unavailable for owner recovery.");
+      await this.#writeCredentialAccessEvent(tx, {
+        workspaceId: input.workspaceId,
+        credentialItemId: input.credentialItemId,
+        executor: "owner",
+        reasonCode: `credential_${input.purpose}_requested`,
+        result: "requested",
+      });
+      return {
+        item: parseCredentialItemRow(row),
+        envelope: credentialEnvelopeSchema.parse(row.envelope),
+      };
+    });
+  }
+
+  async recordCredentialOwnerRecovery(input: {
+    workspaceId: string;
+    credentialItemId: string;
+    purpose: "reveal" | "export";
+  }): Promise<void> {
+    await this.#writeCredentialAccessEvent(this.#sql, {
+      workspaceId: input.workspaceId,
+      credentialItemId: input.credentialItemId,
+      executor: "owner",
+      reasonCode: `credential_${input.purpose}_completed`,
+      result: input.purpose === "reveal" ? "revealed" : "exported",
+    });
+  }
+
+  async claimCredentialInjection(input: {
+    context: CredentialUseContext;
+    claimToken: string;
+  }): Promise<{
+    leaseId: string;
+    providerSessionId: string;
+    item: CredentialItem;
+    envelope: CredentialEnvelope;
+  }> {
+    const context = credentialUseContextSchema.parse(input.context);
+    return this.#sql.begin(async (tx) => {
+      const [row] = await tx<
+        (CredentialItemRow & {
+          envelope: Record<string, unknown>;
+          provider_session_id: string;
+        })[]
+      >`
+        select i.id,i.workspace_id,i.kind,i.label,i.username_hint,
+          i.allowed_origins,i.status,i.record_version,i.configuration_version,
+          i.encryption_key_version,i.last_verified_at,i.rotation_due_at,i.revoked_at,
+          s.envelope,c.provider_session_id
+        from public.credential_items i
+        join app_private.credential_secrets s on s.credential_item_id=i.id
+          and s.workspace_id=i.workspace_id and s.record_version=i.record_version
+        join app_private.browser_control_sessions c
+          on c.id=${context.browserControlSessionId}
+          and c.workspace_id=i.workspace_id and c.profile_id=${context.browserProfileId}
+        join public.browser_profiles p on p.id=c.profile_id
+          and p.workspace_id=c.workspace_id
+        where i.id=${context.credentialItemId}
+          and i.workspace_id=${context.workspaceId}
+          and i.status in ('active','needs_verification')
+          and i.configuration_version=${context.credentialConfigurationVersion}
+          and ${context.exactOrigin}=any(i.allowed_origins)
+          and c.status='active' and c.expires_at>now()
+          and c.configuration_version=${context.browserProfileConfigurationVersion}
+          and p.configuration_version=c.configuration_version
+          and p.status in ('needs_login','needs_reauth')
+          and exists (
+            select 1 from public.browser_profile_origins o
+            where o.profile_id=p.id and o.workspace_id=p.workspace_id
+              and o.origin=${context.exactOrigin}
+          )
+        for update of i,s,c,p
+      `;
+      if (!row) throw new Error("Credential injection context is unavailable.");
+      const item = parseCredentialItemRow(row);
+      validateCredentialUse({ item, context, allowNeedsVerification: true });
+      const envelope = credentialEnvelopeSchema.parse(row.envelope);
+      const leaseId = randomUUID();
+      await tx`
+        insert into app_private.credential_injection_leases (
+          id,workspace_id,credential_item_id,credential_configuration_version,
+          browser_profile_id,browser_profile_configuration_version,
+          control_session_id,exact_origin,field_binding_hash,claim_token_hash,
+          status,expires_at
+        ) values (
+          ${leaseId},${context.workspaceId},${context.credentialItemId},
+          ${context.credentialConfigurationVersion},${context.browserProfileId},
+          ${context.browserProfileConfigurationVersion},
+          ${context.browserControlSessionId},${context.exactOrigin},
+          ${payloadHash(context.fields)},${payloadHash(input.claimToken)},
+          'prepared',least(now()+interval '2 minutes',(
+            select expires_at from app_private.browser_control_sessions
+            where id=${context.browserControlSessionId}
+          ))
+        )
+      `;
+      await this.#writeCredentialAccessEvent(tx, {
+        workspaceId: context.workspaceId,
+        credentialItemId: context.credentialItemId,
+        executor: "worker",
+        exactOrigin: context.exactOrigin,
+        browserProfileId: context.browserProfileId,
+        browserExecutionId: context.browserExecutionId,
+        browserControlSessionId: context.browserControlSessionId,
+        runId: context.runId,
+        actionRequestId: context.actionRequestId,
+        reasonCode: "credential_injection_requested",
+        result: "requested",
+      });
+      return {
+        leaseId,
+        providerSessionId: row.provider_session_id,
+        item,
+        envelope,
+      };
+    });
+  }
+
+  async markCredentialInjectionStarted(input: {
+    leaseId: string;
+    workspaceId: string;
+    claimToken: string;
+  }): Promise<void> {
+    await this.#sql.begin(async (tx) => {
+      const locked = await tx`
+        select l.id
+        from app_private.credential_injection_leases l
+        join public.credential_items i on i.id=l.credential_item_id
+          and i.workspace_id=l.workspace_id
+        join app_private.credential_secrets s on s.credential_item_id=i.id
+          and s.workspace_id=i.workspace_id and s.record_version=i.record_version
+        join public.browser_profiles p on p.id=l.browser_profile_id
+          and p.workspace_id=l.workspace_id
+        join app_private.browser_control_sessions c on c.id=l.control_session_id
+          and c.workspace_id=l.workspace_id
+        where l.id=${input.leaseId} and l.workspace_id=${input.workspaceId}
+          and l.status='prepared' and l.expires_at>now()
+          and l.claim_token_hash=${payloadHash(input.claimToken)}
+          and i.status in ('active','needs_verification')
+          and i.configuration_version=l.credential_configuration_version
+          and p.configuration_version=l.browser_profile_configuration_version
+          and p.status in ('needs_login','needs_reauth')
+          and c.status='active' and c.expires_at>now()
+        for update of l,i,s,p,c
+      `;
+      if (locked.length !== 1)
+        throw new Error("Credential injection fence changed unexpectedly.");
+      const rows = await tx`
+        update app_private.credential_injection_leases
+        set status='invocation_started'
+        where id=${input.leaseId} and workspace_id=${input.workspaceId}
+          and status='prepared' and expires_at>now()
+          and claim_token_hash=${payloadHash(input.claimToken)}
+        returning id
+      `;
+      if (rows.length !== 1)
+        throw new Error("Credential injection fence changed unexpectedly.");
+    });
+  }
+
+  async settleCredentialInjection(input: {
+    leaseId: string;
+    workspaceId: string;
+    claimToken: string;
+    result: "injected" | "failed" | "unknown";
+  }): Promise<
+    { id: string; providerSessionId: string; quarantined: true } | undefined
+  > {
+    return this.#sql.begin(async (tx) => {
+      const [row] = await tx<
+        {
+          credential_item_id: string;
+          credential_configuration_version: string;
+          exact_origin: string;
+          browser_profile_id: string;
+          control_session_id: string;
+        }[]
+      >`
+        update app_private.credential_injection_leases l
+        set status=${input.result},completed_at=now()
+        from public.credential_items i, public.browser_profiles p,
+          app_private.browser_control_sessions c
+        where l.id=${input.leaseId} and l.workspace_id=${input.workspaceId}
+          and l.status='invocation_started'
+          and l.claim_token_hash=${payloadHash(input.claimToken)}
+          and i.id=l.credential_item_id and i.workspace_id=l.workspace_id
+          and i.configuration_version=l.credential_configuration_version
+          and i.status in ('active','needs_verification')
+          and p.id=l.browser_profile_id and p.workspace_id=l.workspace_id
+          and p.configuration_version=l.browser_profile_configuration_version
+          and p.status in ('needs_login','needs_reauth')
+          and c.id=l.control_session_id and c.workspace_id=l.workspace_id
+          and c.profile_id=p.id and c.status='active' and c.expires_at>now()
+        returning l.credential_item_id,l.credential_configuration_version,
+          l.exact_origin,l.browser_profile_id,l.control_session_id
+      `;
+      if (!row)
+        throw new Error("Credential injection settlement fence changed.");
+      if (input.result === "injected")
+        await tx`
+          insert into public.credential_profile_bindings (
+            credential_item_id,workspace_id,browser_profile_id,
+            credential_configuration_version,status
+          ) values (
+            ${row.credential_item_id},${input.workspaceId},${row.browser_profile_id},
+            ${row.credential_configuration_version},'active'
+          ) on conflict (credential_item_id,browser_profile_id) do update set
+            status='active',invalidated_at=null,bound_at=now(),
+            credential_configuration_version=excluded.credential_configuration_version
+        `;
+      await this.#writeCredentialAccessEvent(tx, {
+        workspaceId: input.workspaceId,
+        credentialItemId: row.credential_item_id,
+        executor: "worker",
+        exactOrigin: row.exact_origin,
+        browserProfileId: row.browser_profile_id,
+        browserControlSessionId: row.control_session_id,
+        reasonCode: "credential_injection_finished",
+        result: input.result,
+      });
+      if (input.result === "unknown") {
+        const [session] = await tx<
+          { id: string; provider_session_id: string }[]
+        >`
+          update app_private.browser_control_sessions
+          set status='cleanup_pending'
+          where id=${row.control_session_id} and workspace_id=${input.workspaceId}
+            and status='active'
+          returning id,provider_session_id
+        `;
+        if (session)
+          return {
+            id: session.id,
+            providerSessionId: session.provider_session_id,
+            quarantined: true as const,
+          };
+      }
+      return undefined;
+    });
+  }
+
+  async expireCredentialInjectionLeases(): Promise<number> {
+    return this.#sql.begin(async (tx) => {
+      const rows = await tx<
+        {
+          credential_item_id: string;
+          workspace_id: string;
+          exact_origin: string;
+          browser_profile_id: string;
+          control_session_id: string;
+          status: "expired" | "unknown";
+        }[]
+      >`
+        update app_private.credential_injection_leases
+        set status=case when status='prepared' then 'expired' else 'unknown' end,
+          completed_at=now()
+        where status in ('prepared','invocation_started') and expires_at<=now()
+        returning credential_item_id,workspace_id,exact_origin,
+          browser_profile_id,control_session_id,status
+      `;
+      for (const row of rows)
+        await tx`
+          update app_private.browser_control_sessions set status='cleanup_pending'
+          where id=${row.control_session_id} and workspace_id=${row.workspace_id}
+            and status='active'
+        `;
+      for (const row of rows)
+        await this.#writeCredentialAccessEvent(tx, {
+          workspaceId: row.workspace_id,
+          credentialItemId: row.credential_item_id,
+          executor: "system",
+          exactOrigin: row.exact_origin,
+          browserProfileId: row.browser_profile_id,
+          browserControlSessionId: row.control_session_id,
+          reasonCode: "credential_injection_lease_expired",
+          result: row.status === "unknown" ? "unknown" : "failed",
+        });
+      return rows.length;
+    });
+  }
+
+  async markCredentialVerified(input: {
+    workspaceId: string;
+    credentialItemId: string;
+    browserProfileId: string;
+    credentialConfigurationVersion: string;
+  }): Promise<void> {
+    await this.#sql.begin(async (tx) => {
+      const item = await tx`
+        update public.credential_items set status='active',last_verified_at=now()
+        where id=${input.credentialItemId} and workspace_id=${input.workspaceId}
+          and status in ('active','needs_verification')
+          and configuration_version=${input.credentialConfigurationVersion}
+          and exists (
+            select 1 from public.browser_profiles p
+            where p.id=${input.browserProfileId} and p.workspace_id=${input.workspaceId}
+              and p.status='active'
+          ) returning id
+      `;
+      if (item.length !== 1)
+        throw new Error("Credential verification binding changed.");
+      await tx`
+        insert into public.credential_profile_bindings (
+          credential_item_id,workspace_id,browser_profile_id,
+          credential_configuration_version,status
+        ) values (
+          ${input.credentialItemId},${input.workspaceId},${input.browserProfileId},
+          ${input.credentialConfigurationVersion},'active'
+        ) on conflict (credential_item_id,browser_profile_id) do update set
+          status='active',invalidated_at=null,bound_at=now(),
+          credential_configuration_version=excluded.credential_configuration_version
+      `;
+      await this.#writeCredentialAccessEvent(tx, {
+        workspaceId: input.workspaceId,
+        credentialItemId: input.credentialItemId,
+        executor: "owner",
+        browserProfileId: input.browserProfileId,
+        reasonCode: "credential_verified",
+        result: "injected",
+      });
+    });
+  }
+
+  async markProfileCredentialBindingsVerified(input: {
+    workspaceId: string;
+    browserProfileId: string;
+  }): Promise<number> {
+    return this.#sql.begin(async (tx) => {
+      const rows = await tx<{ id: string }[]>`
+        update public.credential_items i set status='active',last_verified_at=now()
+        where i.workspace_id=${input.workspaceId} and i.status='needs_verification'
+          and exists (
+            select 1 from public.credential_profile_bindings b
+            join public.browser_profiles p on p.id=b.browser_profile_id
+              and p.workspace_id=b.workspace_id
+            where b.credential_item_id=i.id and b.workspace_id=i.workspace_id
+              and b.browser_profile_id=${input.browserProfileId}
+              and b.status='active' and p.status='active'
+          ) returning id
+      `;
+      for (const row of rows)
+        await this.#writeCredentialAccessEvent(tx, {
+          workspaceId: input.workspaceId,
+          credentialItemId: row.id,
+          executor: "system",
+          browserProfileId: input.browserProfileId,
+          reasonCode: "credential_login_verified",
+          result: "injected",
+        });
+      return rows.length;
+    });
+  }
+
+  async revokeCredentialItem(input: {
+    workspaceId: string;
+    credentialItemId: string;
+  }): Promise<readonly { id: string; providerSessionId: string }[]> {
+    return this.#sql.begin(async (tx) => {
+      const item = await tx`
+        update public.credential_items set status='revoked',revoked_at=now()
+        where id=${input.credentialItemId} and workspace_id=${input.workspaceId}
+          and status in ('active','needs_verification') returning id
+      `;
+      if (item.length !== 1) throw new Error("Credential cannot be revoked.");
+      await tx`
+        update app_private.credential_injection_leases
+        set status=case when status='prepared' then 'expired' else 'unknown' end,
+          completed_at=now()
+        where credential_item_id=${input.credentialItemId}
+          and workspace_id=${input.workspaceId}
+          and status in ('prepared','invocation_started')
+      `;
+      await tx`
+        delete from app_private.credential_secrets
+        where credential_item_id=${input.credentialItemId}
+          and workspace_id=${input.workspaceId}
+      `;
+      const profiles = await tx<{ browser_profile_id: string }[]>`
+        update public.credential_profile_bindings
+        set status='invalidated',invalidated_at=now()
+        where credential_item_id=${input.credentialItemId}
+          and workspace_id=${input.workspaceId} and status='active'
+        returning browser_profile_id
+      `;
+      for (const profile of profiles)
+        await tx`
+          update public.browser_profiles set status='needs_reauth',
+            configuration_version=configuration_version+1,last_error_code='credential_revoked'
+          where id=${profile.browser_profile_id} and workspace_id=${input.workspaceId}
+            and status='active'
+        `;
+      const sessions = await tx<{ id: string; provider_session_id: string }[]>`
+        update app_private.browser_control_sessions c set status='cleanup_pending'
+        where c.workspace_id=${input.workspaceId} and c.status='active'
+          and (
+            exists (
+              select 1 from public.credential_profile_bindings b
+              where b.credential_item_id=${input.credentialItemId}
+                and b.workspace_id=c.workspace_id and b.browser_profile_id=c.profile_id
+            ) or exists (
+              select 1 from app_private.credential_injection_leases l
+              where l.credential_item_id=${input.credentialItemId}
+                and l.workspace_id=c.workspace_id and l.control_session_id=c.id
+            )
+          ) returning id,provider_session_id
+      `;
+      await this.#writeCredentialAccessEvent(tx, {
+        workspaceId: input.workspaceId,
+        credentialItemId: input.credentialItemId,
+        executor: "owner",
+        reasonCode: "credential_revoked",
+        result: "revoked",
+      });
+      return sessions.map((row) => ({
+        id: row.id,
+        providerSessionId: row.provider_session_id,
+      }));
+    });
+  }
+
+  async deleteRevokedCredentialItem(input: {
+    workspaceId: string;
+    credentialItemId: string;
+  }): Promise<void> {
+    await this.#sql.begin(async (tx) => {
+      const requested = await tx`
+        update public.credential_items set status='deletion_pending',
+          deletion_requested_at=now()
+        where id=${input.credentialItemId} and workspace_id=${input.workspaceId}
+          and status='revoked' returning id
+      `;
+      if (requested.length !== 1)
+        throw new Error("Credential must be revoked before deletion.");
+      const secret = await tx`
+        select 1 from app_private.credential_secrets
+        where credential_item_id=${input.credentialItemId}
+          and workspace_id=${input.workspaceId}
+      `;
+      if (secret.length)
+        throw new Error("Credential ciphertext deletion is unverified.");
+      await tx`
+        update public.credential_items set status='deleted',deletion_verified_at=now(),
+          username_hint=null
+        where id=${input.credentialItemId} and workspace_id=${input.workspaceId}
+          and status='deletion_pending'
+      `;
+      await this.#writeCredentialAccessEvent(tx, {
+        workspaceId: input.workspaceId,
+        credentialItemId: input.credentialItemId,
+        executor: "owner",
+        reasonCode: "credential_deleted",
+        result: "deleted",
+      });
+    });
   }
 
   async createProvisioningBrowserProfile(input: {

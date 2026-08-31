@@ -3,6 +3,7 @@ import type {
   BrowserActionResult,
   BrowserAuthenticationVerification,
   BrowserCapabilities,
+  BrowserCredentialInjection,
   BrowserFile,
   BrowserHealth,
   BrowserInteraction,
@@ -168,6 +169,19 @@ export class FakeBrowserProvider implements BrowserProvider {
   ): Promise<BrowserActionResult> {
     this.#session(id);
     return { completed: true, url: "https://example.test/", title: "Example" };
+  }
+  async injectCredentialFields(
+    id: string,
+    input: BrowserCredentialInjection,
+  ): Promise<{ completed: true; origin: string }> {
+    this.#session(id);
+    if (input.exactOrigin !== "https://example.test")
+      throw new Error("Credential injection origin mismatch.");
+    if (input.frameOrigin && input.frameOrigin !== input.exactOrigin)
+      throw new Error("Cross-origin credential frames are not supported.");
+    if (input.username.byteLength === 0 || input.password.byteLength === 0)
+      throw new Error("Credential is empty.");
+    return { completed: true, origin: input.exactOrigin };
   }
   async screenshot(id: string): Promise<Uint8Array> {
     this.#session(id);

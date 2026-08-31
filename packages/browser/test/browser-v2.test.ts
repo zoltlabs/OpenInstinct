@@ -63,4 +63,35 @@ describe("BrowserProvider v2", () => {
       provider.downloadFile(session.id, uploaded.remotePath, 1),
     ).rejects.toThrow();
   });
+
+  it("injects credentials only into the exact bound origin", async () => {
+    const provider = new FakeBrowserProvider();
+    const session = await provider.startSession({
+      purpose: "reauthentication",
+    });
+    const secret = {
+      username: new TextEncoder().encode("canary-user"),
+      password: new TextEncoder().encode("canary-password"),
+    };
+    await expect(
+      provider.injectCredentialFields(session.id, {
+        exactOrigin: "https://example.test",
+        usernameSelector: "#username",
+        passwordSelector: "#password",
+        frameOrigin: null,
+        timeoutMs: 30_000,
+        ...secret,
+      }),
+    ).resolves.toEqual({ completed: true, origin: "https://example.test" });
+    await expect(
+      provider.injectCredentialFields(session.id, {
+        exactOrigin: "https://lookalike.test",
+        usernameSelector: "#username",
+        passwordSelector: "#password",
+        frameOrigin: null,
+        timeoutMs: 30_000,
+        ...secret,
+      }),
+    ).rejects.toThrow(/origin/u);
+  });
 });

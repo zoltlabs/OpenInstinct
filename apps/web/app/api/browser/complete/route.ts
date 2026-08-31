@@ -45,7 +45,7 @@ export async function POST(request: Request) {
       );
       response.cookies.set("openinstinct_browser_takeover", "", {
         httpOnly: true,
-        path: "/api/browser",
+        path: "/api",
         maxAge: 0,
       });
       return response;
@@ -74,6 +74,11 @@ export async function POST(request: Request) {
       sessionId: session.id,
       authenticated,
     });
+    if (authenticated)
+      await store.markProfileCredentialBindingsVerified({
+        workspaceId: workspace.id,
+        browserProfileId: profile.id,
+      });
     const response = NextResponse.redirect(
       new URL(
         `/?feedback=${authenticated ? "browser-active" : "browser-login-needed"}`,
@@ -83,7 +88,7 @@ export async function POST(request: Request) {
     );
     response.cookies.set("openinstinct_browser_takeover", "", {
       httpOnly: true,
-      path: "/api/browser",
+      path: "/api",
       maxAge: 0,
     });
     return response;
@@ -110,7 +115,7 @@ export async function POST(request: Request) {
     );
     response.cookies.set("openinstinct_browser_takeover", "", {
       httpOnly: true,
-      path: "/api/browser",
+      path: "/api",
       maxAge: 0,
     });
     return response;

@@ -1,5 +1,5 @@
 begin;
-select plan(147);
+select plan(174);
 
 select has_table('public', 'workspaces', 'workspaces table exists');
 select has_table('public', 'action_requests', 'action requests table exists');
@@ -18,6 +18,11 @@ select has_table('public', 'action_evidence', 'action evidence metadata exists')
 select has_table('public', 'reconciliation_cases', 'durable reconciliation cases exist');
 select has_table('app_private', 'action_evidence_payloads', 'redacted evidence facts are private');
 select has_table('app_private', 'reconciliation_claims', 'reconciliation leases are private');
+select has_table('public', 'credential_items', 'credential metadata exists');
+select has_table('public', 'credential_access_events', 'credential access audit exists');
+select has_table('public', 'credential_profile_bindings', 'credential profile bindings exist');
+select has_table('app_private', 'credential_secrets', 'credential ciphertext is private');
+select has_table('app_private', 'credential_injection_leases', 'credential injection leases are private');
 select ok(
   (select convalidated from pg_constraint
     where conname = 'workflow_steps_reconciliation_input_is_safe'),
@@ -39,6 +44,9 @@ select has_table('app_private', 'artifact_locations', 'artifact byte locations a
 select has_table('app_private', 'worker_heartbeats', 'continuous worker heartbeats are private');
 select has_table('pgmq', 'q_agent_jobs', 'durable agent queue exists');
 select ok((select relrowsecurity from pg_class where oid = 'public.connections'::regclass), 'connections use RLS');
+select ok((select relrowsecurity from pg_class where oid = 'public.credential_items'::regclass), 'credential items use RLS');
+select ok((select relrowsecurity from pg_class where oid = 'public.credential_access_events'::regclass), 'credential access events use RLS');
+select ok((select relrowsecurity from pg_class where oid = 'public.credential_profile_bindings'::regclass), 'credential profile bindings use RLS');
 select ok((select count(*) > 0 from pg_policies where schemaname = 'public' and tablename = 'connections'), 'connections have owner policies');
 select ok((select count(*) = 1 from pg_indexes where schemaname = 'public' and indexname = 'workspaces_single_owner_deployment_idx'), 'deployment enforces one owner workspace');
 select ok(not has_table_privilege('authenticated', 'public.workspaces', 'INSERT'), 'clients cannot claim workspaces directly');
@@ -162,6 +170,19 @@ select ok(
     and not has_table_privilege('authenticated', 'app_private.reconciliation_claims', 'SELECT')
     and not has_table_privilege('service_role', 'app_private.reconciliation_claims', 'SELECT'),
   'evidence payloads and reconciliation leases have no Data API grants'
+);
+select ok(
+  not has_table_privilege('authenticated', 'public.credential_items', 'INSERT')
+    and not has_table_privilege('authenticated', 'public.credential_access_events', 'INSERT')
+    and not has_table_privilege('authenticated', 'public.credential_profile_bindings', 'UPDATE'),
+  'credential metadata and audit are server-written'
+);
+select ok(
+  not has_table_privilege('authenticated', 'app_private.credential_secrets', 'SELECT')
+    and not has_table_privilege('service_role', 'app_private.credential_secrets', 'SELECT')
+    and not has_table_privilege('authenticated', 'app_private.credential_injection_leases', 'SELECT')
+    and not has_table_privilege('service_role', 'app_private.credential_injection_leases', 'SELECT'),
+  'credential ciphertext and injection leases have no Data API grants'
 );
 select ok(
   not has_table_privilege('authenticated', 'public.browser_executions', 'INSERT')
@@ -306,6 +327,177 @@ values (
   '10000000-0000-4000-8000-000000000002','https://example.test'
 );
 select throws_ok(
+  $$insert into public.credential_items (
+      workspace_id,kind,label,allowed_origins,status,configuration_version,
+      encryption_key_version
+    ) values (
+      '10000000-0000-4000-8000-000000000002','website_password','Invalid',
+      array['https://example.test/login'],'needs_verification',repeat('c',64),1
+    )$$,
+  '23514', null,
+  'credential origins must be exact HTTPS origins'
+);
+insert into public.credential_items (
+  id,workspace_id,kind,label,username_hint,allowed_origins,status,
+  configuration_version,encryption_key_version
+) values (
+  '10000000-0000-4000-8000-000000000050',
+  '10000000-0000-4000-8000-000000000002','website_password','Canary login',
+  'o***@example.test',array['https://example.test'],'needs_verification',
+  repeat('c',64),1
+);
+insert into app_private.credential_item_versions (
+  credential_item_id,workspace_id,configuration_version,record_version,
+  allowed_origins
+) values (
+  '10000000-0000-4000-8000-000000000050',
+  '10000000-0000-4000-8000-000000000002',repeat('c',64),1,
+  array['https://example.test']
+);
+select throws_ok(
+  $$insert into app_private.credential_secrets (
+      credential_item_id,workspace_id,record_version,envelope
+    ) values (
+      '10000000-0000-4000-8000-000000000050',
+      '10000000-0000-4000-8000-000000000002',1,
+      jsonb_build_object(
+        'version',1,'keyVersion',2,'wrappedKeyNonce',repeat('A',16),
+        'wrappedKeyTag',repeat('A',16),'wrappedKeyCiphertext',repeat('B',32),
+        'payloadNonce',repeat('A',16),'payloadTag',repeat('A',16),
+        'payloadCiphertext','C'
+      )
+    )$$,
+  '23514', 'credential envelope does not match active metadata',
+  'credential envelope key version must match metadata'
+);
+select lives_ok(
+  $$insert into app_private.credential_secrets (
+      credential_item_id,workspace_id,record_version,envelope
+    ) values (
+      '10000000-0000-4000-8000-000000000050',
+      '10000000-0000-4000-8000-000000000002',1,
+      jsonb_build_object(
+        'version',1,'keyVersion',1,'wrappedKeyNonce',repeat('A',16),
+        'wrappedKeyTag',repeat('A',16),'wrappedKeyCiphertext',repeat('B',32),
+        'payloadNonce',repeat('A',16),'payloadTag',repeat('A',16),
+        'payloadCiphertext','C'
+      )
+    )$$,
+  'matching private credential envelope is accepted'
+);
+select throws_ok(
+  $$update app_private.credential_secrets
+    set envelope=jsonb_set(envelope,'{payloadCiphertext}','"D"'::jsonb)
+    where credential_item_id='10000000-0000-4000-8000-000000000050'$$,
+  '55000', 'credential payload and record version must advance together',
+  'credential payload cannot change without a new record version'
+);
+insert into public.browser_profiles (
+  id,workspace_id,provider,provider_profile_id,label,status
+) values (
+  '10000000-0000-4000-8000-000000000021',
+  '10000000-0000-4000-8000-000000000002',
+  'kernel','credential-injection-profile','Credential injection','needs_login'
+);
+insert into public.browser_profile_origins (profile_id,workspace_id,origin)
+values (
+  '10000000-0000-4000-8000-000000000021',
+  '10000000-0000-4000-8000-000000000002','https://example.test'
+);
+insert into app_private.browser_control_sessions (
+  id,profile_id,workspace_id,provider_session_id,purpose,status,
+  configuration_version,expires_at
+) values (
+  '10000000-0000-4000-8000-000000000052',
+  '10000000-0000-4000-8000-000000000021',
+  '10000000-0000-4000-8000-000000000002','credential-session',
+  'reauthentication','active',1,now()+interval '5 minutes'
+);
+select lives_ok(
+  $$insert into app_private.credential_injection_leases (
+      id,workspace_id,credential_item_id,credential_configuration_version,
+      browser_profile_id,browser_profile_configuration_version,
+      control_session_id,exact_origin,field_binding_hash,claim_token_hash,
+      expires_at
+    ) values (
+      '10000000-0000-4000-8000-000000000053',
+      '10000000-0000-4000-8000-000000000002',
+      '10000000-0000-4000-8000-000000000050',repeat('c',64),
+      '10000000-0000-4000-8000-000000000021',1,
+      '10000000-0000-4000-8000-000000000052','https://example.test',
+      repeat('d',64),repeat('e',64),now()+interval '2 minutes'
+    )$$,
+  'a current exact-origin credential injection lease is accepted'
+);
+select throws_ok(
+  $$update app_private.credential_injection_leases
+    set status='injected',completed_at=now()
+    where id='10000000-0000-4000-8000-000000000053'$$,
+  '55000', 'invalid credential injection lease transition',
+  'credential injection cannot skip the invocation fence'
+);
+insert into public.credential_access_events (
+  id,workspace_id,credential_item_id,executor,exact_origin,browser_profile_id,
+  reason_code,result
+) values (
+  '10000000-0000-4000-8000-000000000051',
+  '10000000-0000-4000-8000-000000000002',
+  '10000000-0000-4000-8000-000000000050','system',
+  'https://example.test','10000000-0000-4000-8000-000000000020',
+  'fixture_created','requested'
+);
+select throws_ok(
+  $$update public.credential_access_events set result='failed'
+    where id='10000000-0000-4000-8000-000000000051'$$,
+  '55000', 'credential_access_events is append-only',
+  'credential access audit rejects updates'
+);
+select throws_ok(
+  $$delete from public.credential_access_events
+    where id='10000000-0000-4000-8000-000000000051'$$,
+  '55000', 'credential_access_events is append-only',
+  'credential access audit rejects deletes'
+);
+select throws_ok(
+  $$insert into public.credential_access_events (
+      workspace_id,credential_item_id,executor,browser_profile_id,
+      browser_control_session_id,reason_code,result
+    ) values (
+      '10000000-0000-4000-8000-000000000002',
+      '10000000-0000-4000-8000-000000000050','system',
+      '10000000-0000-4000-8000-000000000020',
+      '10000000-0000-4000-8000-000000000052','fixture_mismatch','requested'
+    )$$,
+  '23514', 'credential access control-session lineage mismatch',
+  'credential access events reject mismatched control-session profiles'
+);
+select throws_ok(
+  $$update public.credential_items
+    set workspace_id='10000000-0000-4000-8000-000000000012'
+    where id='10000000-0000-4000-8000-000000000050'$$,
+  '55000', 'credential identity is immutable',
+  'credential identity cannot cross workspaces'
+);
+select throws_ok(
+  $$update public.credential_items set status='deleted',revoked_at=now(),
+      deletion_requested_at=now(),deletion_verified_at=now()
+    where id='10000000-0000-4000-8000-000000000050'$$,
+  '55000', 'invalid credential lifecycle transition',
+  'credential deletion cannot skip revocation and deletion-pending states'
+);
+select throws_ok(
+  $$insert into public.credential_profile_bindings (
+      credential_item_id,workspace_id,browser_profile_id,
+      credential_configuration_version,status
+    ) values (
+      '10000000-0000-4000-8000-000000000050',
+      '10000000-0000-4000-8000-000000000012',
+      '10000000-0000-4000-8000-000000000020',repeat('c',64),'active'
+    )$$,
+  '23503', null,
+  'credential profile bindings cannot cross workspaces'
+);
+select throws_ok(
   $$insert into public.browser_profile_origins (profile_id,workspace_id,origin)
     values ('10000000-0000-4000-8000-000000000020',
       '10000000-0000-4000-8000-000000000002','https://example.test/path')$$,
@@ -409,6 +601,17 @@ insert into public.action_requests (
   '10000000-0000-4000-8000-000000000003',
   'fixture.write', 'write', 'first', '{}', repeat('c', 64),
   'pending', now() + interval '1 hour'
+);
+select throws_ok(
+  $$insert into public.credential_access_events (
+      workspace_id,credential_item_id,executor,action_request_id,reason_code,result
+    ) values (
+      '10000000-0000-4000-8000-000000000002',
+      '10000000-0000-4000-8000-000000000050','system',
+      '10000000-0000-4000-8000-000000000006','fixture_missing_run','requested'
+    )$$,
+  '23514', 'credential access action requires a run anchor',
+  'credential access events require a run anchor for actions'
 );
 select throws_ok(
   $$insert into public.action_requests (
@@ -684,6 +887,18 @@ insert into public.browser_executions (
     where id='10000000-0000-4000-8000-000000000020'),
   'persistent_read_only','queued',repeat('a',64),repeat('b',64),3,300,3
 );
+select throws_ok(
+  $$insert into public.credential_access_events (
+      workspace_id,credential_item_id,executor,browser_execution_id,
+      reason_code,result
+    ) values (
+      '10000000-0000-4000-8000-000000000002',
+      '10000000-0000-4000-8000-000000000050','system',
+      '10000000-0000-4000-8000-000000000030','fixture_missing_anchors','requested'
+    )$$,
+  '23514', 'credential access execution requires profile and run anchors',
+  'credential access events require profile and run anchors for executions'
+);
 insert into app_private.browser_execution_handles (
   execution_id,workspace_id,provider,correlation_id,allowed_origins,start_url,goal
 ) values (
@@ -821,7 +1036,7 @@ select is(
 );
 select is(
   (select count(*)::integer from public.browser_profile_summaries),
-  1,
+  2,
   'the owner can read safe browser profile summaries'
 );
 select is(
@@ -872,6 +1087,33 @@ select throws_ok(
 );
 reset role;
 
+update public.credential_items set status='revoked',revoked_at=now()
+where id='10000000-0000-4000-8000-000000000050';
+select throws_ok(
+  $$update public.credential_items set label='Rewritten history'
+    where id='10000000-0000-4000-8000-000000000050'$$,
+  '55000', 'revoked credential history is immutable',
+  'revoked credential history rejects metadata changes'
+);
+update public.credential_items set status='deletion_pending',deletion_requested_at=now()
+where id='10000000-0000-4000-8000-000000000050';
+select throws_ok(
+  $$update public.credential_items set status='deleted',deletion_verified_at=now()
+    where id='10000000-0000-4000-8000-000000000050'$$,
+  '55000', 'credential ciphertext deletion is unverified',
+  'credential metadata cannot be deleted while ciphertext remains'
+);
+delete from app_private.credential_secrets
+where credential_item_id='10000000-0000-4000-8000-000000000050';
+update public.credential_items set status='deleted',deletion_verified_at=now()
+where id='10000000-0000-4000-8000-000000000050';
+select throws_ok(
+  $$update public.credential_items set username_hint='restored@example.test'
+    where id='10000000-0000-4000-8000-000000000050'$$,
+  '55000', 'revoked credential history is immutable',
+  'deleted credential history cannot restore a username hint'
+);
+
 update public.browser_executions set status='failed',completed_at=now(),
   last_error_code='fixture_profile_released'
 where id='10000000-0000-4000-8000-000000000030';
@@ -880,6 +1122,11 @@ update public.browser_profiles set status='revoked',revoked_at=now(),
 where id='10000000-0000-4000-8000-000000000020';
 delete from public.browser_profiles
 where id='10000000-0000-4000-8000-000000000020';
+update public.browser_profiles set status='revoked',revoked_at=now(),
+  deletion_requested_at=now(),deletion_verified_at=now()
+where id='10000000-0000-4000-8000-000000000021';
+delete from public.browser_profiles
+where id='10000000-0000-4000-8000-000000000021';
 
 insert into public.browser_executions (
   id,workspace_id,run_id,step_id,mode,status,goal_hash,policy_hash,

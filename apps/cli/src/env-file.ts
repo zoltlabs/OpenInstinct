@@ -20,6 +20,12 @@ export function envFileValues(
 function serializeEnvValue(value: string): string {
   if (/\u0000|\r|\n/u.test(value))
     throw new Error("Environment values cannot contain line breaks or NUL.");
+  // Node's parseEnv treats a backslash-escaped quote as the end of a
+  // double-quoted value. Prefer single quotes for JSON and other values that
+  // contain double quotes so the value survives a write/read round trip.
+  if (value.includes('"') && !value.includes("'")) return `'${value}'`;
+  if (value.includes('"') && value.includes("'"))
+    throw new Error("Environment values cannot contain both quote styles.");
   return JSON.stringify(value);
 }
 

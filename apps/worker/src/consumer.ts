@@ -22,6 +22,7 @@ export async function consumeJobs(input: {
   await input.store.enqueueAllPendingContinuations();
   await input.store.expireBrowserExecutionHandoffs();
   await input.store.recoverStaleBrowserExecutions();
+  await input.store.expireCredentialInjectionLeases();
   await input.processor.cleanupExpiredBrowserSessions();
   await input.processor.cleanupExpiredArtifacts();
   await input.processor.notifyPendingBrowserHandoffs();

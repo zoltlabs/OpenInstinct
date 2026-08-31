@@ -21,6 +21,7 @@
     "@openinstinct/artifacts": "workspace:*",
     "@openinstinct/browser": "workspace:*",
     "@openinstinct/core": "workspace:*",
+    "@openinstinct/credentials": "workspace:*",
     "@openinstinct/db": "workspace:*",
     "@openinstinct/messaging": "workspace:*",
     "@openinstinct/runtime": "workspace:*",

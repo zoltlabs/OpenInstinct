@@ -85,6 +85,7 @@ Preserve these in every feature:
 | `packages/messaging`         | Blooio v4 protocol, signature verification, message normalization and sending                                 | `src/client.ts`, `src/signature.ts`, `src/types.ts`                                                                    |
 | `packages/connectors`        | Direct Google OAuth/API and generic remote MCP transports                                                     | `src/google.ts`, `src/mcp.ts`, `src/types.ts`                                                                          |
 | `packages/browser`           | Provider-neutral browser contract and Kernel adapter                                                          | `src/provider.ts`, `src/kernel.ts`                                                                                     |
+| `packages/credentials`       | Provider-neutral credential schemas, envelope encryption, origin rules, and secret-message filtering          | `src/envelope.ts`, `src/broker.ts`, `src/redaction.ts`                                                                 |
 | `packages/runtime`           | Environment validation and portable deployment contracts                                                      | `src/env.ts`, `src/deployment.ts`                                                                                      |
 | `supabase`                   | Schema, constraints, RLS, grants, functions, `pgmq`, database tests                                           | `migrations/20260827185247_initial_schema.sql`, `tests/schema.test.sql`                                                |
 | `infra/cloudflare-scheduler` | Optional advanced one-minute trigger for the bounded consumer endpoint                                        | `src/index.ts`, `wrangler.jsonc`                                                                                       |
@@ -107,6 +108,7 @@ The important durable records are:
 - `memories`: owner-approved long-term context with explicit save/forget operations and vector-ready storage
 - `audit_events`: security-relevant history
 - `browser_profiles`: references to provider-side browser state, not raw secrets
+- `credential_items` and `credential_access_events`: owner-safe vault metadata and append-only access history; ciphertext and injection leases remain in `app_private`
 
 Run states are defined in `packages/core/src/domain.ts` and enforced by `state-machine.ts`:
 
@@ -170,6 +172,8 @@ Keep Blooio behavior in `packages/messaging`; do not scatter provider payloads t
 ## How to add browser automation
 
 Implement providers behind `BrowserProvider` in `packages/browser`. The current Kernel adapter bounds program size and runtime. Browser execution is intentionally not exposed as a free-form autonomous model tool.
+
+Website credentials use `packages/credentials` and `app_private.credential_secrets`. The model may select metadata, but only the trusted broker can decrypt and inject into classified fields on an exact HTTPS origin. Never add a plaintext secret getter to a model-facing tool, action request, browser observation, log, or audit event. OTP, password-reset, recovery, and security-challenge messages are withheld and require owner takeover.
 
 To expose a browser capability, define a narrow named operation, classify its risk, persist writes as action requests, and execute the approved operation in the worker. Never pass arbitrary credentials or an unrestricted browsing program from model output directly to a browser provider.
 

@@ -240,6 +240,7 @@ const commonEnvironmentNames = [
   "SUPABASE_SECRET_KEY",
   "DATABASE_URL",
   "SECRET_ENCRYPTION_KEY",
+  "CREDENTIAL_VAULT_KEYS",
   "OWNER_EMAIL",
   "AI_PROVIDER",
   "AI_MODEL",
@@ -255,6 +256,7 @@ const deployableEnvironmentNames = [
   "SUPABASE_SECRET_KEY",
   "DATABASE_URL",
   "SECRET_ENCRYPTION_KEY",
+  "CREDENTIAL_VAULT_KEYS",
   "BLOOIO_API_KEY",
   "BLOOIO_WEBHOOK_SECRET",
   "BLOOIO_CHANNEL_ID",
@@ -508,6 +510,20 @@ program
           envPath,
           "SECRET_ENCRYPTION_KEY",
           randomBytes(32).toString("base64"),
+        );
+      }
+      if (
+        !environmentFieldSchemas.CREDENTIAL_VAULT_KEYS.safeParse(
+          generatedValues.CREDENTIAL_VAULT_KEYS,
+        ).success
+      ) {
+        await setEnvValue(
+          envPath,
+          "CREDENTIAL_VAULT_KEYS",
+          JSON.stringify({
+            currentVersion: 1,
+            keys: { "1": randomBytes(32).toString("base64") },
+          }),
         );
       }
       if (!generatedValues.INTERNAL_API_SECRET) {

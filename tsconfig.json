@@ -6,6 +6,7 @@
     { "path": "./packages/messaging" },
     { "path": "./packages/connectors" },
     { "path": "./packages/browser" },
+    { "path": "./packages/credentials" },
     { "path": "./packages/runtime" },
     { "path": "./apps/cli" },
     { "path": "./apps/worker" },

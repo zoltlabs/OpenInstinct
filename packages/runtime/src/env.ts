@@ -34,6 +34,29 @@ const base64Key = z.string().refine((value) => {
   }
 }, "Must be a canonical base64-encoded 32-byte key.");
 
+const credentialKeyringJson = z.string().refine((value) => {
+  try {
+    const parsed = JSON.parse(value) as {
+      currentVersion?: unknown;
+      keys?: Record<string, unknown>;
+    };
+    return (
+      Number.isInteger(parsed.currentVersion) &&
+      Number(parsed.currentVersion) > 0 &&
+      Boolean(parsed.keys) &&
+      Object.entries(parsed.keys ?? {}).every(([version, encoded]) => {
+        if (!/^[1-9][0-9]*$/u.test(version) || typeof encoded !== "string")
+          return false;
+        const key = Buffer.from(encoded, "base64");
+        return key.byteLength === 32 && key.toString("base64") === encoded;
+      }) &&
+      typeof parsed.keys?.[String(parsed.currentVersion)] === "string"
+    );
+  } catch {
+    return false;
+  }
+}, "Must be a versioned JSON map of canonical base64-encoded 32-byte keys.");
+
 const databaseUrl = z
   .string()
   .url()
@@ -51,6 +74,7 @@ export const environmentFieldSchemas = {
   SUPABASE_SECRET_KEY: z.string().min(1),
   DATABASE_URL: databaseUrl,
   SECRET_ENCRYPTION_KEY: base64Key,
+  CREDENTIAL_VAULT_KEYS: credentialKeyringJson,
   BLOOIO_API_KEY: z.string().min(1),
   BLOOIO_WEBHOOK_SECRET: z.string().min(1),
   BLOOIO_CHANNEL_ID: z.string().min(1),
@@ -94,6 +118,8 @@ const serverEnvironmentBaseSchema = z.object({
   SUPABASE_SECRET_KEY: environmentFieldSchemas.SUPABASE_SECRET_KEY,
   DATABASE_URL: environmentFieldSchemas.DATABASE_URL,
   SECRET_ENCRYPTION_KEY: environmentFieldSchemas.SECRET_ENCRYPTION_KEY,
+  CREDENTIAL_VAULT_KEYS:
+    environmentFieldSchemas.CREDENTIAL_VAULT_KEYS.optional(),
   BLOOIO_API_KEY: environmentFieldSchemas.BLOOIO_API_KEY.optional(),
   BLOOIO_WEBHOOK_SECRET:
     environmentFieldSchemas.BLOOIO_WEBHOOK_SECRET.optional(),

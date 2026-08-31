@@ -6,6 +6,7 @@ import {
   type BrowserActionResult,
   type BrowserAuthenticationVerification,
   type BrowserCapabilities,
+  type BrowserCredentialInjection,
   type BrowserFile,
   type BrowserHealth,
   type BrowserInteraction,
@@ -285,6 +286,83 @@ return { completed:true, url:page.url(), title:(await page.title()).slice(0,2000
       })
       .parse(result);
   }
+  async injectCredentialFields(
+    sessionId: string,
+    input: BrowserCredentialInjection,
+  ): Promise<{ completed: true; origin: string }> {
+    const origin = new URL(input.exactOrigin);
+    if (origin.protocol !== "https:" || origin.origin !== input.exactOrigin)
+      throw new Error("Credential injection requires an exact HTTPS origin.");
+    if (input.frameOrigin && input.frameOrigin !== input.exactOrigin)
+      throw new Error("Cross-origin credential frames are not supported.");
+    if (
+      input.username.byteLength === 0 ||
+      input.username.byteLength > 4_000 ||
+      input.password.byteLength === 0 ||
+      input.password.byteLength > 40_000 ||
+      !Number.isInteger(input.timeoutMs) ||
+      input.timeoutMs < 1_000 ||
+      input.timeoutMs > 60_000
+    )
+      throw new Error("Credential fields exceed the injection boundary.");
+    const username = Buffer.from(input.username).toString("utf8");
+    const password = Buffer.from(input.password).toString("utf8");
+    const value = JSON.stringify({
+      exactOrigin: input.exactOrigin,
+      usernameSelector: input.usernameSelector,
+      passwordSelector: input.passwordSelector,
+      submitSelector: input.submitSelector,
+      username,
+      password,
+    }).replaceAll("<", "\\u003c");
+    try {
+      return z
+        .object({ completed: z.literal(true), origin: z.string().url() })
+        .parse(
+          await this.#executeFixed(
+            sessionId,
+            `const input=${value};
+const currentOrigin=new URL(page.url()).origin;
+if(currentOrigin!==input.exactOrigin) throw new Error("origin_mismatch");
+let username=page.locator(input.usernameSelector);
+if(await username.count()!==1) throw new Error("ambiguous_credential_field");
+const usernameFacts=await username.evaluate(node=>({tag:node.tagName.toLowerCase(),type:(node.getAttribute("type")||"").toLowerCase(),autocomplete:(node.getAttribute("autocomplete")||"").toLowerCase()}));
+if(usernameFacts.tag!=="input" || !["","text","email"].includes(usernameFacts.type) || usernameFacts.autocomplete==="one-time-code") throw new Error("invalid_username_field");
+const fillExact=async(locator,value)=>locator.evaluate((node,args)=>{
+  const view=node.ownerDocument.defaultView;
+  if(!view || view.location.origin!==args.origin) throw new Error("field_origin_mismatch");
+  const setter=Object.getOwnPropertyDescriptor(view.HTMLInputElement.prototype,"value")?.set;
+  if(!setter) throw new Error("input_setter_unavailable");
+  setter.call(node,args.value);
+  node.dispatchEvent(new view.Event("input",{bubbles:true}));
+  node.dispatchEvent(new view.Event("change",{bubbles:true}));
+},{origin:input.exactOrigin,value});
+await fillExact(username,input.username);
+if(new URL(page.url()).origin!==input.exactOrigin) throw new Error("origin_changed_after_username");
+const password=page.locator(input.passwordSelector);
+if(await password.count()!==1) throw new Error("ambiguous_credential_field");
+const passwordFacts=await password.evaluate(node=>({origin:node.ownerDocument.defaultView?.location.origin,tag:node.tagName.toLowerCase(),type:(node.getAttribute("type")||"").toLowerCase(),autocomplete:(node.getAttribute("autocomplete")||"").toLowerCase()}));
+if(passwordFacts.origin!==input.exactOrigin || passwordFacts.tag!=="input" || passwordFacts.type!=="password" || passwordFacts.autocomplete==="one-time-code") throw new Error("invalid_password_field");
+await fillExact(password,input.password);
+if(new URL(page.url()).origin!==input.exactOrigin) throw new Error("origin_changed_after_password");
+if(input.submitSelector) {
+  const submit=page.locator(input.submitSelector);
+  if(await submit.count()!==1) throw new Error("ambiguous_submit_control");
+  const submitOrigin=await submit.evaluate(node=>node.ownerDocument.defaultView?.location.origin);
+  if(submitOrigin!==input.exactOrigin || new URL(page.url()).origin!==input.exactOrigin) throw new Error("submit_origin_mismatch");
+  await submit.click();
+}
+return {completed:true,origin:new URL(page.url()).origin};`,
+            Math.min(Math.max(Math.ceil(input.timeoutMs / 1_000), 1), 30),
+          ),
+        );
+    } finally {
+      // JavaScript strings cannot be reliably zeroized. Keep their lifetime
+      // confined to this provider call and never include them in errors/results.
+      void username;
+      void password;
+    }
+  }
   async screenshot(sessionId: string): Promise<Uint8Array> {
     const response =
       await this.#client.browsers.computer.captureScreenshot(sessionId);
@@ -367,11 +445,24 @@ return { completed:true, url:page.url(), title:(await page.title()).slice(0,2000
   async stopReplay(sessionId: string, replayId: string): Promise<void> {
     await this.#client.browsers.replays.stop(replayId, { id: sessionId });
   }
-  async #executeFixed(sessionId: string, code: string): Promise<unknown> {
-    const result = await this.#client.browsers.playwright.execute(sessionId, {
-      code,
-      timeout_sec: 30,
-    });
+  async #executeFixed(
+    sessionId: string,
+    code: string,
+    timeoutSeconds = 30,
+  ): Promise<unknown> {
+    const timeoutMs = timeoutSeconds * 1_000 + 2_000;
+    const result = await this.#client.browsers.playwright.execute(
+      sessionId,
+      {
+        code,
+        timeout_sec: timeoutSeconds,
+      },
+      {
+        maxRetries: 0,
+        timeout: timeoutMs,
+        signal: AbortSignal.timeout(timeoutMs),
+      },
+    );
     if (!result.success) throw new Error("Kernel browser operation failed.");
     return result.result;
   }

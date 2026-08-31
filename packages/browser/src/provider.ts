@@ -104,6 +104,16 @@ export interface BrowserActionResult {
   readonly title?: string;
   readonly completed: boolean;
 }
+export interface BrowserCredentialInjection {
+  readonly exactOrigin: string;
+  readonly usernameSelector: string;
+  readonly passwordSelector: string;
+  readonly submitSelector?: string;
+  readonly frameOrigin: string | null;
+  readonly username: Uint8Array;
+  readonly password: Uint8Array;
+  readonly timeoutMs: number;
+}
 export interface BrowserTakeoverCapability {
   readonly url: string;
   readonly expiresAt: string;
@@ -159,6 +169,10 @@ export interface BrowserProvider {
     sessionId: string,
     action: BrowserInteraction,
   ): Promise<BrowserActionResult>;
+  injectCredentialFields(
+    sessionId: string,
+    input: BrowserCredentialInjection,
+  ): Promise<{ completed: true; origin: string }>;
   screenshot(sessionId: string): Promise<Uint8Array>;
   captureRedactedScreenshot(sessionId: string): Promise<{
     bytes?: Uint8Array;

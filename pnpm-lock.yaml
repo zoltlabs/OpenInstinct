@@ -69,6 +69,9 @@ importers:
       "@openinstinct/core":
         specifier: workspace:*
         version: link:../../packages/core
+      "@openinstinct/credentials":
+        specifier: workspace:*
+        version: link:../../packages/credentials
       "@openinstinct/db":
         specifier: workspace:*
         version: link:../../packages/db
@@ -133,6 +136,9 @@ importers:
       "@openinstinct/core":
         specifier: workspace:*
         version: link:../../packages/core
+      "@openinstinct/credentials":
+        specifier: workspace:*
+        version: link:../../packages/credentials
       "@openinstinct/db":
         specifier: workspace:*
         version: link:../../packages/db
@@ -169,12 +175,12 @@ importers:
 
   packages/browser:
     dependencies:
-      "@openinstinct/core":
-        specifier: workspace:*
-        version: link:../core
       "@onkernel/sdk":
         specifier: 0.96.0
         version: 0.96.0
+      "@openinstinct/core":
+        specifier: workspace:*
+        version: link:../core
       zod:
         specifier: 4.4.3
         version: 4.4.3
@@ -206,6 +212,12 @@ importers:
         specifier: 4.4.3
         version: 4.4.3
 
+  packages/credentials:
+    dependencies:
+      zod:
+        specifier: 4.4.3
+        version: 4.4.3
+
   packages/db:
     dependencies:
       "@openinstinct/artifacts":
@@ -214,6 +226,9 @@ importers:
       "@openinstinct/core":
         specifier: workspace:*
         version: link:../core
+      "@openinstinct/credentials":
+        specifier: workspace:*
+        version: link:../credentials
       "@supabase/supabase-js":
         specifier: 2.112.4
         version: 2.112.4

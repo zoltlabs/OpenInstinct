@@ -26,6 +26,11 @@ import {
   type McpToolManifestEntry,
 } from "@openinstinct/connectors";
 import type { BrowserProvider } from "@openinstinct/browser";
+import {
+  filterSensitiveMessage,
+  filterSensitiveMessageTree,
+  sanitizeGmailMessage,
+} from "@openinstinct/credentials";
 
 export const calendarEventInputSchema = z
   .object({
@@ -217,7 +222,8 @@ export async function runAssistantAgent(input: {
     getGmailMessage: tool({
       description: "Read a Gmail message by its message ID. Read-only.",
       inputSchema: z.object({ messageId: z.string().min(1) }),
-      execute: ({ messageId }) => requireGoogle().getGmailMessage(messageId),
+      execute: async ({ messageId }) =>
+        sanitizeGmailMessage(await requireGoogle().getGmailMessage(messageId)),
     }),
     listCalendarEvents: tool({
       description:
@@ -583,7 +589,7 @@ export async function runAssistantAgent(input: {
   });
   const messages: ModelMessage[] = input.context.messages.map((message) => ({
     role: message.role,
-    content: message.content,
+    content: filterSensitiveMessage(message.content).text,
   }));
   if (input.context.toolResults?.length) {
     messages.push({

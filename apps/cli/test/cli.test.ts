@@ -22,6 +22,10 @@ const validValues = {
   DATABASE_URL:
     "postgresql://postgres.example:password@db.example.test:5432/postgres",
   SECRET_ENCRYPTION_KEY: Buffer.alloc(32, 7).toString("base64"),
+  CREDENTIAL_VAULT_KEYS: JSON.stringify({
+    currentVersion: 1,
+    keys: { "1": Buffer.alloc(32, 8).toString("base64") },
+  }),
   BLOOIO_API_KEY: "blooio_example",
   BLOOIO_OWNER_PHONE: "+15555550123",
   OWNER_EMAIL: "owner@example.com",
@@ -74,6 +78,19 @@ describe("agent-friendly setup checks", () => {
       OWNER_EMAIL: "owner@example.com",
       EMPTY: "",
     });
+  });
+
+  it("round-trips structured JSON environment values", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "openinstinct-env-"));
+    const envPath = join(directory, ".env.local");
+    const keyring = JSON.stringify({
+      currentVersion: 1,
+      keys: { "1": Buffer.alloc(32, 9).toString("base64") },
+    });
+    await setEnvValues(envPath, { CREDENTIAL_VAULT_KEYS: keyring });
+    expect(
+      envFileValues(await readFile(envPath, "utf8")).CREDENTIAL_VAULT_KEYS,
+    ).toBe(keyring);
   });
 
   it("does not require the webhook secret during bootstrap", () => {

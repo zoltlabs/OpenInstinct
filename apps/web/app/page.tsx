@@ -181,6 +181,9 @@ export default async function Home({
         iMessage. Times are shown in {timeZone}.
       </p>
       <p>
+        <Link href="/credentials">Credential vault</Link>
+      </p>
+      <p>
         <Link href="/authority">Manage bounded authority grants</Link>
       </p>
       <Feedback code={feedback} />

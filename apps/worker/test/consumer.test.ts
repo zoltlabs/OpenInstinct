@@ -16,6 +16,7 @@ describe("queue consumption", () => {
       enqueueAllPendingContinuations: vi.fn(async () => 0),
       expireBrowserExecutionHandoffs: vi.fn(async () => 0),
       recoverStaleBrowserExecutions: vi.fn(async () => 0),
+      expireCredentialInjectionLeases: vi.fn(async () => 0),
       claimJobs: vi.fn(async () => [
         {
           messageId: 7,
@@ -66,6 +67,7 @@ describe("queue consumption", () => {
       enqueueAllPendingContinuations: vi.fn(async () => 0),
       expireBrowserExecutionHandoffs: vi.fn(async () => 0),
       recoverStaleBrowserExecutions: vi.fn(async () => 0),
+      expireCredentialInjectionLeases: vi.fn(async () => 0),
       claimJobs: vi.fn(async () => [
         {
           messageId: 8,
