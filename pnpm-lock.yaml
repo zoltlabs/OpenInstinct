@@ -185,6 +185,12 @@ importers:
         specifier: 4.4.3
         version: 4.4.3
 
+  packages/computer:
+    dependencies:
+      zod:
+        specifier: 4.4.3
+        version: 4.4.3
+
   packages/connectors:
     dependencies:
       "@ai-sdk/mcp":

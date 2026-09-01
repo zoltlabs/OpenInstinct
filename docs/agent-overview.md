@@ -85,6 +85,7 @@ Preserve these in every feature:
 | `packages/messaging`         | Blooio v4 protocol, signature verification, message normalization and sending                                 | `src/client.ts`, `src/signature.ts`, `src/types.ts`                                                                    |
 | `packages/connectors`        | Direct Google OAuth/API and generic remote MCP transports                                                     | `src/google.ts`, `src/mcp.ts`, `src/types.ts`                                                                          |
 | `packages/browser`           | Provider-neutral browser contract and Kernel adapter                                                          | `src/provider.ts`, `src/kernel.ts`                                                                                     |
+| `packages/computer`          | Conditional VM/device contract proposal and evidence-based build gate; no production adapter                  | `src/provider.ts`, `src/gate.ts`, `docs/vm-decision-spike.md`                                                          |
 | `packages/credentials`       | Provider-neutral credential schemas, envelope encryption, origin rules, and secret-message filtering          | `src/envelope.ts`, `src/broker.ts`, `src/redaction.ts`                                                                 |
 | `packages/runtime`           | Environment validation and portable deployment contracts                                                      | `src/env.ts`, `src/deployment.ts`                                                                                      |
 | `supabase`                   | Schema, constraints, RLS, grants, functions, `pgmq`, database tests                                           | `migrations/20260827185247_initial_schema.sql`, `tests/schema.test.sql`                                                |
@@ -184,6 +185,10 @@ To expose a browser capability, define a narrow named operation, classify its ri
 The only automated financial commit path is `openinstinct_sandbox`. It is disabled by default and requires both the global switch and an enabled canary merchant. Every purchase binds an immutable short-lived preflight containing the exact merchant, integer-minor-unit total, recurring terms, payment alias, and configuration versions. The approval page recomputes the exact typed phrase server-side, and the worker revalidates the same snapshot and rolling limits inside the commit transaction.
 
 Never accept raw payment credentials in an agent tool or action request. A timeout after the invocation fence becomes `unknown` and is observed through the read-only transaction ledger; it is never purchased again automatically. Refunds and cancellations are distinct financial actions with fresh typed authorization, a credit ledger entry, and a separate receipt. Adding a real merchant or payment provider requires a reviewed adapter with provider idempotency and read-back evidence; generic browser or MCP execution is not a financial adapter.
+
+## How to evaluate a VM provider
+
+The VM layer is not enabled. `packages/computer` retains a provider-neutral contract and a fail-closed build gate, while [`vm-decision-spike.md`](vm-decision-spike.md) records the current no-build decision. Provider documentation is feasibility evidence, not a live demonstration. Do not add a provider SDK or operate a VM until two recurring owner workflows require it, browser and API alternatives fail measured tests, every lifecycle and security control is demonstrated against a real provider, and owner-visible cost passes an explicit ceiling.
 
 ## How to change the database
 
