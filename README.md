@@ -14,12 +14,14 @@ The recommended Vercel + Supabase infrastructure can start on free tiers. Using 
 - Durable agent runs and retries with Supabase Postgres and `pgmq`
 - Direct Google OAuth with PKCE, encrypted refresh tokens, Gmail reads/drafts, and Calendar reads/writes
 - Conversational MCP resolution, one-click connector cards, per-owner browser OAuth,
-  and bounded tool discovery; MCP calls require explicit approval
+  and bounded tool discovery; generic invocation remains disabled until a reviewed semantic adapter exists
 - Public HTTPS web fetches with redirect, response-size, and private-network protections
 - Owner-approved durable memory with explicit destructive forgetting
 - One-time and recurring reminders plus scheduled agent routines on the durable queue
 - Hash-bound approval requests so approved inputs cannot be changed before execution
-- Kernel browser reads and bounded, approval-gated interaction steps with persistent profiles
+- Kernel adaptive read-only public-page research and short-lived owner takeover; browser writes and unattended authenticated-profile research fail closed
+- An internal website-credential vault with exact-origin, model-blind Kernel injection and owner-only recovery
+- A disabled-by-default financial sandbox with exact typed approval, limits, receipts, and no real-money provider
 - Destructive actions with an additional typed owner-confirmation phrase
 - Direct OpenAI, Anthropic, and Google model access, plus optional OpenRouter, Vercel AI Gateway, and OpenAI-compatible providers
 - Vercel deployment with a cron-driven consumer, or a continuously running Docker worker
@@ -183,6 +185,8 @@ Additionally required for iMessage-ready status:
 
 `BLOOIO_CHANNEL_ID` is optional unless the provisioned Blooio configuration requires an explicit sending channel.
 
+`BLOOIO_OWNER_PHONE` is bootstrap input: onboarding verifies and stores it in `owner_phone_numbers`. That durable verified row becomes the runtime authority for inbound and outbound delivery, so changing only the environment value after onboarding does not redirect messages. `CREDENTIAL_VAULT_KEYS` is required before storing website credentials; `pnpm setup` generates the versioned wrapping-key JSON.
+
 Model providers are selected explicitly:
 
 | `AI_PROVIDER`       | Required configuration                                                          | `AI_MODEL` form                         |
@@ -268,7 +272,7 @@ Vercel Hobby is intended for personal, non-commercial deployments. For commercia
 
 ## Trust model
 
-Read-only Google calls may execute automatically. Gmail drafts, Calendar writes, and every generic MCP call are persisted first and require owner approval. Security-setting changes are denied. Approval records bind to the SHA-256 hash of canonical tool input plus the exact connector account/configuration version, and execution rechecks provider/tool allowlists. Ambiguous provider outcomes are marked `unknown` and never retried automatically.
+Read-only Google calls may execute automatically. Gmail drafts and Calendar writes are persisted first and require owner approval. Generic MCP invocation is currently denied even after connection and discovery; enabling it requires a reviewed semantic adapter with idempotency and read-back evidence. Security-setting changes are denied. Approval records bind to the SHA-256 hash of canonical tool input plus the exact connector account/configuration version, and execution rechecks provider/tool allowlists. Ambiguous provider outcomes are marked `unknown` and never retried automatically.
 
 This is personal automation software with access to sensitive data. Review [`SECURITY.md`](./SECURITY.md) before exposing it publicly.
 

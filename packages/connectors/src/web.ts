@@ -36,6 +36,51 @@ function plainText(contentType: string, body: string): string {
     .trim();
 }
 
+interface ByteResponseBody {
+  getReader(): {
+    read(): Promise<{ done: boolean; value?: Uint8Array }>;
+    cancel(reason?: unknown): Promise<void>;
+    releaseLock(): void;
+  };
+}
+
+export async function readBoundedResponseText(
+  body: ByteResponseBody | null,
+  maxBytes: number,
+  errorMessage: string,
+): Promise<string> {
+  if (!body) return "";
+  const reader = body.getReader();
+  const chunks: Buffer[] = [];
+  let totalBytes = 0;
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      if (!value?.byteLength) continue;
+      totalBytes += value.byteLength;
+      if (totalBytes > maxBytes) {
+        await reader.cancel(errorMessage);
+        throw new Error(errorMessage);
+      }
+      chunks.push(Buffer.from(value));
+    }
+  } catch (error) {
+    await reader.cancel().catch(() => undefined);
+    throw error;
+  } finally {
+    reader.releaseLock();
+  }
+  return Buffer.concat(chunks, totalBytes).toString("utf8");
+}
+
+export function readBoundedWebResponseText(
+  body: ByteResponseBody | null,
+  maxBytes = 1_000_000,
+): Promise<string> {
+  return readBoundedResponseText(body, maxBytes, "Web response is too large.");
+}
+
 export async function fetchPublicWebPage(input: {
   url: string;
   maxCharacters?: number;
@@ -85,9 +130,7 @@ export async function fetchPublicWebPage(input: {
     const declaredLength = Number(response.headers.get("content-length") ?? 0);
     if (declaredLength > 1_000_000)
       throw new Error("Web response is too large.");
-    const body = await response.text();
-    if (Buffer.byteLength(body) > 1_000_000)
-      throw new Error("Web response is too large.");
+    const body = await readBoundedWebResponseText(response.body);
     return {
       url: url.toString(),
       contentType,

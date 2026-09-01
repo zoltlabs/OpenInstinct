@@ -8,6 +8,8 @@ import {
   isPrivateNetworkAddress,
   OpenInstinctMcpOAuthProvider,
   parseMcpCredential,
+  readBoundedResponseText,
+  readBoundedWebResponseText,
   resolveMcpConnectorCandidates,
 } from "../src/index";
 
@@ -33,6 +35,57 @@ describe("web fetch URL policy", () => {
     expect(() => assertSafeWebUrl("http://example.com")).toThrow();
     expect(() => assertSafeWebUrl("https://127.0.0.1/private")).toThrow();
     expect(() => assertSafeWebUrl("https://token@example.com")).toThrow();
+  });
+
+  it("reads a safe streamed response through the byte boundary", async () => {
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode("hello "));
+        controller.enqueue(new TextEncoder().encode("world"));
+        controller.close();
+      },
+    });
+    await expect(readBoundedWebResponseText(body, 11)).resolves.toBe(
+      "hello world",
+    );
+  });
+
+  it("cancels a streamed response as soon as its byte limit is exceeded", async () => {
+    let cancelled = false;
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode("1234"));
+        controller.enqueue(new TextEncoder().encode("56"));
+      },
+      cancel() {
+        cancelled = true;
+      },
+    });
+    await expect(readBoundedWebResponseText(body, 5)).rejects.toThrow(
+      "Web response is too large.",
+    );
+    expect(cancelled).toBe(true);
+  });
+
+  it("applies the same streaming bound to MCP registry responses", async () => {
+    let cancelled = false;
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new Uint8Array(256_000));
+        controller.enqueue(new Uint8Array([1]));
+      },
+      cancel() {
+        cancelled = true;
+      },
+    });
+    await expect(
+      readBoundedResponseText(
+        body,
+        256_000,
+        "MCP registry response is too large.",
+      ),
+    ).rejects.toThrow("MCP registry response is too large.");
+    expect(cancelled).toBe(true);
   });
 });
 

@@ -123,16 +123,22 @@ describe("credential policy", () => {
   });
 
   it("withholds OTP and recovery messages from model context", () => {
-    expect(
-      filterSensitiveMessage("Your verification code is 123456"),
-    ).toMatchObject({
-      disposition: "owner_handoff",
-      kind: "otp",
-    });
-    expect(filterSensitiveMessage("Your code is 123456")).toMatchObject({
-      disposition: "owner_handoff",
-      kind: "otp",
-    });
+    for (const message of [
+      "Your verification code is 123456",
+      "Your code is 123456",
+      "Your passcode is 123456",
+      "Your pass code is 123456",
+      "Your one-time password is 123456",
+      "Your one time passcode: 123456",
+      "123456 is your one-time password",
+      "Your login code is 123 456",
+      "Your login code is 123-456",
+      "Your login code is １２３４５６",
+    ])
+      expect(filterSensitiveMessage(message)).toMatchObject({
+        disposition: "owner_handoff",
+        kind: "otp",
+      });
     expect(filterSensitiveMessage("Meeting notes for tomorrow")).toEqual({
       disposition: "allow",
       text: "Meeting notes for tomorrow",
@@ -170,6 +176,10 @@ describe("credential policy", () => {
     for (const body of [
       "123456 is your login code",
       "<p><span>123</span><span>456</span> is your <b>login</b> code</p>",
+      "Your passcode is 123456",
+      "Your one-time password is 123456",
+      "Your login code is 123 456",
+      "Your login code is １２３４５６",
     ]) {
       const message = sanitizeGmailMessage({
         id: "gmail-adversarial",

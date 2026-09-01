@@ -82,6 +82,7 @@ describe("durable job processing", () => {
 
   it("runs a queued owner message, sends once, persists the reply, and completes", async () => {
     const store = {
+      getVerifiedOwnerPhone: vi.fn(async () => "+15555550123"),
       getRunContext: vi.fn(async () => ({
         runId: "11111111-1111-4111-8111-111111111111",
         claimToken: "99999999-9999-4999-8999-999999999999",
@@ -110,7 +111,7 @@ describe("durable job processing", () => {
     const model = {} as ResolvedLanguageModel;
     const processor = new JobProcessor({
       store,
-      env,
+      env: { ...env, BLOOIO_OWNER_PHONE: "+15555550999" },
       messenger,
       model,
       modelId: "test:test-model",
@@ -151,6 +152,102 @@ describe("durable job processing", () => {
       outputTokens: 5,
       model: "test:test-model",
     });
+  });
+
+  it("delivers reminders to the durable verified owner phone", async () => {
+    const store = {
+      isScheduledTriggerCancelled: vi.fn(async () => false),
+      getVerifiedOwnerPhone: vi.fn(async () => "+15555550123"),
+      saveAssistantMessage: vi.fn(async () => undefined),
+    } as unknown as OpenInstinctStore;
+    const messenger = {
+      sendMessage: vi.fn(async () => ({
+        message_id: "reminder-message",
+        status: "sent",
+      })),
+    };
+    const processor = new JobProcessor({
+      store,
+      env: { ...env, BLOOIO_OWNER_PHONE: "+15555550999" },
+      messenger,
+      model: {} as ResolvedLanguageModel,
+    });
+
+    await processor.process({
+      type: "deliver_reminder",
+      triggerId: "44444444-4444-4444-8444-444444444444",
+      occurrenceAt: "2026-09-01T12:00:00.000Z",
+      workspaceId: "22222222-2222-4222-8222-222222222222",
+      conversationId: "33333333-3333-4333-8333-333333333333",
+      message: "Review the release",
+    });
+
+    expect(messenger.sendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ to: "+15555550123" }),
+    );
+    expect(messenger.sendMessage).not.toHaveBeenCalledWith(
+      expect.objectContaining({ to: "+15555550999" }),
+    );
+  });
+
+  it("fails closed when a workspace has no verified outbound phone", async () => {
+    const store = {
+      isScheduledTriggerCancelled: vi.fn(async () => false),
+      getVerifiedOwnerPhone: vi.fn(async () => undefined),
+      saveAssistantMessage: vi.fn(async () => undefined),
+    } as unknown as OpenInstinctStore;
+    const messenger = { sendMessage: vi.fn() };
+    const processor = new JobProcessor({
+      store,
+      env,
+      messenger,
+      model: {} as ResolvedLanguageModel,
+    });
+
+    await expect(
+      processor.process({
+        type: "deliver_reminder",
+        triggerId: "44444444-4444-4444-8444-444444444444",
+        occurrenceAt: "2026-09-01T12:00:00.000Z",
+        workspaceId: "22222222-2222-4222-8222-222222222222",
+        conversationId: "33333333-3333-4333-8333-333333333333",
+        message: "Review the release",
+      }),
+    ).rejects.toThrow("Verified deployment owner phone was not found.");
+    expect(messenger.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("sends browser handoffs to the durable verified owner phone", async () => {
+    const store = {
+      listPendingBrowserHandoffNotifications: vi.fn(async () => [
+        {
+          id: "55555555-5555-4555-8555-555555555555",
+          workspaceId: "22222222-2222-4222-8222-222222222222",
+        },
+      ]),
+      getVerifiedOwnerPhone: vi.fn(async () => "+15555550123"),
+      markBrowserHandoffNotificationSent: vi.fn(async () => undefined),
+      recordBrowserHandoffNotificationFailure: vi.fn(async () => undefined),
+    } as unknown as OpenInstinctStore;
+    const messenger = {
+      sendMessage: vi.fn(async () => ({
+        message_id: "handoff-message",
+        status: "sent",
+      })),
+    };
+    const processor = new JobProcessor({
+      store,
+      env: { ...env, BLOOIO_OWNER_PHONE: "+15555550999" },
+      messenger,
+      model: {} as ResolvedLanguageModel,
+    });
+
+    await processor.notifyPendingBrowserHandoffs();
+
+    expect(messenger.sendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ to: "+15555550123" }),
+    );
+    expect(store.markBrowserHandoffNotificationSent).toHaveBeenCalledOnce();
   });
 
   it("persists an approved action result and enqueues model continuation", async () => {

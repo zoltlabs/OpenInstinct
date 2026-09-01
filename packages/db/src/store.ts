@@ -1135,6 +1135,16 @@ export class OpenInstinctStore {
     });
   }
 
+  async getVerifiedOwnerPhone(
+    workspaceId: string,
+  ): Promise<string | undefined> {
+    const [owner] = await this.#sql<{ phone_e164: string }[]>`
+      select phone_e164 from public.owner_phone_numbers
+      where workspace_id = ${workspaceId} and verified_at is not null
+    `;
+    return owner?.phone_e164;
+  }
+
   async ingestBlooioEvent(event: {
     id: string;
     type: string;

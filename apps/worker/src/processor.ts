@@ -218,11 +218,10 @@ export class JobProcessor {
   }
 
   async notifyPendingBrowserHandoffs(): Promise<void> {
-    if (!this.#env.BLOOIO_OWNER_PHONE) return;
     for (const handoff of await this.#store.listPendingBrowserHandoffNotifications()) {
       try {
         await this.#sendMessage({
-          to: this.#env.BLOOIO_OWNER_PHONE,
+          workspaceId: handoff.workspaceId,
           text: `Owner browser takeover is required: ${new URL(
             `/api/browser/handoffs/${handoff.id}`,
             this.#env.NEXT_PUBLIC_APP_URL,
@@ -325,13 +324,9 @@ export class JobProcessor {
         })
       )
         return;
-      if (!this.#env.BLOOIO_OWNER_PHONE)
-        throw new PermanentJobError(
-          "Blooio is not configured; reminder delivery is unavailable.",
-        );
       const text = `Reminder: ${job.message}`;
       const sent = await this.#sendMessage({
-        to: this.#env.BLOOIO_OWNER_PHONE,
+        workspaceId: job.workspaceId,
         text,
         channelId: this.#env.BLOOIO_CHANNEL_ID,
         idempotencyKey: `schedule:${job.triggerId}:${job.occurrenceAt}`,
@@ -537,7 +532,7 @@ export class JobProcessor {
       })),
     });
     const sent = await this.#sendMessage({
-      to: context.ownerPhone,
+      workspaceId: context.workspaceId,
       text: result.text,
       channelId: this.#env.BLOOIO_CHANNEL_ID,
       idempotencyKey:
@@ -564,13 +559,21 @@ export class JobProcessor {
   }
 
   async #sendMessage(
-    input: Parameters<OutboundMessenger["sendMessage"]>[0],
+    input: Omit<Parameters<OutboundMessenger["sendMessage"]>[0], "to"> & {
+      workspaceId: string;
+    },
   ): Promise<Awaited<ReturnType<OutboundMessenger["sendMessage"]>>> {
     if (!this.#messenger)
       throw new PermanentJobError(
         "Blooio is not configured; outbound delivery is unavailable.",
       );
-    return this.#messenger.sendMessage(input);
+    const { workspaceId, ...message } = input;
+    const to = await this.#store.getVerifiedOwnerPhone(workspaceId);
+    if (!to)
+      throw new PermanentJobError(
+        "Verified deployment owner phone was not found.",
+      );
+    return this.#messenger.sendMessage({ ...message, to });
   }
 
   async #hitFailpoint(point: ExecutionFailpoint): Promise<void> {

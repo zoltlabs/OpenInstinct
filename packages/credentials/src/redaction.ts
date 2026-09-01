@@ -7,7 +7,7 @@ export type SensitiveMessageKind =
 const sensitivePatterns: readonly [SensitiveMessageKind, RegExp][] = [
   [
     "otp",
-    /\b(?:otp|one[- ]time|verification|security)\s+(?:code|pin)\b|\b(?:your|the|login|sign[- ]?in|authentication)?\s*(?:verification|security|access)?\s*(?:code|pin)\s*(?:is|:)\s*\d{4,8}\b|\b\d{4,8}\b.{0,40}\b(?:expires?|minutes?)\b/isu,
+    /\b(?:otp|one[- ]time|verification|security)\s+(?:code|pin|pass\s*code|password)\b|\b(?:pass\s*code|temporary password|authentication number|verification number|verification token)\b|\b(?:your|the|login|sign[- ]?in|authentication)?\s*(?:verification|security|access|one[- ]time)?\s*(?:code|pin|pass\s*code|password|number|token)\s*(?:is|:)\s*\d{4,8}\b|\b\d{4,8}\b.{0,40}\b(?:expires?|minutes?|pass\s*code|one[- ]time password)\b/isu,
   ],
   [
     "password_reset",
@@ -23,26 +23,27 @@ const sensitivePatterns: readonly [SensitiveMessageKind, RegExp][] = [
 export function classifySensitiveMessage(
   value: string,
 ): SensitiveMessageKind | undefined {
+  const normalized = value.normalize("NFKC");
   if (
     /https?:\/\/[^\s<>"']{1,2000}(?:\/(?:magic|verify|verification|reset|recovery)(?:[-_/?#]|$)|[?&](?:token|code|otp|magic|verify|verification|reset|recovery)=[^\s&<>"']+)/iu.test(
-      value,
+      normalized,
     )
   )
     return "security_challenge";
   if (
-    /\b(?:use|enter)?\s*(?:your|the)?\s*(?:login|sign[- ]?in|verification|security|authentication|access|one[- ]time)\s*(?:code|pin)\s*(?:is|:)?\s*[a-z0-9][a-z0-9-]{3,31}\b/iu.test(
-      value,
+    /\b(?:use|enter)?\s*(?:your|the)?\s*(?:login|sign[- ]?in|verification|security|authentication|access|one[- ]time)\s*(?:code|pin|pass\s*code|password|number|token)\s*(?:is|:)?\s*[a-z0-9][a-z0-9-]{3,31}\b/iu.test(
+      normalized,
     )
   )
     return "otp";
   if (
-    /\b\d{4,8}\b/u.test(value) &&
-    /\b(?:code|pin|otp|verify|verification|login|sign[- ]?in|authentication|security|access)\b/iu.test(
-      value,
+    /(?<![0-9])(?:[0-9][ \t-]?){3,7}[0-9](?![ \t-]?[0-9])/u.test(normalized) &&
+    /\b(?:code|pin|pass\s*code|otp|one[- ]time password|temporary password|verify|verification|login|sign[- ]?in|authentication|security|access)\b/iu.test(
+      normalized,
     )
   )
     return "otp";
-  return sensitivePatterns.find(([, pattern]) => pattern.test(value))?.[0];
+  return sensitivePatterns.find(([, pattern]) => pattern.test(normalized))?.[0];
 }
 
 export function filterSensitiveMessage(

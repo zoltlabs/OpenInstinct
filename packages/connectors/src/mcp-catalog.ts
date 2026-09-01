@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { assertSafeMcpUrl, createSafeMcpFetch } from "./mcp";
+import { readBoundedResponseText } from "./web";
 
 export interface McpConnectorCandidate {
   readonly id: string;
@@ -110,8 +111,11 @@ async function searchOfficialMcpRegistry(
     if (!response.ok) return [];
     const length = Number(response.headers.get("content-length") ?? 0);
     if (length > 256_000) return [];
-    const text = await response.text();
-    if (Buffer.byteLength(text, "utf8") > 256_000) return [];
+    const text = await readBoundedResponseText(
+      response.body,
+      256_000,
+      "MCP registry response is too large.",
+    );
     const parsed = registryResponseSchema.safeParse(JSON.parse(text));
     if (!parsed.success) return [];
     const seen = new Set<string>();

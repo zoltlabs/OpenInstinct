@@ -59,7 +59,7 @@ HTTP requests are triggers, not the source of truth. Durable state and the queue
 
 Preserve these in every feature:
 
-1. **One owner, one deployment.** `OWNER_EMAIL`, the exact E.164 owner phone, database constraints, and RLS all enforce the boundary. Do not generalize to multi-tenant behavior accidentally.
+1. **One owner, one deployment.** `OWNER_EMAIL`, the exact E.164 owner phone, database constraints, and RLS all enforce the boundary. `BLOOIO_OWNER_PHONE` bootstraps onboarding; afterward the verified `owner_phone_numbers` row is authoritative for both inbound and outbound delivery. Do not generalize to multi-tenant behavior accidentally.
 2. **Authenticate before parsing or acting.** Verify public webhook signatures against raw bytes, enforce body limits, and authenticate internal routes with server-only secrets.
 3. **Ingestion is idempotent.** A provider retry must not create another run. Keep event insertion and job creation atomic.
 4. **The queue is authoritative.** Never rely on an in-memory task, a long-lived HTTP request, or a provider callback alone for durable progress.
@@ -68,8 +68,8 @@ Preserve these in every feature:
 7. **Revalidate at execution time.** Confirm workspace, action state, expiry, provider, connector, tool allowlist, account, and configuration version immediately before the side effect.
 8. **Ambiguous writes are not retried.** Prefer provider idempotency keys. If a timeout or crash leaves completion uncertain, record `unknown`, notify the owner, and require reconciliation instead of replaying it.
 9. **Secrets stay server-side and encrypted.** Connector credentials are AES-256-GCM encrypted at rest. Never put tokens in model context, browser output, logs, CLI arguments, committed files, or client-visible API responses.
-10. **Remote MCP is hostile input.** Require HTTPS, block redirects and private/special IP ranges at the transport layer, bound responses, validate schemas, and require approval for every MCP invocation.
-11. **Database exposure is explicit.** Every Data API table needs intentional grants, RLS, and SQL tests. Workers use direct Postgres credentials; browsers receive only owner-safe views and server-mediated operations.
+10. **Remote MCP is hostile input.** Require HTTPS, block redirects and private/special IP ranges at the transport layer, bound responses, and validate schemas. Generic invocation remains denied until a reviewed semantic adapter can persist and authorize the exact effect with idempotency and read-back evidence.
+11. **Database exposure is explicit.** Every Data API table needs intentional grants, RLS, and SQL tests. Workers use direct Postgres credentials. Browser mutations are limited to deliberately granted owner-scoped records; execution truth, credentials, provider handles, and consequential effects remain server-mediated.
 12. **Provider code stays at the edge.** Core policy and state must not depend on Vercel, Blooio, Google, Kernel, or a specific model provider.
 13. **Model fallback is step-local and explicit.** A configured fallback may retry a failed generation before its tool call executes. Never restart an entire agent run for provider failover because earlier tool calls may already have completed.
 
@@ -159,7 +159,7 @@ MCP is the long-tail integration path. Keep the existing network protections in 
 - Discover and expose only explicitly allowed tools.
 - Treat tool descriptions and results as untrusted data, not instructions.
 - Bound argument and response sizes.
-- Persist every invocation as an action request, even if the remote tool claims to be read-only. Generic MCP commits fail closed unless a reviewed adapter supplies a trusted semantic effect, idempotency, and read-back contract.
+- Generic invocation is not currently exposed to the model. Before enabling a tool, add a reviewed adapter that supplies trusted semantic effect, idempotency, and read-back contracts, then persist every invocation as an action request even if the remote tool claims to be read-only.
 - Recheck the server and `configVersion` during execution.
 
 ## How to add another messaging channel
@@ -176,7 +176,7 @@ Keep Blooio behavior in `packages/messaging`; do not scatter provider payloads t
 
 Implement providers behind `BrowserProvider` in `packages/browser`. The current Kernel adapter bounds program size and runtime. Browser execution is intentionally not exposed as a free-form autonomous model tool.
 
-Website credentials use `packages/credentials` and `app_private.credential_secrets`. The model may select metadata, but only the trusted broker can decrypt and inject into classified fields on an exact HTTPS origin. Never add a plaintext secret getter to a model-facing tool, action request, browser observation, log, or audit event. OTP, password-reset, recovery, and security-challenge messages are withheld and require owner takeover.
+Website credentials use `packages/credentials` and `app_private.credential_secrets`. The owner selects credential metadata in the authenticated control plane; the model does not receive the credential list or plaintext. Only the trusted broker can decrypt and inject into classified fields on an exact HTTPS origin. Never add a plaintext secret getter to a model-facing tool, action request, browser observation, log, or audit event. OTP, password-reset, recovery, and security-challenge messages are withheld and require owner takeover.
 
 To expose a browser capability, define a narrow named operation, classify its risk, persist writes as action requests, and execute the approved operation in the worker. Never pass arbitrary credentials or an unrestricted browsing program from model output directly to a browser provider.
 
@@ -279,17 +279,19 @@ Before considering a feature complete, verify:
 - Scheduled routines inject their approved prompt as a durable scheduled event and run through the same agent queue, tool limits, policy, and approval boundary as owner messages.
 - The worker includes a bounded set of recent owner-approved memories in each model run. It can search all active memories, propose new memories, and propose destructive forgetting.
 - Public web fetch is read-only, HTTPS-only, response-bounded, redirect-free, and protected against private/special network destinations.
-- Kernel may read a public page in an ephemeral browser. Persistent profiles and browser writes fail closed until the later lease, redaction, and semantic-authorization phases; arbitrary JavaScript is never accepted from the model.
-- Any HTTPS MCP server can contribute discovered tools. The assistant invokes them through one generic, allowlist-checked action boundary; every invocation still requires approval, including tools described as read-only.
-- Destructive connector operations require a hash-bound approval plus the control plane's exact destructive confirmation phrase. Generic browser writes, financial actions, and security-sensitive operations remain denied.
+- Kernel can perform durable adaptive read-only research on a public HTTPS origin using one bounded typed action per slice. Persistent authenticated research hands off to the owner because the current adapter cannot prove complete read-only network isolation. Browser writes and arbitrary JavaScript remain disabled.
+- Any public HTTPS MCP server can contribute bounded discovered tool metadata after owner connection or OAuth. Generic tool invocation remains denied until a reviewed semantic adapter supplies effect classification, idempotency, and read-back evidence.
+- Destructive connector operations require a hash-bound approval plus the control plane's exact destructive confirmation phrase. Financial commits are available only through the disabled-by-default `openinstinct_sandbox` pilot with exact typed approval; real-money and security-sensitive operations remain denied.
 
 ## Intentional limitations
 
 - It is single-owner, not multi-tenant SaaS.
 - The web app is a control plane, not a primary conversation surface.
-- Generic MCP calls always require approval.
+- Generic MCP discovery and OAuth are available, but generic tool calls are not currently enabled.
 - Browser automation uses a bounded step language, not unrestricted model-generated code.
 - Some APIs cannot prove whether a timed-out write completed. Those actions become `unknown` and require owner reconciliation.
 - Recurrence is a fixed elapsed-time interval rather than a cron or calendar recurrence rule; local-time/DST-aware schedules need a future schema extension.
 
 For architectural rationale, read [`architecture.md`](architecture.md). For operator steps, read [`deployment/README.md`](deployment/README.md). For disclosure and security expectations, read [`../SECURITY.md`](../SECURITY.md).
+
+The original end-to-end roadmap and acceptance criteria are in [`plans/personal-execution-platform.md`](plans/personal-execution-platform.md). Execution truth, persistent browser identity, adaptive read-only research, semantic authorization, the internal credential vault, and the bounded financial sandbox are implemented. The VM and mobile layers were evaluated and deliberately deferred; see [`vm-decision-spike.md`](vm-decision-spike.md) and [`mobile-decision-spike.md`](mobile-decision-spike.md).

@@ -45,4 +45,4 @@ Implement typed direct connectors for high-value services where OAuth scopes and
 
 ## Browser automation
 
-Kernel implements the provider-neutral `BrowserProvider` interface. Browser programs have a 50 KB input limit and a 30-second execution limit. Public page reads may execute inline. Interactions are exposed only through a bounded step schema and the same proposal/approval boundary used by MCP; the model cannot submit arbitrary browser JavaScript.
+Kernel implements the provider-neutral `BrowserProvider` interface. The model can queue adaptive read-only research for a public HTTPS origin; each durable slice executes one bounded typed action under origin, step, time, and cost limits. Persistent authenticated research hands off to the owner because the current Kernel adapter cannot prove complete read-only network isolation. Browser writes and arbitrary model-generated JavaScript remain disabled.
