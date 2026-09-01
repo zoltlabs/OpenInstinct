@@ -190,6 +190,10 @@ Never accept raw payment credentials in an agent tool or action request. A timeo
 
 The VM layer is not enabled. `packages/computer` retains a provider-neutral contract and a fail-closed build gate, while [`vm-decision-spike.md`](vm-decision-spike.md) records the current no-build decision. Provider documentation is feasibility evidence, not a live demonstration. Do not add a provider SDK or operate a VM until two recurring owner workflows require it, browser and API alternatives fail measured tests, every lifecycle and security control is demonstrated against a real provider, and owner-visible cost passes an explicit ceiling.
 
+## How to evaluate a mobile device
+
+The mobile layer is deferred. [`mobile-decision-spike.md`](mobile-decision-spike.md) records the failed product-demand gate and the separate Android and iOS custody requirements. Never use a public shared device fleet with owner credentials. Do not provision a dedicated device until recurring mobile-only workflows are proven and test-account custody, encryption, bounded control, takeover, retention, reset, verified deletion, ambiguous outcomes, and owner-visible cost pass review.
+
 ## How to change the database
 
 Create a new timestamped migration; never edit an already-applied migration after release.
