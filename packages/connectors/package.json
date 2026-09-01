@@ -11,10 +11,10 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@ai-sdk/mcp": "2.0.39",
-    "ai": "7.0.83",
+    "@ai-sdk/mcp": "2.0.40",
+    "ai": "7.0.84",
     "ipaddr.js": "^2.5.0",
     "undici": "^8.10.0",
-    "zod": "4.4.3"
+    "zod": "4.5.2"
   }
 }

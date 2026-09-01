@@ -11,7 +11,7 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "ai": "7.0.83",
-    "zod": "4.4.3"
+    "ai": "7.0.84",
+    "zod": "4.5.2"
   }
 }
