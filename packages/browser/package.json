@@ -12,7 +12,7 @@
   },
   "dependencies": {
     "@openinstinct/core": "workspace:*",
-    "@onkernel/sdk": "0.96.0",
-    "zod": "4.4.3"
+    "@onkernel/sdk": "0.100.0",
+    "zod": "4.5.4"
   }
 }
