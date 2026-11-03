@@ -14,8 +14,8 @@
     "@openinstinct/artifacts": "workspace:*",
     "@openinstinct/core": "workspace:*",
     "@openinstinct/credentials": "workspace:*",
-    "@supabase/supabase-js": "2.112.4",
-    "postgres": "3.4.9",
-    "zod": "4.4.3"
+    "@supabase/supabase-js": "2.118.0",
+    "postgres": "4.0.0",
+    "zod": "4.6.7"
   }
 }
