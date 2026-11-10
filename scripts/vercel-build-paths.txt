@@ -1,8 +1,15 @@
+.gitignore
+.gitmodules
 .node-version
 .npmrc
+.nvmrc
+.vercelignore
 apps/web
 apps/worker
+bun.lock
+bun.lockb
 compose.yaml
+package-lock.json
 package.json
 packages/artifacts
 packages/browser
@@ -19,3 +26,4 @@ tsconfig.base.json
 tsconfig.json
 vercel.json
 vercel.pro.json
+yarn.lock
