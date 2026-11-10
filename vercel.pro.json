@@ -8,5 +8,12 @@
       "path": "/api/internal/consume",
       "schedule": "* * * * *"
     }
-  ]
+  ],
+  "ignoreCommand": "sh \"$(git rev-parse --show-toplevel)/scripts/vercel-ignore-build.sh\"",
+  "git": {
+    "deploymentEnabled": {
+      "**": false,
+      "main": true
+    }
+  }
 }
