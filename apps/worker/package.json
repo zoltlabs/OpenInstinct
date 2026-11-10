@@ -13,10 +13,10 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@ai-sdk/anthropic": "4.0.44",
-    "@ai-sdk/google": "4.0.56",
-    "@ai-sdk/openai": "4.0.50",
-    "@ai-sdk/openai-compatible": "3.0.39",
+    "@ai-sdk/anthropic": "4.0.98",
+    "@ai-sdk/google": "4.0.113",
+    "@ai-sdk/openai": "4.0.110",
+    "@ai-sdk/openai-compatible": "3.0.86",
     "@openinstinct/connectors": "workspace:*",
     "@openinstinct/artifacts": "workspace:*",
     "@openinstinct/browser": "workspace:*",
@@ -25,8 +25,8 @@
     "@openinstinct/db": "workspace:*",
     "@openinstinct/messaging": "workspace:*",
     "@openinstinct/runtime": "workspace:*",
-    "ai": "7.0.83",
-    "tsx": "4.23.12",
-    "zod": "4.4.3"
+    "ai": "7.0.164",
+    "tsx": "4.23.15",
+    "zod": "4.6.7"
   }
 }
